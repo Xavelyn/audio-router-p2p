@@ -1,0 +1,6 @@
+# local toolchain and per-replica state (not committed)
+.tools/
+.gopath/
+routes.json
+cert.pem
+key.pem
