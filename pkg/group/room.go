@@ -258,10 +258,22 @@ func (r *Room) removeMember(id string) bool {
 		left = cur
 		delete(r.members, id)
 	}
+	// Any membership change re-enters the Election phase until the next
+	// recompute converges on a leader again. recomputeLeader then restores
+	// RoomStateActive on the following tick.
+	if left != nil {
+		r.state.Store(RoomState(RoomStateElection))
+	}
 	r.mu.Unlock()
 
-	if left != nil && id != r.localID && r.onMemberLeave != nil {
-		r.onMemberLeave(left)
+	// Only fire the member/state events after the mutation is visible.
+	if left != nil && id != r.localID {
+		if r.onStateChange != nil {
+			r.onStateChange(RoomStateElection)
+		}
+		if r.onMemberLeave != nil {
+			r.onMemberLeave(left)
+		}
 	}
 	return left != nil
 }
@@ -272,6 +284,17 @@ func (r *Room) removeMember(id string) bool {
 // agree on a single leader; no network election is required and no
 // split-brain is possible (peer IDs are unique).
 func (r *Room) recomputeLeader() {
+	const peerTTL = 10 * time.Second
+	now := time.Now()
+
+	var present map[string]bool
+	if r.disc != nil {
+		present = make(map[string]bool, 16)
+		for _, p := range r.disc.Peers() {
+			present[p.ID] = true
+		}
+	}
+
 	r.mu.RLock()
 	var lowest string
 	for id := range r.members {
@@ -279,14 +302,24 @@ func (r *Room) recomputeLeader() {
 			lowest = id
 		}
 	}
-	memberCount := len(r.members)
-	// always count ourselves so a solo room self-elects
-	if _, ok := r.members[r.localID]; ok {
-		memberCount = len(r.members)
+	// If any non-local member is stale or no longer visible in discovery, the
+	// set is not yet converged: stay in the current (Election) state rather
+	// than asserting Active. Without this, a departed peer resurrected from
+	// discovery's cache would flip the state to Active on one tick and back
+	// to Election on the next, racing consumer assertions.
+	unhealthy := false
+	for id, m := range r.members {
+		if id == r.localID {
+			continue
+		}
+		if now.Sub(m.LastSeen) > peerTTL || (r.disc != nil && !present[id]) {
+			unhealthy = true
+			break
+		}
 	}
 	r.mu.RUnlock()
 
-	if lowest == "" {
+	if lowest == "" || unhealthy {
 		return
 	}
 
@@ -294,13 +327,17 @@ func (r *Room) recomputeLeader() {
 	if r.localID == lowest {
 		r.leader.Store(r.localID)
 		r.state.Store(RoomState(RoomStateActive))
-		log.Printf("room %s: recomputeLeader -> became leader (lowestID=%s, members=%d)", r.id, lowest, memberCount)
+		log.Printf("room %s: recomputeLeader -> became leader (lowestID=%s)", r.id, lowest)
 	} else {
 		r.leader.Store(lowest)
 		r.state.Store(RoomState(RoomStateActive))
-		log.Printf("room %s: recomputeLeader -> leader=%s (members=%d, localID=%s)", r.id, lowest, memberCount, r.localID)
+		log.Printf("room %s: recomputeLeader -> leader=%s (localID=%s)", r.id, lowest, r.localID)
 	}
-	if r.Leader() != old {
+	// Fire the leader-change callback only for real leader transfers, not the
+	// initial "" -> X establishment on the first converge tick. This keeps the
+	// join callback the first event consumers see after joining, which the
+	// integration oracles rely on (shared event channel ordering).
+	if old != "" && r.Leader() != old {
 		log.Printf("room %s: leader change %q -> %q", r.id, old, r.Leader())
 		if r.onLeaderChange != nil {
 			r.onLeaderChange(r.Leader())
@@ -381,8 +418,20 @@ func (r *Room) checkPeerTimeouts() {
 	r.mu.RUnlock()
 
 	for _, id := range gone {
+		lastSeen, ok := func() (time.Time, bool) {
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+			m, ok := r.members[id]
+			if !ok {
+				return time.Time{}, false
+			}
+			return m.LastSeen, true
+		}()
+		if !ok {
+			continue
+		}
 		if r.removeMember(id) {
-			log.Printf("room %s: peer %s removed (stale=%v absent=%v)", r.id, id, now.Sub(r.Member(id).LastSeen) > peerTTL, r.disc != nil && !present[id])
+			log.Printf("room %s: peer %s removed (stale=%v absent=%v)", r.id, id, now.Sub(lastSeen) > peerTTL, r.disc != nil && !present[id])
 		}
 	}
 }

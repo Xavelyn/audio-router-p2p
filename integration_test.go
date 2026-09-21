@@ -281,6 +281,7 @@ func TestDTLSEncryption(t *testing.T) {
 
 	dtlsB, err := transport.NewDTLSTransport(transport.DTLSConfig{
 		ListenAddr: cfgB.StreamPort,
+		RemoteAddr: cfgA.StreamPort, // connect to node A (server)
 		CertFile:   certFile,
 		KeyFile:    keyFile,
 		IsServer:   false,
@@ -320,23 +321,29 @@ func TestDTLSEncryption(t *testing.T) {
 		Timestamp:      0,
 		SSRC:           0x12345678,
 	}
-	plaintext := make([]byte, 160) // 20ms @ 44.1kHz mono
-	rand.Read(plaintext)
+	payload := make([]byte, 160) // 20ms @ 44.1kHz mono
+	rand.Read(payload)
 
-	dst := make([]byte, len(plaintext)+20)
-	encrypted, err := dtlsA.EncryptRTP(dst, plaintext, header)
+	pkt := &rtp.Packet{Header: *header, Payload: payload}
+	raw, err := pkt.Marshal()
+	if err != nil {
+		t.Fatalf("marshal RTP packet: %v", err)
+	}
+
+	dst := make([]byte, len(raw)+20)
+	encrypted, err := dtlsA.EncryptRTP(dst, raw, header)
 	if err != nil {
 		t.Fatalf("EncryptRTP: %v", err)
 	}
-	t.Logf("Encrypted packet size: %d (plaintext: %d)", len(encrypted), len(plaintext))
+	t.Logf("Encrypted packet size: %d (plaintext: %d)", len(encrypted), len(raw))
 
 	// Decrypt
 	decrypted, err := dtlsB.DecryptRTP(dst, encrypted, header)
 	if err != nil {
 		t.Fatalf("DecryptRTP: %v", err)
 	}
-	if !bytes.Equal(decrypted, plaintext) {
-		t.Fatal("Decrypted payload mismatch")
+	if !bytes.Equal(decrypted, raw) {
+		t.Fatal("Decrypted packet mismatch")
 	}
 	t.Log("DTLS/SRTP encryption round-trip successful")
 }
@@ -500,38 +507,47 @@ func TestHealthMonitoring(t *testing.T) {
 		Transport:   nodeB.trans,
 	})
 
-	healthEvents := make(chan string, 10)
+	nodeBPeerID := nodeB.disc.NodeID()
+
+	// Use separate channels per room: when node B's sockets are closed, room B
+	// also stops hearing node A and fires its own leave event. Mixing both
+	// rooms onto one channel makes the state assertion below race on whose
+	// leave event was consumed first.
+	eventsA := make(chan string, 10)
+	eventsB := make(chan string, 10)
 	roomA.SetCallbacks(
-		func(m *group.RoomMember) { healthEvents <- "join:" + m.PeerID },
-		func(m *group.RoomMember) { healthEvents <- "leave:" + m.PeerID },
-		func(leader string) { healthEvents <- "leader:" + leader },
-		func(s group.RoomState) { healthEvents <- "state:" + roomStateString(s) },
+		func(m *group.RoomMember) { eventsA <- "join:" + m.PeerID },
+		func(m *group.RoomMember) { eventsA <- "leave:" + m.PeerID },
+		func(leader string) { eventsA <- "leader:" + leader },
+		func(s group.RoomState) { eventsA <- "state:" + roomStateString(s) },
 	)
 	roomB.SetCallbacks(
-		func(m *group.RoomMember) { healthEvents <- "join:" + m.PeerID },
-		func(m *group.RoomMember) { healthEvents <- "leave:" + m.PeerID },
-		func(leader string) { healthEvents <- "leader:" + leader },
-		func(s group.RoomState) { healthEvents <- "state:" + roomStateString(s) },
+		func(m *group.RoomMember) { eventsB <- "join:" + m.PeerID },
+		func(m *group.RoomMember) { eventsB <- "leave:" + m.PeerID },
+		func(leader string) { eventsB <- "leader:" + leader },
+		func(s group.RoomState) { eventsB <- "state:" + roomStateString(s) },
 	)
 
 	roomA.Join()
 	roomB.Join()
 	time.Sleep(5 * time.Second)
 
-	// Verify both joined
-	joinCount := 0
+	// Verify both rooms detected the peer join (one join event per room)
 	for i := 0; i < 2; i++ {
+		var events <-chan string
+		if i == 0 {
+			events = eventsA
+		} else {
+			events = eventsB
+		}
 		select {
-		case e := <-healthEvents:
-			if strings.HasPrefix(e, "join:") {
-				joinCount++
+		case e := <-events:
+			if !strings.HasPrefix(e, "join:") {
+				t.Fatalf("Expected join event on room %d, got %q", i, e)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("Join event timeout")
+			t.Fatalf("Join event timeout on room %d", i)
 		}
-	}
-	if joinCount != 2 {
-		t.Fatalf("Expected 2 join events, got %d", joinCount)
 	}
 
 	// Simulate node B failure (close transport)
@@ -539,16 +555,18 @@ func TestHealthMonitoring(t *testing.T) {
 	nodeB.disc.Close()
 	nodeB.sync.Close()
 
-	// Wait for leave detection
+	// Wait for room A to detect node B's leave specifically; room B's own
+	// leave events are irrelevant here.
 	leaveDetected := false
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
-		case e := <-healthEvents:
-			if strings.HasPrefix(e, "leave:") {
+		case e := <-eventsA:
+			if e == "leave:"+nodeBPeerID {
 				leaveDetected = true
-				break
 			}
+		case e := <-eventsB:
+			_ = e // drain, room B events don't drive this assertion
 		case <-time.After(500 * time.Millisecond):
 		}
 		if leaveDetected {

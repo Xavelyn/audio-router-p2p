@@ -100,26 +100,33 @@ func writeFile(path string, data []byte, perm uint32) error {
 }
 
 func deriveSRTPKeys(state dtls.State, role dtlsRole) (sendKey, recvKey []byte, err error) {
-	const srtpKeyLen = 30 // 16 byte key + 14 byte salt
+	const (
+		keyLen  = 16 // AES-128 SRTP master key
+		saltLen = 14 // SRTP master salt
+	)
 
-	keyMaterial, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, srtpKeyLen*2)
+	// RFC 5764 order: client_write_key | server_write_key | client_write_salt | server_write_salt
+	keyMaterial, err := state.ExportKeyingMaterial("EXTRACTOR-dtls_srtp", nil, 2*(keyLen+saltLen))
 	if err != nil {
 		return nil, nil, fmt.Errorf("export SRTP keying material: %w", err)
 	}
 
-	if len(keyMaterial) < srtpKeyLen*2 {
+	if len(keyMaterial) < 2*(keyLen+saltLen) {
 		return nil, nil, fmt.Errorf("insufficient keying material")
 	}
 
-	clientWriteKey := keyMaterial[:srtpKeyLen]
-	serverWriteKey := keyMaterial[srtpKeyLen : srtpKeyLen*2]
+	clientKey := keyMaterial[:keyLen]
+	serverKey := keyMaterial[keyLen : 2*keyLen]
+	clientSalt := keyMaterial[2*keyLen : 2*keyLen+saltLen]
+	serverSalt := keyMaterial[2*keyLen+saltLen : 2*(keyLen+saltLen)]
 
+	// Send context uses our own write keys; receive context uses the peer's.
 	if role == roleClient {
-		sendKey = clientWriteKey
-		recvKey = serverWriteKey
+		sendKey = append(append([]byte{}, clientKey...), clientSalt...)
+		recvKey = append(append([]byte{}, serverKey...), serverSalt...)
 	} else {
-		sendKey = serverWriteKey
-		recvKey = clientWriteKey
+		sendKey = append(append([]byte{}, serverKey...), serverSalt...)
+		recvKey = append(append([]byte{}, clientKey...), clientSalt...)
 	}
 	return sendKey, recvKey, nil
 }
@@ -134,6 +141,97 @@ func NewDTLSConn(cfg *DTLSConfig) (*DTLSConn, error) {
 }
 
 func NewDTLSConnWithRole(cfg *DTLSConfig, role dtlsRole) (*DTLSConn, error) {
+	var conn *dtls.Conn
+	var err error
+
+	if role == roleServer {
+		listener, err := NewDTLSListener(cfg)
+		if err != nil {
+			return nil, err
+		}
+		defer listener.Close()
+		return listener.Accept()
+	}
+
+	dtlsConfig, err := buildDTLSConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err = dtls.Dial("udp", cfg.RemoteAddr, dtlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("dtls dial: %w", err)
+	}
+
+	d := &DTLSConn{
+		conn:       conn,
+		localAddr:  cfg.LocalAddr,
+		remoteAddr: cfg.RemoteAddr,
+	}
+
+	// Setup SRTP contexts
+	if err := d.setupSRTPWithRole(role); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("setup SRTP: %w", err)
+	}
+
+	return d, nil
+}
+
+// DTLSListener is a DTLS server that binds its UDP socket immediately and
+// accepts peers asynchronously.
+type DTLSListener struct {
+	listener net.Listener
+	cfg      *DTLSConfig
+}
+
+// NewDTLSListener binds the UDP socket for cfg.LocalAddr synchronously so the
+// port is guaranteed available as soon as it returns. Use Accept to wait for a
+// peer, or Close to release the socket.
+func NewDTLSListener(cfg *DTLSConfig) (*DTLSListener, error) {
+	dtlsConfig, err := buildDTLSConfig(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	listener, err := dtls.Listen("udp", cfg.LocalAddr, dtlsConfig)
+	if err != nil {
+		return nil, fmt.Errorf("dtls listen: %w", err)
+	}
+
+	return &DTLSListener{listener: listener, cfg: cfg}, nil
+}
+
+// Accept waits for the next inbound connection and completes the DTLS
+// handshake plus SRTP setup.
+func (l *DTLSListener) Accept() (*DTLSConn, error) {
+	dtlsConn, err := l.listener.Accept()
+	if err != nil {
+		return nil, fmt.Errorf("dtls accept: %w", err)
+	}
+	conn := dtlsConn.(*dtls.Conn)
+
+	d := &DTLSConn{
+		conn:       conn,
+		localAddr:  l.cfg.LocalAddr,
+		remoteAddr: l.cfg.RemoteAddr,
+	}
+
+	// Setup SRTP contexts (server write keys are used for sends)
+	if err := d.setupSRTPWithRole(roleServer); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("setup SRTP: %w", err)
+	}
+
+	return d, nil
+}
+
+// Close releases the listener's UDP socket; accepted connections are unaffected.
+func (l *DTLSListener) Close() error {
+	return l.listener.Close()
+}
+
+func buildDTLSConfig(cfg *DTLSConfig) (*dtls.Config, error) {
 	var cert *tls.Certificate
 	if cfg.CertFile != "" && cfg.KeyFile != "" {
 		c, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
@@ -144,9 +242,12 @@ func NewDTLSConnWithRole(cfg *DTLSConfig, role dtlsRole) (*DTLSConn, error) {
 	}
 
 	dtlsConfig := &dtls.Config{
-		Certificates:             []tls.Certificate{},
-		ExtendedMasterSecret:     dtls.RequestExtendedMasterSecret,
-		MTU:                      1500,
+		// Self-signed certs: the connecting peer is trusted via the room's
+		// authentication layer, so skip chain verification.
+		InsecureSkipVerify: true,
+		Certificates:       []tls.Certificate{},
+		ExtendedMasterSecret: dtls.RequestExtendedMasterSecret,
+		MTU:                1500,
 		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
 			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
 			dtls.SRTP_AEAD_AES_128_GCM,
@@ -172,41 +273,7 @@ func NewDTLSConnWithRole(cfg *DTLSConfig, role dtlsRole) (*DTLSConn, error) {
 		}
 	}
 
-	var conn *dtls.Conn
-	var err error
-
-	if role == roleServer {
-		listener, err := dtls.Listen("udp", cfg.LocalAddr, dtlsConfig)
-		if err != nil {
-			return nil, fmt.Errorf("dtls listen: %w", err)
-		}
-		dtlsConn, err := listener.Accept()
-		if err != nil {
-			listener.Close()
-			return nil, fmt.Errorf("dtls accept: %w", err)
-		}
-		conn = dtlsConn.(*dtls.Conn)
-		listener.Close()
-	} else {
-		conn, err = dtls.Dial("udp", cfg.RemoteAddr, dtlsConfig)
-		if err != nil {
-			return nil, fmt.Errorf("dtls dial: %w", err)
-		}
-	}
-
-	d := &DTLSConn{
-		conn:       conn,
-		localAddr:  cfg.LocalAddr,
-		remoteAddr: cfg.RemoteAddr,
-	}
-
-	// Setup SRTP contexts
-	if err := d.setupSRTPWithRole(role); err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("setup SRTP: %w", err)
-	}
-
-	return d, nil
+	return dtlsConfig, nil
 }
 
 func (d *DTLSConn) setupSRTPWithRole(role dtlsRole) error {
@@ -222,14 +289,16 @@ func (d *DTLSConn) setupSRTPWithRole(role dtlsRole) error {
 	}
 
 	srtpProfile := srtp.ProtectionProfile(profile)
+	const keyLen, saltLen = 16, 14
 
-	// Create SRTP contexts for send and receive
-	sendCtx, err := srtp.CreateContext(sendKey, recvKey, srtpProfile)
+	// Create SRTP contexts for send and receive. sendKey/recvKey are
+	// key(16) preceded by salt(14) as produced by deriveSRTPKeys.
+	sendCtx, err := srtp.CreateContext(sendKey[:keyLen], sendKey[keyLen:keyLen+saltLen], srtpProfile)
 	if err != nil {
 		return fmt.Errorf("create send SRTP context: %w", err)
 	}
 
-	recvCtx, err := srtp.CreateContext(recvKey, sendKey, srtpProfile)
+	recvCtx, err := srtp.CreateContext(recvKey[:keyLen], recvKey[keyLen:keyLen+saltLen], srtpProfile)
 	if err != nil {
 		return fmt.Errorf("create recv SRTP context: %w", err)
 	}
