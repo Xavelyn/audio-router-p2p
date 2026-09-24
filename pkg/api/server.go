@@ -128,7 +128,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	syncInfo := s.syncMgr.Offsets()
+	var syncInfo map[string]sync.PeerOffset
+	if s.syncMgr != nil {
+		syncInfo = s.syncMgr.Offsets()
+	}
 	active := s.rt.List()
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":      "ok",

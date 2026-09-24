@@ -49,6 +49,7 @@ func Load() (*Config, error) {
 	flag.BoolVar(&cfg.UseEmulator, "use-emulator", false, "Use the audio emulator instead of real devices")
 	flag.BoolVar(&cfg.Encrypt, "encrypt", false, "Enable DTLS/SRTP encryption for audio streams")
 	flag.StringVar(&cfg.PSK, "psk", "", "Pre-shared key for DTLS encryption (base64 encoded)")
+	flag.StringVar(&cfg.RoutesFile, "routes", "routes.json", "Path to the JSON routes file")
 
 	flag.StringVar(&cfg.MulticastGroup, "multicast-group", "239.255.0.1", "Multicast group for peer discovery")
 	flag.IntVar(&cfg.MulticastPort, "multicast-port", 45400, "Multicast port for peer announcements")

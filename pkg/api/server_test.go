@@ -423,14 +423,18 @@ func TestServerMethodNotAllowed(t *testing.T) {
 }
 
 func TestServerPanicRecovery(t *testing.T) {
-	// Create server with nil syncMgr to trigger panic in handleStatus
 	cfg := testConfig()
 	rt := testRouter(t)
 	disc := testDiscovery(t)
 	s := NewServer(cfg, rt, disc, nil, nil)
+	// Nil syncMgr no longer panics in handleStatus (3.3 mirrors handleSync),
+	// so exercise the recovery middleware deterministically via a panic route.
+	s.mux.HandleFunc("/boom", func(w http.ResponseWriter, r *http.Request) {
+		panic("boom")
+	})
 	handler := s.Handler()
 
-	w := doRequest(t, handler, http.MethodGet, "/status", nil, "test-token")
+	w := doRequest(t, handler, http.MethodGet, "/boom", nil, "test-token")
 
 	// Should recover and return 500
 	if w.Code != http.StatusInternalServerError {
@@ -481,5 +485,26 @@ func TestConstantTimeCompare(t *testing.T) {
 	}
 	if subtle.ConstantTimeCompare(token, []byte("wrong")) == 1 {
 		t.Error("constant time compare should fail for different")
+	}
+}
+func TestStatusNilSyncMgr(t *testing.T) {
+	// Server without a sync manager must serve /status in a read-only mode
+	// (200, syncPeers: 0) instead of dereferencing a nil syncMgr (3.3).
+	cfg := testConfig()
+	rt := testRouter(t)
+	disc := testDiscovery(t)
+	s := NewServer(cfg, rt, disc, nil, nil)
+	handler := s.Handler()
+
+	w := doRequest(t, handler, http.MethodGet, "/status", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with nil syncMgr, got %d", w.Code)
+	}
+	var body map[string]interface{}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode /status: %v", err)
+	}
+	if got := int(body["syncPeers"].(float64)); got != 0 {
+		t.Fatalf("expected syncPeers 0 with nil syncMgr, got %d", got)
 	}
 }
