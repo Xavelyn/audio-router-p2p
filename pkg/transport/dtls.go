@@ -34,6 +34,9 @@ type DTLSTransport struct {
 	recvDone chan struct{}
 	recvOnce sync.Once
 	config   DTLSConfig
+
+	handlers map[uint64]func([]byte, *net.UDPAddr)
+	nextID   uint64
 }
 
 // NewDTLSTransport creates a new DTLS transport.
@@ -201,14 +204,35 @@ func (t *DTLSTransport) Send(to string, data []byte) error {
 	return err
 }
 
-// Receive spawns a goroutine that delivers received datagrams to handler
-func (t *DTLSTransport) Receive(handler func([]byte, *net.UDPAddr)) {
+// Receive registers a handler for incoming datagrams and returns a function
+// that unregisters it. Any number of handlers may be registered; each
+// received datagram is delivered to every registered handler. The receive
+// loop starts on demand with the first registration.
+func (t *DTLSTransport) Receive(handler func([]byte, *net.UDPAddr)) (unregister func()) {
+	t.mu.Lock()
+	if t.handlers == nil {
+		t.handlers = make(map[uint64]func([]byte, *net.UDPAddr))
+	}
+	t.nextID++
+	id := t.nextID
+	t.handlers[id] = handler
+	t.mu.Unlock()
+
 	t.recvOnce.Do(func() {
-		go t.receiveLoop(handler)
+		go t.receiveLoop()
 	})
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			delete(t.handlers, id)
+			t.mu.Unlock()
+		})
+	}
 }
 
-func (t *DTLSTransport) receiveLoop(handler func([]byte, *net.UDPAddr)) {
+func (t *DTLSTransport) receiveLoop() {
 	if err := t.waitForConn(); err != nil {
 		log.Printf("DTLS receive: connection not established: %v", err)
 		close(t.recvDone)
@@ -237,7 +261,15 @@ func (t *DTLSTransport) receiveLoop(handler func([]byte, *net.UDPAddr)) {
 			raddr = t.conn.RemoteAddr().(*net.UDPAddr)
 		}
 
-		handler(data, raddr)
+		t.mu.Lock()
+		handlers := make([]func([]byte, *net.UDPAddr), 0, len(t.handlers))
+		for _, h := range t.handlers {
+			handlers = append(handlers, h)
+		}
+		t.mu.Unlock()
+		for _, h := range handlers {
+			h(data, raddr)
+		}
 	}
 }
 

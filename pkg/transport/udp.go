@@ -11,12 +11,17 @@ import (
 )
 
 // UDPTransport is a thin goroutine-safe wrapper around a UDP socket.
+// It supports any number of registered receive handlers; each received
+// datagram is delivered to every registered handler.
 type UDPTransport struct {
 	mu       sync.Mutex
 	conn     *net.UDPConn
 	closed   atomic.Bool
 	recvDone chan struct{} // closed when the Receive loop exits
 	recvOnce sync.Once
+
+	handlers map[uint64]func([]byte, *net.UDPAddr)
+	nextID   uint64
 }
 
 // NewUDPTransport binds a UDP socket to listenAddr (e.g. ":45678" or "127.0.0.1:0").
@@ -82,16 +87,36 @@ func (t *UDPTransport) Send(to string, data []byte) error {
 	return err
 }
 
-// Receive spawns a goroutine that delivers a copy of each received datagram
-// to handler. The goroutine exits when the transport is closed. Use Wait() to
-// block until it has fully stopped.
-func (t *UDPTransport) Receive(handler func([]byte, *net.UDPAddr)) {
+// Receive registers a handler for incoming datagrams and returns a function
+// that unregisters it. Any number of handlers may be registered; each
+// received datagram is delivered to every registered handler (streamers
+// filter by stream ID internally). The receive loop starts on demand with
+// the first registration and stops when the transport is closed.
+func (t *UDPTransport) Receive(handler func([]byte, *net.UDPAddr)) (unregister func()) {
+	t.mu.Lock()
+	if t.handlers == nil {
+		t.handlers = make(map[uint64]func([]byte, *net.UDPAddr))
+	}
+	t.nextID++
+	id := t.nextID
+	t.handlers[id] = handler
+	t.mu.Unlock()
+
 	t.recvOnce.Do(func() {
-		go t.receiveLoop(handler)
+		go t.receiveLoop()
 	})
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			t.mu.Lock()
+			delete(t.handlers, id)
+			t.mu.Unlock()
+		})
+	}
 }
 
-func (t *UDPTransport) receiveLoop(handler func([]byte, *net.UDPAddr)) {
+func (t *UDPTransport) receiveLoop() {
 	buf := make([]byte, 65535)
 	for {
 		n, addr, err := t.conn.ReadFromUDP(buf)
@@ -107,7 +132,15 @@ func (t *UDPTransport) receiveLoop(handler func([]byte, *net.UDPAddr)) {
 		// Copy the slice: the next ReadFromUDP call may reuse buf.
 		data := make([]byte, n)
 		copy(data, buf[:n])
-		handler(data, addr)
+		t.mu.Lock()
+		handlers := make([]func([]byte, *net.UDPAddr), 0, len(t.handlers))
+		for _, h := range t.handlers {
+			handlers = append(handlers, h)
+		}
+		t.mu.Unlock()
+		for _, h := range handlers {
+			h(data, addr)
+		}
 	}
 }
 

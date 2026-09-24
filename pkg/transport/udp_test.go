@@ -79,6 +79,70 @@ func TestUDPTransportReceiveStopsOnClose(t *testing.T) {
 	}
 }
 
+// TestUDPTransportMultiHandler verifies the shared-socket semantics used by
+// multi-route operation: multiple handlers receive every datagram, and
+// unregistering one handler stops exactly that handler without affecting the
+// others or the socket.
+func TestUDPTransportMultiHandler(t *testing.T) {
+	tr, err := NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("create transport: %v", err)
+	}
+	defer tr.Close()
+
+	h1 := make(chan []byte, 4)
+	h2 := make(chan []byte, 4)
+	unreg1 := tr.Receive(func(data []byte, _ *net.UDPAddr) {
+		select {
+		case h1 <- append([]byte(nil), data...):
+		default:
+		}
+	})
+	tr.Receive(func(data []byte, _ *net.UDPAddr) {
+		select {
+		case h2 <- append([]byte(nil), data...):
+		default:
+		}
+	})
+
+	// Self-send a datagram: both registered handlers must see it.
+	if err := tr.Send("127.0.0.1:"+portOf(tr), []byte("one")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	for name, ch := range map[string]chan []byte{"h1": h1, "h2": h2} {
+		select {
+		case got := <-ch:
+			if string(got) != "one" {
+				t.Fatalf("%s received %q, want %q", name, got, "one")
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s did not receive datagram", name)
+		}
+	}
+
+	// Unregister h1, then send again: only h2 receives.
+	unreg1()
+	if err := tr.Send("127.0.0.1:"+portOf(tr), []byte("two")); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	select {
+	case got := <-h2:
+		if string(got) != "two" {
+			t.Fatalf("h2 received %q, want %q", got, "two")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("h2 did not receive datagram after h1 unregistered")
+	}
+	select {
+	case got := <-h1:
+		t.Fatalf("h1 still received after unregister: %q", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Unregistering twice must be safe (idempotent).
+	unreg1()
+}
+
 func portOf(tr *UDPTransport) string {
 	_, p, err := net.SplitHostPort(tr.Addr())
 	if err != nil {

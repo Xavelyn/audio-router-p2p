@@ -35,7 +35,8 @@ type JitterBuffer struct {
 	// Playout state
 	playoutTime   time.Time
 	originTime    time.Time
-	originSeq     uint32
+	originSeq     uint32 // sequence number of the anchor (first) packet
+	nextSeq       uint32 // sequence number expected at the head of playout
 	seqInitialized bool
 
 	// Adaptive delay
@@ -104,6 +105,7 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 	// Initialize origin on first packet
 	if !jb.seqInitialized {
 		jb.originSeq = seq
+		jb.nextSeq = seq
 		jb.originTime = ts
 		jb.playoutTime = now.Add(jb.targetDelay)
 		jb.seqInitialized = true
@@ -118,11 +120,10 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 		jb.latePackets++
 	}
 
-	// Find slot
-	idx := int((seq - jb.originSeq) % uint32(jb.capacity))
-	if idx < 0 {
-		idx += jb.capacity
-	}
+	// Find slot: sequence numbers map directly into the ring buffer and wrap
+	// naturally via unsigned modulo, which keeps buffered frames at stable
+	// slots regardless of how many packets play out in between.
+	idx := int(seq % uint32(jb.capacity))
 
 	dropped := 0
 	if jb.frames[idx] != nil {
@@ -157,32 +158,32 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 	}
 
 	for {
-		idx := int((jb.originSeq - jb.originSeq) % uint32(jb.capacity))
-		if idx < 0 {
-			idx += jb.capacity
+		if jb.closed {
+			return nil, 0, ErrClosed
 		}
 
+		idx := int(jb.nextSeq % uint32(jb.capacity))
 		frame := jb.frames[idx]
 		if frame != nil {
 			jb.frames[idx] = nil
-			jb.originSeq++
+			jb.nextSeq++
 			return frame.data, frame.seq, nil
 		}
 
 		// Check if it's time to play out silence (underrun)
-		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.originSeq-jb.originSeq) * jb.frameDuration())
+		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.nextSeq-jb.originSeq) * jb.frameDuration())
 		if time.Now().After(expectedPlayout) {
 			jb.underruns++
 			// Generate silence frame
 			silence := make([]byte, jb.frameSize)
-			jb.originSeq++
-			return silence, jb.originSeq - 1, nil
+			jb.nextSeq++
+			return silence, jb.nextSeq - 1, nil
 		}
 
-		// Wait a bit
+		// Block until the next frame is due, then re-check for its arrival.
 		waitTime := expectedPlayout.Sub(time.Now())
-		if waitTime < 0 {
-			waitTime = 1 * time.Millisecond
+		if waitTime < time.Millisecond {
+			waitTime = time.Millisecond
 		}
 		jb.mu.Unlock()
 		time.Sleep(waitTime)
@@ -200,38 +201,33 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 		return nil, 0, ErrBufferEmpty
 	}
 
-	idx := int((jb.originSeq - jb.originSeq) % uint32(jb.capacity))
-	if idx < 0 {
-		idx += jb.capacity
-	}
+	idx := int(jb.nextSeq % uint32(jb.capacity))
 
 	frame := jb.frames[idx]
 	if frame == nil {
-		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.originSeq-jb.originSeq) * jb.frameDuration())
+		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.nextSeq-jb.originSeq) * jb.frameDuration())
 		if time.Now().After(expectedPlayout) {
 			jb.underruns++
 			silence := make([]byte, jb.frameSize)
-			jb.originSeq++
-			return silence, jb.originSeq - 1, nil
+			jb.nextSeq++
+			return silence, jb.nextSeq - 1, nil
 		}
 		return nil, 0, ErrBufferEmpty
 	}
 
 	jb.frames[idx] = nil
-	jb.originSeq++
+	jb.nextSeq++
 	return frame.data, frame.seq, nil
 }
 
 func (jb *JitterBuffer) frameDuration() time.Duration {
-	// frames per second = sampleRate / (frameSize / channels / 2)
-	// but we know frameSize = channels * 2 (int16 per channel)
-	// so frames per buffer = frameSize / (channels * 2)
-	// Actually for 20ms packets: frames = sampleRate * 0.02
+	// Each ring slot holds one 20ms packet of audio, so the playout advances
+	// by the packet duration per sequence step - not the per-sample duration.
 	framesPerPacket := jb.sampleRate / 50 // 20ms = 1/50 sec
 	if framesPerPacket <= 0 {
 		framesPerPacket = 1
 	}
-	return time.Duration(float64(time.Second) / float64(framesPerPacket))
+	return time.Duration(float64(time.Second) * float64(framesPerPacket) / float64(jb.sampleRate))
 }
 
 func (jb *JitterBuffer) adaptDelay(arrival, expected time.Time) {
@@ -334,7 +330,9 @@ func NewResampler(inRate, outRate, channels int) *Resampler {
 // Returns resampled data and number of input frames consumed.
 func (r *Resampler) Resample(inData []byte) ([]byte, int) {
 	if r == nil {
-		return inData, len(inData) / (r.channels * 2)
+		// Passthrough; frame size is unknown without a receiver, so report
+		// zero consumed frames to avoid a nil dereference.
+		return inData, 0
 	}
 
 	frameSize := r.channels * 2

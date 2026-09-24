@@ -18,7 +18,10 @@ type Transport interface {
 	Addr() string
 	LocalAddr() *net.UDPAddr
 	Send(to string, data []byte) error
-	Receive(handler func([]byte, *net.UDPAddr))
+	// Receive registers a handler for incoming datagrams and returns a
+	// function that unregisters it. Transports may be shared by multiple
+	// streamers (one socket per node), each registering its own handler.
+	Receive(handler func([]byte, *net.UDPAddr)) (unregister func())
 	Wait()
 	Closed() bool
 	Close() error
@@ -103,6 +106,10 @@ type Streamer struct {
 	recvWG      sync.WaitGroup
 	peers       map[string]*RemotePeer // keyed by peer address
 	peersMu     sync.RWMutex
+
+	// unregister removes this streamer's handler from the (possibly shared)
+	// transport. Set in Start, called in Stop.
+	unregister func()
 }
 
 func NewStreamer(trans Transport, localIPs []string, config StreamConfig, localNodeID string) (*Streamer, error) {
@@ -201,7 +208,7 @@ func (s *Streamer) Start(input audio.AudioStream, destAddrs []string, output aud
 	// Start receive loop if we have output or local destinations
 	if output != nil || s.hasLocalDest(destAddrs) {
 		if s.transport != nil {
-			s.transport.Receive(s.handlePacket)
+			s.unregister = s.transport.Receive(s.handlePacket)
 		}
 		s.recvWG.Add(1)
 		go s.recvLoop(stopCh)
@@ -359,14 +366,20 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 }
 
 // Stop requests the streamer to terminate.
+// The streamer does not own the transport: transports are shared across
+// routes (one socket per node), so closing it here would tear down every
+// other active route. The owner (streamManager / caller) closes the
+// transport. We only unregister our receive handler so we stop consuming
+// packets targeting other routes.
 func (s *Streamer) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.stopCh != nil {
 		s.stopOnce.Do(func() { close(s.stopCh) })
 	}
-	if s.transport != nil {
-		s.transport.Close()
+	if s.unregister != nil {
+		s.unregister()
+		s.unregister = nil
 	}
 }
 
