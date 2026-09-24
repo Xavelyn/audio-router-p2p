@@ -39,9 +39,34 @@ func main() {
 		log.Fatalf("config load error: %v", err)
 	}
 
-	// Shared audio transport socket (UDP or DTLS).
+	// Discovery + clock sync run first: the DTLS client transport needs the
+	// peer's stream address, which comes from the route table / discovery.
+	disc, err := discovery.New(cfg, "")
+	if err != nil {
+		log.Fatalf("discovery: %v", err)
+	}
+	go disc.Run()
+	log.Printf("discovery started for node %s (advertised %s)", disc.NodeID(), disc.OwnAddr())
+
+	// Routing table is loaded before the transport so encrypt mode can resolve
+	// the (single) DTLS peer address.
+	rt, err := router.New(cfg.RoutesFile)
+	if err != nil {
+		log.Fatalf("router init error: %v", err)
+	}
+
+	// Shared audio transport socket (UDP or DTLS). In encrypt mode the DAILY
+	// DTLS/SRTP transport supports a single remote peer; derive it from the
+	// route table and fail fast unless exactly one distinct peer is used.
 	var trans streamer.Transport
 	if cfg.Encrypt {
+		remote := singleDTLSPeer(routesOf(rt, disc))
+		if remote == "" {
+			log.Fatal("encrypt mode requires exactly one distinct DTLS peer; " +
+				"set a single route with a peerAddr (or a single peerId that " +
+				"has been discovered) in " + cfg.RoutesFile)
+		}
+
 		// Parse PSK if provided
 		var psk []byte
 		if cfg.PSK != "" {
@@ -53,10 +78,11 @@ func main() {
 
 		dtlsCfg := transport.DTLSConfig{
 			ListenAddr: cfg.StreamPort,
+			RemoteAddr: remote,
 			CertFile:   cfg.CertFile,
 			KeyFile:    cfg.KeyFile,
 			PSK:        psk,
-			IsServer:   false, // Client initiates DTLS connection
+			IsServer:   true, // server role: accept the peer's DTLS connection
 		}
 		trans, err = transport.NewDTLSTransport(dtlsCfg)
 		if err != nil {
@@ -72,22 +98,10 @@ func main() {
 		log.Printf("audio UDP transport listening on %s", trans.Addr())
 	}
 
-	// Peer discovery + clock sync.
-	disc, err := discovery.New(cfg, "")
-	if err != nil {
-		log.Fatalf("discovery: %v", err)
-	}
-	go disc.Run()
-	log.Printf("discovery started for node %s (advertised %s)", disc.NodeID(), disc.OwnAddr())
-
+	// Clock sync.
 	sm := syncmgr.NewManager(cfg, disc)
 	go sm.Run()
 
-	// Routing table + live streams.
-	rt, err := router.New("routes.json")
-	if err != nil {
-		log.Fatalf("router init error: %v", err)
-	}
 	localIPs := collectLocalIPs(trans, disc)
 	streams := newStreamManager(cfg, trans, localIPs, disc)
 	for _, route := range rt.List() {

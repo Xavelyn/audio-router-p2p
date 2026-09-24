@@ -133,6 +133,9 @@ func deriveSRTPKeys(state dtls.State, role dtlsRole) (sendKey, recvKey []byte, e
 
 // NewDTLSConn creates a new DTLS connection with SRTP support
 func NewDTLSConn(cfg *DTLSConfig) (*DTLSConn, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("dtls: nil config")
+	}
 	role := roleClient
 	if cfg.IsServer {
 		role = roleServer
@@ -141,6 +144,16 @@ func NewDTLSConn(cfg *DTLSConfig) (*DTLSConn, error) {
 }
 
 func NewDTLSConnWithRole(cfg *DTLSConfig, role dtlsRole) (*DTLSConn, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("dtls: nil config")
+	}
+	if cfg.LocalAddr == nil {
+		return nil, fmt.Errorf("dtls: LocalAddr is required")
+	}
+	if role == roleClient && cfg.RemoteAddr == nil {
+		return nil, fmt.Errorf("dtls: client role requires a RemoteAddr")
+	}
+
 	var conn *dtls.Conn
 	var err error
 

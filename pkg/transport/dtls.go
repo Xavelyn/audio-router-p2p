@@ -44,6 +44,12 @@ type DTLSTransport struct {
 // constructor returns immediately; callers obtain a usable connection once
 // the peer has completed the DTLS handshake (see waitForConn).
 func NewDTLSTransport(cfg DTLSConfig) (*DTLSTransport, error) {
+	// Fail fast on misconfiguration at construction time instead of starting a
+	// doomed async dial: a client (initiator) role requires a concrete remote.
+	if !cfg.IsServer && cfg.RemoteAddr == "" {
+		return nil, fmt.Errorf("dtls: client role requires a non-empty RemoteAddr " +
+			"(set the single DTLS peer's stream address in routes.json)")
+	}
 	if cfg.HandshakeTimeout == 0 {
 		cfg.HandshakeTimeout = 10 * time.Second
 	}

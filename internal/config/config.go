@@ -15,6 +15,7 @@ type Config struct {
 	UseEmulator bool // true when running with the -use-emulator flag or the noaudio build
 	Encrypt     bool   // enable DTLS/SRTP encryption for audio streams
 	PSK         string // Pre-shared key for DTLS (base64 encoded)
+	RoutesFile   string // Path to the JSON routes file
 
 	MulticastGroup   string
 	MulticastPort    int
