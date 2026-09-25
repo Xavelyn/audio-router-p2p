@@ -10,23 +10,23 @@ import (
 
 // MediaFormat describes the audio format for a stream.
 type MediaFormat struct {
-	SampleRate  int    `json:"sampleRate"`
-	Channels    int    `json:"channels"`
-	FrameSize   int    `json:"frameSize"`   // bytes per frame (channels * 2 for int16)
-	Codec       string `json:"codec"`       // "pcm16" for now
-	PacketTime  int    `json:"packetTime"`  // ms per packet (e.g., 20ms)
-	MaxPacketBytes int `json:"maxPacketBytes,omitempty"`
+	SampleRate     int    `json:"sampleRate"`
+	Channels       int    `json:"channels"`
+	FrameSize      int    `json:"frameSize"`  // bytes per frame (channels * 2 for int16)
+	Codec          string `json:"codec"`      // "pcm16" for now
+	PacketTime     int    `json:"packetTime"` // ms per packet (e.g., 20ms)
+	MaxPacketBytes int    `json:"maxPacketBytes,omitempty"`
 }
 
 // SessionDescription is the SDP-like offer/answer for stream setup.
 type SessionDescription struct {
-	Type       string      `json:"type"`       // "offer" or "answer"
-	StreamID   [16]byte    `json:"streamId"`
-	Origin     string      `json:"origin"`     // node ID
-	Formats    []MediaFormat `json:"formats"`  // supported formats (offer) / selected format (answer)
-	Direction  string      `json:"direction"`  // "sendonly", "recvonly", "sendrecv"
-	Timestamp  int64       `json:"ts"`         // unix nano
-	Nonce      uint64      `json:"nonce"`      // for correlation
+	Type      string        `json:"type"` // "offer" or "answer"
+	StreamID  [16]byte      `json:"streamId"`
+	Origin    string        `json:"origin"`    // node ID
+	Formats   []MediaFormat `json:"formats"`   // supported formats (offer) / selected format (answer)
+	Direction string        `json:"direction"` // "sendonly", "recvonly", "sendrecv"
+	Timestamp int64         `json:"ts"`        // unix nano
+	Nonce     uint64        `json:"nonce"`     // for correlation
 }
 
 func NewOffer(origin string, streamID [16]byte, formats []MediaFormat, direction string) *SessionDescription {

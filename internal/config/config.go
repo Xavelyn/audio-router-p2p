@@ -12,10 +12,10 @@ type Config struct {
 	CertFile    string
 	KeyFile     string
 	AuthToken   string
-	UseEmulator bool // true when running with the -use-emulator flag or the noaudio build
+	UseEmulator bool   // true when running with the -use-emulator flag or the noaudio build
 	Encrypt     bool   // enable DTLS/SRTP encryption for audio streams
 	PSK         string // Pre-shared key for DTLS (base64 encoded)
-	RoutesFile   string // Path to the JSON routes file
+	RoutesFile  string // Path to the JSON routes file
 
 	MulticastGroup   string
 	MulticastPort    int
@@ -23,7 +23,7 @@ type Config struct {
 	SyncPort         int
 	StreamPort       string
 	AdvHost          string
-	ElectionPort     int                // dedicated election socket port
+	ElectionPort     int // dedicated election socket port
 	AnnounceInterval time.Duration
 	PeerTTL          time.Duration
 	SyncInterval     time.Duration
@@ -34,10 +34,10 @@ type Config struct {
 }
 
 type StaticPeerConfig struct {
-	ID         string `json:"id"`          // peer ID
-	Addr       string `json:"addr"`        // discovery/control address host:port
-	StreamAddr string `json:"streamAddr"`  // audio stream address host:port
-	SyncAddr   string `json:"syncAddr"`    // clock sync address host:port
+	ID         string `json:"id"`         // peer ID
+	Addr       string `json:"addr"`       // discovery/control address host:port
+	StreamAddr string `json:"streamAddr"` // audio stream address host:port
+	SyncAddr   string `json:"syncAddr"`   // clock sync address host:port
 }
 
 func Load() (*Config, error) {

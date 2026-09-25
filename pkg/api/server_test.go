@@ -46,6 +46,7 @@ func (m *mockStreamManager) StopRoute(routeID string) error {
 var errTest = &testError{"test error"}
 
 type testError struct{ msg string }
+
 func (e *testError) Error() string { return e.msg }
 
 func testConfig() *config.Config {
@@ -95,7 +96,7 @@ func newTestServer(t *testing.T, streams StreamManager) *Server {
 	rt := testRouter(t)
 	disc := testDiscovery(t)
 	sm := testSyncMgr(t)
-	
+
 	// Create server with custom prometheus registry to avoid duplicate registration
 	s := &Server{
 		cfg:     cfg,

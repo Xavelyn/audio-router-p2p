@@ -47,17 +47,17 @@ type RoomMember struct {
 
 // Room is a group of peers that play audio in sync
 type Room struct {
-	mu           sync.RWMutex
-	id           RoomID
-	name         string
-	state        atomic.Value
-	leader       atomic.Value
-	members      map[string]*RoomMember // keyed by peer ID
-	localID      string
-	cfg          *config.Config
-	disc         *discovery.Discovery
-	syncMgr      *syncmgr.Manager
-	transport    streamer.Transport
+	mu        sync.RWMutex
+	id        RoomID
+	name      string
+	state     atomic.Value
+	leader    atomic.Value
+	members   map[string]*RoomMember // keyed by peer ID
+	localID   string
+	cfg       *config.Config
+	disc      *discovery.Discovery
+	syncMgr   *syncmgr.Manager
+	transport streamer.Transport
 
 	stopCh    chan struct{}
 	closeOnce sync.Once
@@ -75,13 +75,13 @@ type Room struct {
 
 // RoomConfig holds the configuration for creating a room
 type RoomConfig struct {
-	ID           RoomID
-	Name         string
-	LocalPeerID  string
-	Config       *config.Config
-	Discovery    *discovery.Discovery
-	SyncManager  *syncmgr.Manager
-	Transport    streamer.Transport
+	ID          RoomID
+	Name        string
+	LocalPeerID string
+	Config      *config.Config
+	Discovery   *discovery.Discovery
+	SyncManager *syncmgr.Manager
+	Transport   streamer.Transport
 }
 
 // NewRoom creates a new room
@@ -230,14 +230,14 @@ func (r *Room) addMember(id string, m *RoomMember) {
 		if m.StreamAddr != "" {
 			cur.StreamAddr = m.StreamAddr
 		}
-	if m.SyncAddr != "" {
-		cur.SyncAddr = m.SyncAddr
-	}
-	// carry the peer's own presence timestamp: when a remote stops announcing
-	// (e.g. it closed transport), the discovery entry's LastSeen freezes, so
-	// this member ages out via peerTTL even though discovery still lists the
-	// stale peer for its own longer cache TTL.
-	cur.LastSeen = m.LastSeen
+		if m.SyncAddr != "" {
+			cur.SyncAddr = m.SyncAddr
+		}
+		// carry the peer's own presence timestamp: when a remote stops announcing
+		// (e.g. it closed transport), the discovery entry's LastSeen freezes, so
+		// this member ages out via peerTTL even though discovery still lists the
+		// stale peer for its own longer cache TTL.
+		cur.LastSeen = m.LastSeen
 	} else {
 		m.LastSeen = time.Now()
 		r.members[id] = m

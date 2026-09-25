@@ -15,12 +15,12 @@ import (
 
 // DTLSConfig holds configuration for DTLS transport
 type DTLSConfig struct {
-	ListenAddr string        // Local address to bind (e.g., ":45678")
-	RemoteAddr string        // Remote address to connect to (for client)
-	CertFile   string        // Path to certificate file
-	KeyFile    string        // Path to key file
-	PSK        []byte        // Pre-shared key (optional)
-	IsServer   bool          // true for server (responder), false for client (initiator)
+	ListenAddr       string        // Local address to bind (e.g., ":45678")
+	RemoteAddr       string        // Remote address to connect to (for client)
+	CertFile         string        // Path to certificate file
+	KeyFile          string        // Path to key file
+	PSK              []byte        // Pre-shared key (optional)
+	IsServer         bool          // true for server (responder), false for client (initiator)
 	HandshakeTimeout time.Duration // Timeout for DTLS handshake
 }
 

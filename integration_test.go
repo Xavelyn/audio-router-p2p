@@ -62,11 +62,11 @@ func TestMultiRoomSync(t *testing.T) {
 		for j, m := range nodeConfigs {
 			if i != j {
 				n.disc.AddPeer(&discovery.Peer{
-					ID:        m.disc.NodeID(),
-					Addr:      m.disc.OwnAddr(),
-					SyncAddr:  m.disc.OwnSyncAddr(),
+					ID:         m.disc.NodeID(),
+					Addr:       m.disc.OwnAddr(),
+					SyncAddr:   m.disc.OwnSyncAddr(),
 					StreamAddr: m.disc.OwnStreamAddr(),
-					LastSeen:  time.Now(),
+					LastSeen:   time.Now(),
 				})
 			}
 		}
@@ -405,7 +405,7 @@ func TestAutoReconnect(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-tmpDir := t.TempDir()
+	tmpDir := t.TempDir()
 	certFile := filepath.Join(tmpDir, "cert.pem")
 	keyFile := filepath.Join(tmpDir, "key.pem")
 
@@ -1022,4 +1022,3 @@ func roomStateString(s group.RoomState) string {
 		return fmt.Sprintf("Unknown(%d)", s)
 	}
 }
-

@@ -91,9 +91,9 @@ func TestOffsetComputation(t *testing.T) {
 
 	base := time.Unix(0, 0)
 	t1 := base
-	t2 := t1.Add(delay + skew)      // server clock
-	t3 := t2.Add(proc)              // server clock
-	t4 := t3.Add(delay - skew)      // client clock (t4 = t3 - θ + δ)
+	t2 := t1.Add(delay + skew) // server clock
+	t3 := t2.Add(proc)         // server clock
+	t4 := t3.Add(delay - skew) // client clock (t4 = t3 - θ + δ)
 
 	offset := ((t2.UnixNano() - t1.UnixNano()) + (t3.UnixNano() - t4.UnixNano())) / 2
 	if time.Duration(offset) < skew-10*time.Millisecond || time.Duration(offset) > skew+10*time.Millisecond {

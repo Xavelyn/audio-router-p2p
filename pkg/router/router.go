@@ -19,12 +19,12 @@ type StreamRoute struct {
 	Channels     int      `json:"channels,omitempty"`
 
 	// Peer binding and negotiated format
-	PeerID       string `json:"peerId,omitempty"`       // Bound peer ID (empty = any/unicast)
-	PeerAddr     string `json:"peerAddr,omitempty"`     // Peer's stream address (host:port)
-	Negotiated   bool   `json:"negotiated,omitempty"`   // Whether format was negotiated
-	NegSampleRate int   `json:"negSampleRate,omitempty"` // Negotiated sample rate
-	NegChannels  int    `json:"negChannels,omitempty"`  // Negotiated channels
-	NegCodec     string `json:"negCodec,omitempty"`     // Negotiated codec (e.g., "pcm16")
+	PeerID        string `json:"peerId,omitempty"`        // Bound peer ID (empty = any/unicast)
+	PeerAddr      string `json:"peerAddr,omitempty"`      // Peer's stream address (host:port)
+	Negotiated    bool   `json:"negotiated,omitempty"`    // Whether format was negotiated
+	NegSampleRate int    `json:"negSampleRate,omitempty"` // Negotiated sample rate
+	NegChannels   int    `json:"negChannels,omitempty"`   // Negotiated channels
+	NegCodec      string `json:"negCodec,omitempty"`      // Negotiated codec (e.g., "pcm16")
 }
 
 // Router is a persistent, file-backed store of StreamRoutes.

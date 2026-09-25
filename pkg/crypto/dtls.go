@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/pion/dtls/v2"
-	"github.com/pion/rtp"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/srtp/v2"
 )
 
@@ -257,10 +257,10 @@ func buildDTLSConfig(cfg *DTLSConfig) (*dtls.Config, error) {
 	dtlsConfig := &dtls.Config{
 		// Self-signed certs: the connecting peer is trusted via the room's
 		// authentication layer, so skip chain verification.
-		InsecureSkipVerify: true,
-		Certificates:       []tls.Certificate{},
+		InsecureSkipVerify:   true,
+		Certificates:         []tls.Certificate{},
 		ExtendedMasterSecret: dtls.RequestExtendedMasterSecret,
-		MTU:                1500,
+		MTU:                  1500,
 		SRTPProtectionProfiles: []dtls.SRTPProtectionProfile{
 			dtls.SRTP_AES128_CM_HMAC_SHA1_80,
 			dtls.SRTP_AEAD_AES_128_GCM,

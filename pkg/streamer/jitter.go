@@ -25,33 +25,33 @@ var (
 // It smooths out network jitter by buffering packets and playing them out
 // at a steady rate. The target delay adapts based on observed network conditions.
 type JitterBuffer struct {
-	mu           sync.Mutex
-	frames       []*jbFrame
-	capacity     int
-	frameSize    int
-	sampleRate   int
-	channels     int
+	mu         sync.Mutex
+	frames     []*jbFrame
+	capacity   int
+	frameSize  int
+	sampleRate int
+	channels   int
 
 	// Playout state
-	playoutTime   time.Time
-	originTime    time.Time
-	originSeq     uint32 // sequence number of the anchor (first) packet
-	nextSeq       uint32 // sequence number expected at the head of playout
+	playoutTime    time.Time
+	originTime     time.Time
+	originSeq      uint32 // sequence number of the anchor (first) packet
+	nextSeq        uint32 // sequence number expected at the head of playout
 	seqInitialized bool
 
 	// Adaptive delay
-	targetDelay    time.Duration
-	minDelay       time.Duration
-	maxDelay       time.Duration
-	ewmaDelay      time.Duration
-	ewmaDeviation  time.Duration
-	alpha          float64 // EWMA smoothing factor
+	targetDelay   time.Duration
+	minDelay      time.Duration
+	maxDelay      time.Duration
+	ewmaDelay     time.Duration
+	ewmaDeviation time.Duration
+	alpha         float64 // EWMA smoothing factor
 
 	// Stats
-	underruns      uint64
-	overruns       uint64
-	latePackets    uint64
-	earlyPackets   uint64
+	underruns    uint64
+	overruns     uint64
+	latePackets  uint64
+	earlyPackets uint64
 
 	closed bool
 }
@@ -132,10 +132,10 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 		jb.overruns++
 	}
 	jb.frames[idx] = &jbFrame{
-		seq:      seq,
+		seq:       seq,
 		timestamp: ts,
-		data:     append([]byte(nil), data...),
-		received: now,
+		data:      append([]byte(nil), data...),
+		received:  now,
 	}
 
 	// Adaptive delay adjustment based on arrival time vs expected
@@ -270,28 +270,28 @@ func (jb *JitterBuffer) Stats() JitterBufferStats {
 		}
 	}
 	return JitterBufferStats{
-		BufferedFrames:  buffered,
-		CapacityFrames:  jb.capacity,
-		TargetDelay:     jb.targetDelay,
-		MinDelay:        jb.minDelay,
-		MaxDelay:        jb.maxDelay,
-		Underruns:       jb.underruns,
-		Overruns:        jb.overruns,
-		LatePackets:     jb.latePackets,
-		EarlyPackets:    jb.earlyPackets,
+		BufferedFrames: buffered,
+		CapacityFrames: jb.capacity,
+		TargetDelay:    jb.targetDelay,
+		MinDelay:       jb.minDelay,
+		MaxDelay:       jb.maxDelay,
+		Underruns:      jb.underruns,
+		Overruns:       jb.overruns,
+		LatePackets:    jb.latePackets,
+		EarlyPackets:   jb.earlyPackets,
 	}
 }
 
 type JitterBufferStats struct {
-	BufferedFrames  int
-	CapacityFrames  int
-	TargetDelay     time.Duration
-	MinDelay        time.Duration
-	MaxDelay        time.Duration
-	Underruns       uint64
-	Overruns        uint64
-	LatePackets     uint64
-	EarlyPackets    uint64
+	BufferedFrames int
+	CapacityFrames int
+	TargetDelay    time.Duration
+	MinDelay       time.Duration
+	MaxDelay       time.Duration
+	Underruns      uint64
+	Overruns       uint64
+	LatePackets    uint64
+	EarlyPackets   uint64
 }
 
 func (jb *JitterBuffer) Close() error {
@@ -304,11 +304,11 @@ func (jb *JitterBuffer) Close() error {
 // Resampler provides linear interpolation resampling for sample rate conversion.
 // Not for production quality; use soxr or similar for high-quality resampling.
 type Resampler struct {
-	inRate    int
-	outRate   int
-	channels  int
-	pos       float64
-	step      float64
+	inRate     int
+	outRate    int
+	channels   int
+	pos        float64
+	step       float64
 	lastSample []float64
 }
 
@@ -342,13 +342,13 @@ func (r *Resampler) Resample(inData []byte) ([]byte, int) {
 	}
 
 	// Estimate output frames
-	outFrames := int(float64(inFrames) / r.step) + 2
+	outFrames := int(float64(inFrames)/r.step) + 2
 	outData := make([]byte, outFrames*frameSize)
 
 	// Convert input to float
 	inFloat := make([]float64, inFrames*r.channels)
 	for i := 0; i < inFrames*r.channels; i++ {
-		inFloat[i] = float64(int16(inData[i*2]) | int16(inData[i*2+1])<<8) / 32768.0
+		inFloat[i] = float64(int16(inData[i*2])|int16(inData[i*2+1])<<8) / 32768.0
 	}
 
 	outIdx := 0

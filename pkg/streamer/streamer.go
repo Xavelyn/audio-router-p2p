@@ -67,8 +67,8 @@ type RemotePeer struct {
 type StreamConfig struct {
 	SampleRate    int
 	Channels      int
-	PacketTime    int       // ms per packet
-	JitterBufSize int       // frames
+	PacketTime    int // ms per packet
+	JitterBufSize int // frames
 	MinDelay      time.Duration
 	MaxDelay      time.Duration
 }
@@ -86,26 +86,26 @@ func DefaultStreamConfig(sampleRate, channels int) StreamConfig {
 
 // Streamer handles bidirectional audio streaming with negotiation, jitter buffering, and resampling.
 type Streamer struct {
-	transport  Transport
-	localIPs   []*net.IP
-	config     StreamConfig
-	streamID   [16]byte
+	transport   Transport
+	localIPs    []*net.IP
+	config      StreamConfig
+	streamID    [16]byte
 	localNodeID string
 
-	mu          sync.Mutex
-	started     bool
-	stopCh      chan struct{}
-	stopOnce    sync.Once
-	errCh       chan error
-	doneCh      chan struct{}
+	mu       sync.Mutex
+	started  bool
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	errCh    chan error
+	doneCh   chan struct{}
 
 	// Send path
-	sendSeq     uint32
+	sendSeq uint32
 
 	// Receive path
-	recvWG      sync.WaitGroup
-	peers       map[string]*RemotePeer // keyed by peer address
-	peersMu     sync.RWMutex
+	recvWG  sync.WaitGroup
+	peers   map[string]*RemotePeer // keyed by peer address
+	peersMu sync.RWMutex
 
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.

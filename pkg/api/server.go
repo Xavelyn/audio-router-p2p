@@ -41,12 +41,12 @@ type Server struct {
 // NewServer wires the API together. streams may be nil for read-only mode.
 func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery, syncMgr *sync.Manager, streams StreamManager) *Server {
 	s := &Server{
-		cfg:     cfg,
-		rt:      rt,
-		disc:    disc,
-		syncMgr: syncMgr,
-		streams: streams,
-		mux:     http.NewServeMux(),
+		cfg:      cfg,
+		rt:       rt,
+		disc:     disc,
+		syncMgr:  syncMgr,
+		streams:  streams,
+		mux:      http.NewServeMux(),
 		registry: prometheus.NewRegistry(),
 	}
 	s.reqs = prometheus.NewCounterVec(prometheus.CounterOpts{
