@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 )
 
@@ -29,6 +30,11 @@ type Config struct {
 	SyncInterval     time.Duration
 	ShutdownTimeout  time.Duration
 
+	// Room orchestration flags
+	RoomID       string // Room ID to create/join
+	RoomName     string // Human-readable room name
+	RoomAutoJoin bool   // Auto-join the room on startup
+
 	// StaticPeers for cross-broadcast domain connectivity (manual peer config)
 	StaticPeers []StaticPeerConfig
 }
@@ -40,32 +46,47 @@ type StaticPeerConfig struct {
 	SyncAddr   string `json:"syncAddr"`   // clock sync address host:port
 }
 
+// Load loads configuration from command-line arguments.
 func Load() (*Config, error) {
-	cfg := &Config{}
-	flag.StringVar(&cfg.ListenAddr, "listen", ":8443", "HTTP listen address (TLS)")
-	flag.StringVar(&cfg.CertFile, "cert", "cert.pem", "TLS certificate file")
-	flag.StringVar(&cfg.KeyFile, "key", "key.pem", "TLS key file")
-	flag.StringVar(&cfg.AuthToken, "auth-token", "", "Authentication token for the API and peer handshakes")
-	flag.BoolVar(&cfg.UseEmulator, "use-emulator", false, "Use the audio emulator instead of real devices")
-	flag.BoolVar(&cfg.Encrypt, "encrypt", false, "Enable DTLS/SRTP encryption for audio streams")
-	flag.StringVar(&cfg.PSK, "psk", "", "Pre-shared key for DTLS encryption (base64 encoded)")
-	flag.StringVar(&cfg.RoutesFile, "routes", "routes.json", "Path to the JSON routes file")
+	return LoadFromArgs(os.Args[1:])
+}
 
-	flag.StringVar(&cfg.MulticastGroup, "multicast-group", "239.255.0.1", "Multicast group for peer discovery")
-	flag.IntVar(&cfg.MulticastPort, "multicast-port", 45400, "Multicast port for peer announcements")
-	flag.IntVar(&cfg.DiscoveryPort, "discovery-port", 45401, "Node's unicast discovery/control port")
-	flag.IntVar(&cfg.SyncPort, "sync-port", 45402, "Node's clock-sync UDP port")
-	flag.IntVar(&cfg.ElectionPort, "election-port", 45403, "Node's election UDP port")
-	flag.StringVar(&cfg.StreamPort, "stream-port", ":45678", "UDP port for audio streaming [host:]port")
-	flag.StringVar(&cfg.AdvHost, "adv-host", "", "Host/IP to advertise to peers (default: auto-detect)")
-	flag.DurationVar(&cfg.AnnounceInterval, "announce-interval", 3*time.Second, "Peer discovery announce interval")
-	flag.DurationVar(&cfg.PeerTTL, "peer-ttl", 10*time.Second, "How long a peer entry lives without refresh")
-	flag.DurationVar(&cfg.SyncInterval, "sync-interval", 2*time.Second, "Heartbeat/clock-sync interval")
-	flag.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", 5*time.Second, "Graceful shutdown timeout")
+// LoadFromArgs parses configuration from a slice of command-line arguments.
+func LoadFromArgs(args []string) (*Config, error) {
+	cfg := &Config{}
+	fs := flag.NewFlagSet("audio-router", flag.ContinueOnError)
+
+	fs.StringVar(&cfg.ListenAddr, "listen", ":8443", "HTTP listen address (TLS)")
+	fs.StringVar(&cfg.CertFile, "cert", "cert.pem", "TLS certificate file")
+	fs.StringVar(&cfg.KeyFile, "key", "key.pem", "TLS key file")
+	fs.StringVar(&cfg.AuthToken, "auth-token", "", "Authentication token for the API and peer handshakes")
+	fs.BoolVar(&cfg.UseEmulator, "use-emulator", false, "Use the audio emulator instead of real devices")
+	fs.BoolVar(&cfg.Encrypt, "encrypt", false, "Enable DTLS/SRTP encryption for audio streams")
+	fs.StringVar(&cfg.PSK, "psk", "", "Pre-shared key for DTLS encryption (base64 encoded)")
+	fs.StringVar(&cfg.RoutesFile, "routes", "routes.json", "Path to the JSON routes file")
+
+	fs.StringVar(&cfg.MulticastGroup, "multicast-group", "239.255.0.1", "Multicast group for peer discovery")
+	fs.IntVar(&cfg.MulticastPort, "multicast-port", 45400, "Multicast port for peer announcements")
+	fs.IntVar(&cfg.DiscoveryPort, "discovery-port", 45401, "Node's unicast discovery/control port")
+	fs.IntVar(&cfg.SyncPort, "sync-port", 45402, "Node's clock-sync UDP port")
+	fs.IntVar(&cfg.ElectionPort, "election-port", 45403, "Node's election UDP port")
+	fs.StringVar(&cfg.StreamPort, "stream-port", ":45678", "UDP port for audio streaming [host:]port")
+	fs.StringVar(&cfg.AdvHost, "adv-host", "", "Host/IP to advertise to peers (default: auto-detect)")
+	fs.DurationVar(&cfg.AnnounceInterval, "announce-interval", 3*time.Second, "Peer discovery announce interval")
+	fs.DurationVar(&cfg.PeerTTL, "peer-ttl", 10*time.Second, "How long a peer entry lives without refresh")
+	fs.DurationVar(&cfg.SyncInterval, "sync-interval", 2*time.Second, "Heartbeat/clock-sync interval")
+	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", 5*time.Second, "Graceful shutdown timeout")
+
+	fs.StringVar(&cfg.RoomID, "room-id", "", "Room ID to create/join")
+	fs.StringVar(&cfg.RoomName, "room-name", "", "Human-readable name of the room")
+	fs.BoolVar(&cfg.RoomAutoJoin, "room-auto-join", false, "Auto-join room on daemon startup")
 
 	// Static peers (comma-separated JSON array)
-	staticPeersJSON := flag.String("static-peers", "", "Static peers JSON array (for cross-broadcast domains)")
-	flag.Parse()
+	staticPeersJSON := fs.String("static-peers", "", "Static peers JSON array (for cross-broadcast domains)")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
 
 	if *staticPeersJSON != "" {
 		if err := json.Unmarshal([]byte(*staticPeersJSON), &cfg.StaticPeers); err != nil {

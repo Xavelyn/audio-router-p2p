@@ -26,6 +26,7 @@ import (
 	"github.com/audio-router-p2p/pkg/api"
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/discovery"
+	"github.com/audio-router-p2p/pkg/group"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	syncmgr "github.com/audio-router-p2p/pkg/sync"
@@ -110,8 +111,29 @@ func main() {
 		}
 	}
 
+	// Room Manager
+	roomMgr := group.NewDefaultRoomManager(cfg, disc, sm, trans)
+	if cfg.RoomAutoJoin || cfg.RoomID != "" {
+		roomID := cfg.RoomID
+		if roomID == "" {
+			roomID = "default"
+		}
+		roomName := cfg.RoomName
+		if roomName == "" {
+			roomName = "Default Room"
+		}
+		if _, err := roomMgr.CreateRoom(roomID, roomName); err != nil {
+			log.Printf("auto-create room %s: %v", roomID, err)
+		}
+		if err := roomMgr.JoinRoom(roomID); err != nil {
+			log.Printf("auto-join room %s: %v", roomID, err)
+		} else {
+			log.Printf("auto-joined room %s (%s)", roomID, roomName)
+		}
+	}
+
 	// HTTP API.
-	apiSrv := api.NewServer(cfg, rt, disc, sm, streams)
+	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
 	if err := ensureTLS(cfg); err != nil {
 		log.Fatalf("TLS: %v", err)
@@ -134,6 +156,7 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("HTTP shutdown: %v", err)
 	}
+	_ = roomMgr.Close()
 	streams.StopAll()
 	disc.Close()
 	sm.Close()
@@ -316,6 +339,19 @@ func (m *streamManager) StopAll() {
 		delete(m.routes, id)
 		m.stopLocked(as)
 	}
+}
+
+// Stats returns statistics for all active streams.
+func (m *streamManager) Stats() map[string]streamer.StreamerStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res := make(map[string]streamer.StreamerStats, len(m.routes))
+	for id, as := range m.routes {
+		if as.st != nil {
+			res[id] = as.st.Stats()
+		}
+	}
+	return res
 }
 
 func (m *streamManager) stopLocked(as *activeStream) {
