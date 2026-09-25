@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/audio/dsp"
 	"github.com/audio-router-p2p/pkg/transport"
 )
 
@@ -29,7 +30,7 @@ var (
 // at a steady rate. The target delay adapts based on observed network conditions.
 type JitterBuffer struct {
 	mu         sync.Mutex
-	frames     []*jbFrame
+	frames     []jbFrame
 	capacity   int
 	frameSize  int
 	sampleRate int
@@ -44,6 +45,12 @@ type JitterBuffer struct {
 
 	// DTX mode
 	dtxMode bool
+
+	// PLC and Clock Drift
+	plc        *dsp.PSOLAConcealer
+	driftCtrl  *ClockDriftController
+	concealBuf []byte
+	recoverBuf []byte
 
 	// Adaptive delay
 	targetDelay   time.Duration
@@ -67,6 +74,7 @@ type jbFrame struct {
 	timestamp time.Time // sender timestamp
 	data      []byte
 	received  time.Time
+	valid     bool
 }
 
 func NewJitterBuffer(frameSize, sampleRate, channels int, capacityFrames int) *JitterBuffer {
@@ -75,8 +83,16 @@ func NewJitterBuffer(frameSize, sampleRate, channels int, capacityFrames int) *J
 	}
 	minDelay := time.Duration(20) * time.Millisecond
 	maxDelay := time.Duration(200) * time.Millisecond
+	targetWatermark := float64(minDelay) / float64(20*time.Millisecond)
+	if targetWatermark < 1.0 {
+		targetWatermark = 1.0
+	}
+	frames := make([]jbFrame, capacityFrames)
+	for i := range frames {
+		frames[i].data = make([]byte, frameSize)
+	}
 	return &JitterBuffer{
-		frames:      make([]*jbFrame, capacityFrames),
+		frames:      frames,
 		capacity:    capacityFrames,
 		frameSize:   frameSize,
 		sampleRate:  sampleRate,
@@ -86,6 +102,10 @@ func NewJitterBuffer(frameSize, sampleRate, channels int, capacityFrames int) *J
 		targetDelay: minDelay,
 		ewmaDelay:   minDelay,
 		alpha:       0.125,
+		plc:         dsp.NewPSOLAConcealer(sampleRate, channels),
+		driftCtrl:   NewClockDriftController(DefaultClockDriftConfig(targetWatermark)),
+		concealBuf:  make([]byte, frameSize),
+		recoverBuf:  make([]byte, frameSize),
 	}
 }
 
@@ -143,8 +163,16 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 		jb.seqInitialized = true
 	}
 
-	// Calculate expected playout time for this sequence
-	expectedPlayout := jb.playoutTime.Add(time.Duration(seq-jb.originSeq) * jb.frameDuration())
+	// Signed RFC 1982 serial number distance from next expected sequence
+	distFromNext := int32(seq - jb.nextSeq)
+	if distFromNext < 0 {
+		jb.latePackets++
+		return 0, nil
+	}
+
+	// Calculate expected playout time for this sequence using signed distance from origin
+	distFromOrigin := int32(seq - jb.originSeq)
+	expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
 
 	// Check if packet is too late (already past playout time)
 	late := now.After(expectedPlayout.Add(jb.targetDelay))
@@ -156,23 +184,34 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	// naturally via unsigned modulo, which keeps buffered frames at stable
 	// slots regardless of how many packets play out in between.
 	idx := int(seq % uint32(jb.capacity))
+	f := &jb.frames[idx]
 
 	dropped := 0
-	if jb.frames[idx] != nil {
+	if f.valid {
 		// Overwrite existing frame (overrun)
 		dropped = 1
 		jb.overruns++
 	}
-	jb.frames[idx] = &jbFrame{
-		seq:       seq,
-		timestamp: ts,
-		data:      append([]byte(nil), data...),
-		received:  now,
-	}
+	f.seq = seq
+	f.timestamp = ts
+	copy(f.data, data)
+	f.received = now
+	f.valid = true
 
 	// Adaptive delay adjustment based on arrival time vs expected (omit SID packets from jitter stats)
 	if jb.seqInitialized && !late && !isSID {
 		jb.adaptDelay(now, expectedPlayout)
+	}
+
+	// Update clock drift controller with current buffer depth
+	if jb.driftCtrl != nil && !isSID {
+		buffered := 0
+		for i := range jb.frames {
+			if jb.frames[i].valid {
+				buffered++
+			}
+		}
+		jb.driftCtrl.Update(float64(buffered))
 	}
 
 	return dropped, nil
@@ -195,18 +234,34 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 		}
 
 		idx := int(jb.nextSeq % uint32(jb.capacity))
-		frame := jb.frames[idx]
-		if frame != nil {
-			jb.frames[idx] = nil
+		frame := &jb.frames[idx]
+		if frame.valid && frame.seq == jb.nextSeq {
+			frame.valid = false
 			jb.nextSeq++
-			return frame.data, frame.seq, nil
+			data := frame.data
+			if jb.plc != nil {
+				if jb.plc.ConsecutiveConcealed() > 0 {
+					n := jb.plc.Recover(frame.data, jb.recoverBuf)
+					data = append([]byte(nil), jb.recoverBuf[:n]...)
+				} else {
+					jb.plc.AddHistory(frame.data)
+				}
+			}
+			return data, frame.seq, nil
 		}
 
-		// Check if it's time to play out silence (underrun or DTX comfort noise)
-		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.nextSeq-jb.originSeq) * jb.frameDuration())
+		// Check if it's time to play out silence or run PLC (underrun or DTX comfort noise)
+		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
+		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
 		if time.Now().After(expectedPlayout) {
 			if !jb.dtxMode {
 				jb.underruns++
+				if jb.plc != nil {
+					n := jb.plc.Conceal(jb.concealBuf)
+					concealed := append([]byte(nil), jb.concealBuf[:n]...)
+					jb.nextSeq++
+					return concealed, jb.nextSeq - 1, nil
+				}
 			}
 			// Generate silence frame
 			silence := make([]byte, jb.frameSize)
@@ -236,13 +291,19 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 	}
 
 	idx := int(jb.nextSeq % uint32(jb.capacity))
-
-	frame := jb.frames[idx]
-	if frame == nil {
-		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.nextSeq-jb.originSeq) * jb.frameDuration())
+	frame := &jb.frames[idx]
+	if !frame.valid || frame.seq != jb.nextSeq {
+		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
+		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
 		if time.Now().After(expectedPlayout) {
 			if !jb.dtxMode {
 				jb.underruns++
+				if jb.plc != nil {
+					n := jb.plc.Conceal(jb.concealBuf)
+					concealed := append([]byte(nil), jb.concealBuf[:n]...)
+					jb.nextSeq++
+					return concealed, jb.nextSeq - 1, nil
+				}
 			}
 			silence := make([]byte, jb.frameSize)
 			jb.nextSeq++
@@ -251,9 +312,18 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 		return nil, 0, ErrBufferEmpty
 	}
 
-	jb.frames[idx] = nil
+	frame.valid = false
 	jb.nextSeq++
-	return frame.data, frame.seq, nil
+	data := frame.data
+	if jb.plc != nil {
+		if jb.plc.ConsecutiveConcealed() > 0 {
+			n := jb.plc.Recover(frame.data, jb.recoverBuf)
+			data = append([]byte(nil), jb.recoverBuf[:n]...)
+		} else {
+			jb.plc.AddHistory(frame.data)
+		}
+	}
+	return data, frame.seq, nil
 }
 
 func (jb *JitterBuffer) frameDuration() time.Duration {
@@ -300,12 +370,12 @@ func (jb *JitterBuffer) Stats() JitterBufferStats {
 	defer jb.mu.Unlock()
 
 	buffered := 0
-	for _, f := range jb.frames {
-		if f != nil {
+	for i := range jb.frames {
+		if jb.frames[i].valid {
 			buffered++
 		}
 	}
-	return JitterBufferStats{
+	stats := JitterBufferStats{
 		BufferedFrames: buffered,
 		CapacityFrames: jb.capacity,
 		TargetDelay:    jb.targetDelay,
@@ -317,19 +387,48 @@ func (jb *JitterBuffer) Stats() JitterBufferStats {
 		EarlyPackets:   jb.earlyPackets,
 		DTXMode:        jb.dtxMode,
 	}
+
+	if jb.driftCtrl != nil {
+		stats.DriftPPM = jb.driftCtrl.DriftPPM()
+		stats.ResampleRatio = jb.driftCtrl.Ratio()
+		stats.SmoothedWatermark = jb.driftCtrl.SmoothedWatermark()
+	}
+	if jb.plc != nil {
+		stats.PLC = jb.plc.Stats()
+	}
+
+	return stats
+}
+
+// PLC returns the underlying packet loss concealer.
+func (jb *JitterBuffer) PLC() *dsp.PSOLAConcealer {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	return jb.plc
+}
+
+// DriftController returns the clock drift controller.
+func (jb *JitterBuffer) DriftController() *ClockDriftController {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	return jb.driftCtrl
 }
 
 type JitterBufferStats struct {
-	BufferedFrames int           `json:"bufferedFrames"`
-	CapacityFrames int           `json:"capacityFrames"`
-	TargetDelay    time.Duration `json:"targetDelay"`
-	MinDelay       time.Duration `json:"minDelay"`
-	MaxDelay       time.Duration `json:"maxDelay"`
-	Underruns      uint64        `json:"underruns"`
-	Overruns       uint64        `json:"overruns"`
-	LatePackets    uint64        `json:"latePackets"`
-	EarlyPackets   uint64        `json:"earlyPackets"`
-	DTXMode        bool          `json:"dtxMode,omitempty"`
+	BufferedFrames    int           `json:"bufferedFrames"`
+	CapacityFrames    int           `json:"capacityFrames"`
+	TargetDelay       time.Duration `json:"targetDelay"`
+	MinDelay          time.Duration `json:"minDelay"`
+	MaxDelay          time.Duration `json:"maxDelay"`
+	Underruns         uint64        `json:"underruns"`
+	Overruns          uint64        `json:"overruns"`
+	LatePackets       uint64        `json:"latePackets"`
+	EarlyPackets      uint64        `json:"earlyPackets"`
+	DTXMode           bool          `json:"dtxMode,omitempty"`
+	DriftPPM          float64       `json:"driftPPM,omitempty"`
+	ResampleRatio     float64       `json:"resampleRatio,omitempty"`
+	SmoothedWatermark float64       `json:"smoothedWatermark,omitempty"`
+	PLC               dsp.PLCStats  `json:"plc,omitempty"`
 }
 
 func (jb *JitterBuffer) Close() error {

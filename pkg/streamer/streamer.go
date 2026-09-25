@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"math"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -67,6 +68,15 @@ type RemotePeer struct {
 	Resampler      *Resampler
 	IngressAdapter *IngressAdapter
 	Output         audio.AudioStream
+	FECDecoder     *transport.FECDecoder
+	ASRC           *dsp.ASRCResampler
+	asrcOutBuf     []byte
+}
+
+// FECConfig configures RFC 5109 1-D XOR Parity Matrix Forward Error Correction.
+type FECConfig struct {
+	Enabled   bool `json:"enabled"`
+	GroupSize int  `json:"groupSize"` // K media packets per 1 parity packet (default 4)
 }
 
 // StreamConfig holds configuration for a stream session.
@@ -78,6 +88,7 @@ type StreamConfig struct {
 	MinDelay      time.Duration
 	MaxDelay      time.Duration
 	DTX           dsp.DTXConfig
+	FEC           FECConfig
 }
 
 func DefaultStreamConfig(sampleRate, channels int) StreamConfig {
@@ -89,6 +100,10 @@ func DefaultStreamConfig(sampleRate, channels int) StreamConfig {
 		MinDelay:      20 * time.Millisecond,
 		MaxDelay:      200 * time.Millisecond,
 		DTX:           dsp.DefaultDTXConfig(),
+		FEC: FECConfig{
+			Enabled:   false,
+			GroupSize: 4,
+		},
 	}
 }
 
@@ -113,13 +128,18 @@ type Streamer struct {
 	packetsSuppressed atomic.Uint64
 
 	// Send path
-	sendSeq atomic.Uint32
+	sendSeq        atomic.Uint32
+	fecEncoder     *transport.FECEncoder
+	fecEncoderMu   sync.Mutex
+	fecParitySent  atomic.Uint64
 
 	// Receive path
-	recvWG      sync.WaitGroup
-	peers       map[string]*RemotePeer // keyed by peer address
-	peersMu     sync.RWMutex
-	packetsRecv atomic.Uint64
+	recvWG         sync.WaitGroup
+	peers          map[string]*RemotePeer // keyed by peer address
+	peersMu        sync.RWMutex
+	packetsRecv    atomic.Uint64
+	fecParityRecv  atomic.Uint64
+	fecRecovered   atomic.Uint64
 
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.
@@ -184,6 +204,22 @@ func NewStreamer(trans Transport, localIPs []string, config StreamConfig, localN
 		peers:       make(map[string]*RemotePeer),
 		dtx:         dsp.NewDTXController(config.DTX),
 	}
+
+	if config.FEC.Enabled {
+		groupSize := config.FEC.GroupSize
+		if groupSize <= 0 {
+			groupSize = 4
+		}
+		pb := (config.SampleRate * config.PacketTime / 1000) * config.Channels * 2
+		if pb <= 0 {
+			pb = config.Channels * 2 * 256
+		}
+		enc, err := transport.NewFECEncoder(groupSize, pb)
+		if err != nil {
+			return nil, err
+		}
+		s.fecEncoder = enc
+	}
 	for _, a := range localIPs {
 		ip, err := parseIP(a)
 		if err != nil {
@@ -235,11 +271,19 @@ func (s *Streamer) Start(input audio.AudioStream, destAddrs []string, output aud
 	s.peersMu.Lock()
 	for _, addr := range destAddrs {
 		isLocal := s.isLocalDest(addr)
+		fecGroupSize := s.config.FEC.GroupSize
+		if fecGroupSize <= 0 {
+			fecGroupSize = 4
+		}
+		fecDec, _ := transport.NewFECDecoder(fecGroupSize, packetBytes)
 		peer := &RemotePeer{
 			Addr:           addr,
 			Direction:      DirSendRecv,
 			Output:         output,
 			IngressAdapter: NewIngressAdapter(s.config.SampleRate, s.config.Channels),
+			FECDecoder:     fecDec,
+			ASRC:           dsp.NewASRCResampler(s.config.Channels),
+			asrcOutBuf:     make([]byte, packetBytes*2+64),
 		}
 		if !isLocal && s.transport != nil {
 			// No SDP handshake runs here (see the de-scope note in
@@ -254,6 +298,12 @@ func (s *Streamer) Start(input audio.AudioStream, destAddrs []string, output aud
 			)
 			jb.minDelay = s.config.MinDelay
 			jb.maxDelay = s.config.MaxDelay
+			jb.targetDelay = s.config.MinDelay
+			tw := float64(s.config.MinDelay) / float64(jb.frameDuration())
+			if tw < 1.0 {
+				tw = 1.0
+			}
+			jb.driftCtrl = NewClockDriftController(DefaultClockDriftConfig(tw))
 			peer.JitterBuf = jb
 		}
 		s.peers[addr] = peer
@@ -371,6 +421,35 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			}
 		}
 		s.peersMu.RUnlock()
+
+		// Send RFC 5109 parity packet if group completed
+		if s.fecEncoder != nil && !isSID {
+			s.fecEncoderMu.Lock()
+			parityPayload, ready := s.fecEncoder.Encode(seq, packetBuf[:packetBytes])
+			if ready {
+				s.fecParitySent.Add(1)
+				paritySeq := s.sendSeq.Add(1) - 1
+				parityHdr := transport.PacketHeader{
+					Seq:        paritySeq,
+					Timestamp:  uint64(time.Now().UnixNano()),
+					SampleRate: uint32(s.config.SampleRate),
+					Channels:   uint8(s.config.Channels),
+					Flags:      transport.FlagFEC,
+					StreamID:   sid,
+				}
+				parityPkt := transport.Marshal(parityHdr, parityPayload)
+				s.peersMu.RLock()
+				for _, peer := range s.peers {
+					if !s.isLocalDest(peer.Addr) && s.transport != nil {
+						if err := s.transport.Send(peer.Addr, parityPkt); err != nil && !errors.Is(err, net.ErrClosed) {
+							log.Printf("streamer: send parity to %s: %v", peer.Addr, err)
+						}
+					}
+				}
+				s.peersMu.RUnlock()
+			}
+			s.fecEncoderMu.Unlock()
+		}
 	}
 }
 
@@ -406,7 +485,27 @@ func (s *Streamer) playout() {
 		}
 
 		if peer.Output != nil {
-			if _, err := peer.Output.Write(data); err != nil {
+			playData := data
+			if peer.ASRC != nil {
+				ratio := 1.0
+				if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
+					ratio = jb.driftCtrl.Ratio()
+				}
+				// Deadband: engage ASRC resampling when ratio diverges by > 1.0 ppm (1.0e-6).
+				// Preserves exact byte nominal passthrough under negligible jitter/noise.
+				if math.Abs(ratio-1.0) > 1.0e-6 {
+					needed := len(data)*2 + 64
+					if len(peer.asrcOutBuf) < needed {
+						peer.asrcOutBuf = make([]byte, needed)
+					}
+					n := peer.ASRC.Process(data, peer.asrcOutBuf, ratio)
+					if n > 0 {
+						playData = peer.asrcOutBuf[:n]
+					}
+				}
+			}
+
+			if _, err := peer.Output.Write(playData); err != nil {
 				log.Printf("streamer: output write error: %v", err)
 			}
 		}
@@ -452,7 +551,18 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		)
 		jb.minDelay = s.config.MinDelay
 		jb.maxDelay = s.config.MaxDelay
+		jb.targetDelay = s.config.MinDelay
+		tw := float64(s.config.MinDelay) / float64(jb.frameDuration())
+		if tw < 1.0 {
+			tw = 1.0
+		}
+		jb.driftCtrl = NewClockDriftController(DefaultClockDriftConfig(tw))
 
+		fecGroupSize := s.config.FEC.GroupSize
+		if fecGroupSize <= 0 {
+			fecGroupSize = 4
+		}
+		fecDec, _ := transport.NewFECDecoder(fecGroupSize, packetBytes)
 		peer = &RemotePeer{
 			Addr:           peerAddr,
 			StreamID:       hdr.StreamID,
@@ -460,11 +570,23 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 			Output:         outStream,
 			JitterBuf:      jb,
 			IngressAdapter: NewIngressAdapter(s.config.SampleRate, s.config.Channels),
+			FECDecoder:     fecDec,
+			ASRC:           dsp.NewASRCResampler(s.config.Channels),
+			asrcOutBuf:     make([]byte, packetBytes*2+64),
 		}
 
 		s.peersMu.Lock()
 		if existing, exists := s.peers[peerAddr]; exists {
 			peer = existing
+			if peer.FECDecoder == nil {
+				peer.FECDecoder, _ = transport.NewFECDecoder(fecGroupSize, packetBytes)
+			}
+			if peer.ASRC == nil {
+				peer.ASRC = dsp.NewASRCResampler(s.config.Channels)
+			}
+			if len(peer.asrcOutBuf) == 0 {
+				peer.asrcOutBuf = make([]byte, packetBytes*2+64)
+			}
 		} else {
 			const maxDynamicPeers = 64
 			if len(s.peers) >= maxDynamicPeers {
@@ -477,6 +599,46 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	}
 
 	s.packetsRecv.Add(1)
+
+	// Handle RFC 5109 Parity Packet
+	if (hdr.Flags & transport.FlagFEC) != 0 {
+		s.fecParityRecv.Add(1)
+		reconstructed, err := peer.FECDecoder.ProcessParity(payload)
+		if err == nil && len(reconstructed) > 0 {
+			for _, rec := range reconstructed {
+				s.fecRecovered.Add(1)
+				recData := rec.Data
+				if peer.IngressAdapter != nil {
+					if norm, err := peer.IngressAdapter.Process(recData, int(hdr.SampleRate), int(hdr.Channels)); err == nil {
+						recData = norm
+					}
+				}
+				if peer.JitterBuf != nil {
+					peer.JitterBuf.PushWithFlags(rec.Seq, int64(hdr.Timestamp), recData, transport.FlagRedundant)
+				}
+			}
+		}
+		return
+	}
+
+	// For media packets, check if arriving packet solves a missing group
+	if peer.FECDecoder != nil {
+		reconstructed := peer.FECDecoder.ProcessMedia(hdr.Seq, payload)
+		if len(reconstructed) > 0 {
+			for _, rec := range reconstructed {
+				s.fecRecovered.Add(1)
+				recData := rec.Data
+				if peer.IngressAdapter != nil {
+					if norm, err := peer.IngressAdapter.Process(recData, int(hdr.SampleRate), int(hdr.Channels)); err == nil {
+						recData = norm
+					}
+				}
+				if peer.JitterBuf != nil {
+					peer.JitterBuf.PushWithFlags(rec.Seq, int64(hdr.Timestamp), recData, transport.FlagRedundant)
+				}
+			}
+		}
+	}
 
 	if len(payload) == 0 && (hdr.Flags&transport.FlagSID) != 0 {
 		payload = make([]byte, s.packetBytes())
@@ -542,6 +704,33 @@ func (s *Streamer) StreamID() [16]byte {
 	return s.streamID
 }
 
+// FECStats contains forward error correction metrics per ADR 0004.
+type FECStats struct {
+	GroupSizeK                 int    `json:"group_size_k"`
+	ParityPacketsSentTotal     uint64 `json:"parity_packets_sent_total"`
+	ParityPacketsReceivedTotal uint64 `json:"parity_packets_received_total"`
+	PacketsRecoveredTotal      uint64 `json:"packets_recovered_total"`
+	UnrecoverableGroupsTotal   uint64 `json:"unrecoverable_groups_total"`
+}
+
+// PLCStats contains packet loss concealment metrics per ADR 0004.
+type PLCStats struct {
+	ConcealedFramesTotal         uint64 `json:"concealed_frames_total"`
+	PitchDetectedFramesTotal     uint64 `json:"pitch_detected_frames_total"`
+	NoiseExtrapolatedFramesTotal uint64 `json:"noise_extrapolated_frames_total"`
+	SilenceDecayEventsTotal      uint64 `json:"silence_decay_events_total"`
+}
+
+// ASRCStats contains asynchronous sample rate converter and drift metrics per ADR 0004.
+type ASRCStats struct {
+	NominalRateHz           int     `json:"nominal_rate_hz"`
+	SmoothedWatermarkFrames float64 `json:"smoothed_watermark_frames"`
+	TargetWatermarkFrames   float64 `json:"target_watermark_frames"`
+	DriftPPM                float64 `json:"drift_ppm"`
+	ResampleRatio           float64 `json:"resample_ratio"`
+	SamplesAdjustedTotal    uint64  `json:"samples_adjusted_total"`
+}
+
 // StreamerStats holds aggregated telemetry and per-peer jitter buffer statistics.
 type StreamerStats struct {
 	StreamID          string                       `json:"streamId"`
@@ -556,6 +745,9 @@ type StreamerStats struct {
 	PeakdBFS          float64                      `json:"peak_dbfs"`
 	DTXState          string                       `json:"dtx_state"`
 	PacketsSuppressed uint64                       `json:"dtx_packets_suppressed_total"`
+	FEC               FECStats                     `json:"fec"`
+	PLC               PLCStats                     `json:"plc"`
+	ASRC              ASRCStats                    `json:"asrc"`
 }
 
 // Stats returns statistics for this streamer and all peer connections.
@@ -567,12 +759,27 @@ func (s *Streamer) Stats() StreamerStats {
 	s.peersMu.RLock()
 	defer s.peersMu.RUnlock()
 
+	fecK := s.config.FEC.GroupSize
+	if fecK <= 0 {
+		fecK = 4
+	}
+
 	stats := StreamerStats{
 		StreamID:          sid,
 		PacketsSent:       uint64(s.sendSeq.Load()),
 		PacketsReceived:   s.packetsRecv.Load(),
 		PacketsSuppressed: s.packetsSuppressed.Load(),
 		Peers:             make(map[string]JitterBufferStats, len(s.peers)),
+		FEC: FECStats{
+			GroupSizeK:                 fecK,
+			ParityPacketsSentTotal:     s.fecParitySent.Load(),
+			ParityPacketsReceivedTotal: s.fecParityRecv.Load(),
+			PacketsRecoveredTotal:      s.fecRecovered.Load(),
+		},
+		ASRC: ASRCStats{
+			NominalRateHz: s.config.SampleRate,
+			ResampleRatio: 1.0,
+		},
 	}
 
 	if s.dtx != nil {
@@ -583,6 +790,13 @@ func (s *Streamer) Stats() StreamerStats {
 	}
 
 	for addr, peer := range s.peers {
+		if peer.FECDecoder != nil {
+			fDecStats := peer.FECDecoder.Stats()
+			stats.FEC.UnrecoverableGroupsTotal += fDecStats.UnrecoverableGroupsTotal
+		}
+		if peer.ASRC != nil {
+			stats.ASRC.SamplesAdjustedTotal += peer.ASRC.SamplesAdjusted()
+		}
 		if peer.JitterBuf != nil {
 			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
 				jbStats := jb.Stats()
@@ -591,6 +805,18 @@ func (s *Streamer) Stats() StreamerStats {
 				stats.Overruns += jbStats.Overruns
 				stats.LatePackets += jbStats.LatePackets
 				stats.EarlyPackets += jbStats.EarlyPackets
+
+				stats.PLC.ConcealedFramesTotal += jbStats.PLC.ConcealedFramesTotal
+				stats.PLC.PitchDetectedFramesTotal += jbStats.PLC.PitchDetectedFramesTotal
+				stats.PLC.NoiseExtrapolatedFramesTotal += jbStats.PLC.NoiseExtrapolatedFramesTotal
+				stats.PLC.SilenceDecayEventsTotal += jbStats.PLC.SilenceDecayEventsTotal
+
+				if jb.driftCtrl != nil {
+					stats.ASRC.SmoothedWatermarkFrames = jb.driftCtrl.SmoothedWatermark()
+					stats.ASRC.TargetWatermarkFrames = jb.driftCtrl.TargetWatermark()
+					stats.ASRC.DriftPPM = jb.driftCtrl.DriftPPM()
+					stats.ASRC.ResampleRatio = jb.driftCtrl.Ratio()
+				}
 			}
 		}
 	}

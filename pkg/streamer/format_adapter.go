@@ -1,7 +1,6 @@
 package streamer
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"math"
@@ -25,6 +24,7 @@ type IngressAdapter struct {
 	matrices map[int]dsp.ChannelMatrix // cached matrix per inChannels
 	chanBuf  []byte
 	outBuf   []byte
+	asrc     *dsp.ASRCResampler
 }
 
 // NewIngressAdapter creates an IngressAdapter targeting outRate and outChannels.
@@ -41,6 +41,7 @@ func NewIngressAdapter(outRate, outChannels int) *IngressAdapter {
 		matrices:    make(map[int]dsp.ChannelMatrix),
 		chanBuf:     make([]byte, defaultScratchBytes),
 		outBuf:      make([]byte, defaultScratchBytes),
+		asrc:        dsp.NewASRCResampler(outChannels),
 	}
 }
 
@@ -96,7 +97,7 @@ func (a *IngressAdapter) Process(in []byte, inRate, inChannels int) ([]byte, err
 		}
 	}
 
-	// Step 2: Linear Resampling
+	// Step 2: Dynamic ASRC Resampling using Catmull-Rom cubic interpolation
 	if inRate == a.outRate {
 		// No resampling needed; pass through remapped audio
 		outBytes := inFrames * a.outChannels * bytesPerSample
@@ -108,8 +109,8 @@ func (a *IngressAdapter) Process(in []byte, inRate, inChannels int) ([]byte, err
 		return a.outBuf[:outBytes], nil
 	}
 
-	// Calculate output frames
-	outFrames := int(math.Round(float64(inFrames) * float64(a.outRate) / float64(inRate)))
+	step := float64(inRate) / float64(a.outRate)
+	outFrames := int(math.Round(float64(inFrames) / step))
 	if outFrames <= 0 {
 		return a.outBuf[:0], nil
 	}
@@ -118,61 +119,11 @@ func (a *IngressAdapter) Process(in []byte, inRate, inChannels int) ([]byte, err
 	if len(a.outBuf) < outBytes {
 		a.outBuf = make([]byte, outBytes*2)
 	}
-	outSlice := a.outBuf[:outBytes]
 
-	step := float64(inRate) / float64(a.outRate)
-	pos := a.phase
-
-	sampleAt := func(frameIdx, ch int) int16 {
-		if frameIdx < inFrames {
-			off := (frameIdx*a.outChannels + ch) * 2
-			return int16(binary.LittleEndian.Uint16(remapSrc[off:]))
-		}
-		if inFrames >= 2 {
-			lastOff := ((inFrames-1)*a.outChannels + ch) * 2
-			prevOff := ((inFrames-2)*a.outChannels + ch) * 2
-			sLast := int32(int16(binary.LittleEndian.Uint16(remapSrc[lastOff:])))
-			sPrev := int32(int16(binary.LittleEndian.Uint16(remapSrc[prevOff:])))
-			extrap := sLast + (sLast - sPrev)
-			if extrap > 32767 {
-				extrap = 32767
-			} else if extrap < -32768 {
-				extrap = -32768
-			}
-			return int16(extrap)
-		}
-		if inFrames == 1 {
-			off := ch * 2
-			return int16(binary.LittleEndian.Uint16(remapSrc[off:]))
-		}
-		return 0
+	if a.asrc == nil {
+		a.asrc = dsp.NewASRCResampler(a.outChannels)
 	}
 
-	for m := 0; m < outFrames; m++ {
-		k := int(pos)
-		frac := pos - float64(k)
-
-		for c := 0; c < a.outChannels; c++ {
-			s0 := float64(sampleAt(k, c))
-			s1 := float64(sampleAt(k+1, c))
-			interp := s0*(1.0-frac) + s1*frac
-			if interp > 32767.0 {
-				interp = 32767.0
-			} else if interp < -32768.0 {
-				interp = -32768.0
-			}
-			val := int16(math.Round(interp))
-			off := (m*a.outChannels + c) * 2
-			binary.LittleEndian.PutUint16(outSlice[off:], uint16(val))
-		}
-		pos += step
-	}
-
-	// Carry over fractional phase
-	a.phase = pos - float64(inFrames)
-	if a.phase < 0 {
-		a.phase = 0
-	}
-
-	return outSlice, nil
+	n := a.asrc.Process(remapSrc, a.outBuf[:outBytes], step)
+	return a.outBuf[:n], nil
 }

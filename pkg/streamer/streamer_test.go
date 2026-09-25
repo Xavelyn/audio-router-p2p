@@ -434,6 +434,56 @@ func TestJitterBufferWraparound(t *testing.T) {
 	}
 }
 
+func TestJitterBuffer_LatePackets(t *testing.T) {
+	jb := NewJitterBuffer(2, 44100, 1, 10)
+	defer jb.Close()
+
+	baseTime := time.Now().UnixNano()
+	// Push seq 10 to anchor
+	if _, err := jb.Push(10, baseTime, []byte{0x10, 0x00}); err != nil {
+		t.Fatalf("Push(10) error: %v", err)
+	}
+
+	// Pop seq 10, advancing nextSeq to 11
+	data, seq, err := jb.Pop()
+	if err != nil || seq != 10 {
+		t.Fatalf("Pop(10) failed: seq=%d err=%v", seq, err)
+	}
+	if !bytes.Equal(data, []byte{0x10, 0x00}) {
+		t.Fatalf("data mismatch")
+	}
+
+	// Now push seq 9 (distFromNext = 9 - 11 = -2 < 0): must be treated as late packet
+	if _, err := jb.Push(9, baseTime, []byte{0x09, 0x00}); err != nil {
+		t.Fatalf("Push(9) error: %v", err)
+	}
+
+	stats := jb.Stats()
+	if stats.LatePackets != 1 {
+		t.Fatalf("expected 1 late packet, got %d", stats.LatePackets)
+	}
+
+	// Buffer must not pop seq 9
+	if _, _, err := jb.PopNonBlock(); err != ErrBufferEmpty {
+		t.Fatalf("expected ErrBufferEmpty, got %v", err)
+	}
+}
+
+func BenchmarkJitterBuffer_Push(b *testing.B) {
+	jb := NewJitterBuffer(960*4, 48000, 2, 200)
+	defer jb.Close()
+
+	payload := make([]byte, 960*4)
+	ts := time.Now().UnixNano()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		jb.Push(uint32(i), ts, payload)
+	}
+}
+
 // TestResampler tests the resampler
 func TestResampler(t *testing.T) {
 	// 44100 -> 48000
