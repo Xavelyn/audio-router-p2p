@@ -5,11 +5,14 @@ import (
 	"math"
 	"sync"
 	"time"
+
+	"github.com/audio-router-p2p/pkg/transport"
 )
 
 // JitterBufferInterface defines the interface for jitter buffers.
 type JitterBufferInterface interface {
 	Push(seq uint32, timestamp int64, data []byte) (int, error)
+	PushWithFlags(seq uint32, timestamp int64, data []byte, flags uint8) (int, error)
 	PopNonBlock() ([]byte, uint32, error)
 	Stats() JitterBufferStats
 	Close() error
@@ -38,6 +41,9 @@ type JitterBuffer struct {
 	originSeq      uint32 // sequence number of the anchor (first) packet
 	nextSeq        uint32 // sequence number expected at the head of playout
 	seqInitialized bool
+
+	// DTX mode
+	dtxMode bool
 
 	// Adaptive delay
 	targetDelay   time.Duration
@@ -83,12 +89,16 @@ func NewJitterBuffer(frameSize, sampleRate, channels int, capacityFrames int) *J
 	}
 }
 
-// Push adds a frame to the jitter buffer.
-// seq: packet sequence number
-// timestamp: sender's timestamp (nanoseconds since epoch)
-// data: audio frame data
+// Push adds a frame to the jitter buffer defaulting to FlagActive.
 // Returns the number of frames dropped due to overflow.
 func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, error) {
+	return jb.PushWithFlags(seq, timestamp, data, transport.FlagActive)
+}
+
+// PushWithFlags adds a frame to the jitter buffer with wire control flags.
+// When a packet carries FlagSID, it updates the playout sequence anchor and
+// marks the buffer as operating in DTX silence suppression mode.
+func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, flags uint8) (int, error) {
 	jb.mu.Lock()
 	defer jb.mu.Unlock()
 
@@ -101,6 +111,28 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 
 	now := time.Now()
 	ts := time.Unix(0, timestamp)
+
+	isSID := (flags & transport.FlagSID) != 0
+
+	// Handle DTX mode transitions and sequence anchoring
+	if isSID {
+		jb.dtxMode = true
+		jb.originSeq = seq
+		jb.nextSeq = seq
+		jb.originTime = ts
+		jb.playoutTime = now.Add(jb.targetDelay)
+		jb.seqInitialized = true
+	} else if (flags & transport.FlagActive) != 0 {
+		if jb.dtxMode {
+			// Transition out of DTX silence mode back to active speech
+			jb.dtxMode = false
+			jb.originSeq = seq
+			jb.nextSeq = seq
+			jb.originTime = ts
+			jb.playoutTime = now.Add(jb.targetDelay)
+			jb.seqInitialized = true
+		}
+	}
 
 	// Initialize origin on first packet
 	if !jb.seqInitialized {
@@ -138,8 +170,8 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 		received:  now,
 	}
 
-	// Adaptive delay adjustment based on arrival time vs expected
-	if jb.seqInitialized && !late {
+	// Adaptive delay adjustment based on arrival time vs expected (omit SID packets from jitter stats)
+	if jb.seqInitialized && !late && !isSID {
 		jb.adaptDelay(now, expectedPlayout)
 	}
 
@@ -170,10 +202,12 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 			return frame.data, frame.seq, nil
 		}
 
-		// Check if it's time to play out silence (underrun)
+		// Check if it's time to play out silence (underrun or DTX comfort noise)
 		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.nextSeq-jb.originSeq) * jb.frameDuration())
 		if time.Now().After(expectedPlayout) {
-			jb.underruns++
+			if !jb.dtxMode {
+				jb.underruns++
+			}
 			// Generate silence frame
 			silence := make([]byte, jb.frameSize)
 			jb.nextSeq++
@@ -207,7 +241,9 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 	if frame == nil {
 		expectedPlayout := jb.playoutTime.Add(time.Duration(jb.nextSeq-jb.originSeq) * jb.frameDuration())
 		if time.Now().After(expectedPlayout) {
-			jb.underruns++
+			if !jb.dtxMode {
+				jb.underruns++
+			}
 			silence := make([]byte, jb.frameSize)
 			jb.nextSeq++
 			return silence, jb.nextSeq - 1, nil
@@ -279,19 +315,21 @@ func (jb *JitterBuffer) Stats() JitterBufferStats {
 		Overruns:       jb.overruns,
 		LatePackets:    jb.latePackets,
 		EarlyPackets:   jb.earlyPackets,
+		DTXMode:        jb.dtxMode,
 	}
 }
 
 type JitterBufferStats struct {
-	BufferedFrames int
-	CapacityFrames int
-	TargetDelay    time.Duration
-	MinDelay       time.Duration
-	MaxDelay       time.Duration
-	Underruns      uint64
-	Overruns       uint64
-	LatePackets    uint64
-	EarlyPackets   uint64
+	BufferedFrames int           `json:"bufferedFrames"`
+	CapacityFrames int           `json:"capacityFrames"`
+	TargetDelay    time.Duration `json:"targetDelay"`
+	MinDelay       time.Duration `json:"minDelay"`
+	MaxDelay       time.Duration `json:"maxDelay"`
+	Underruns      uint64        `json:"underruns"`
+	Overruns       uint64        `json:"overruns"`
+	LatePackets    uint64        `json:"latePackets"`
+	EarlyPackets   uint64        `json:"earlyPackets"`
+	DTXMode        bool          `json:"dtxMode,omitempty"`
 }
 
 func (jb *JitterBuffer) Close() error {

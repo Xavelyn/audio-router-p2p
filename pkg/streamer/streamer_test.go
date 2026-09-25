@@ -460,3 +460,42 @@ func TestResampler(t *testing.T) {
 		t.Fatalf("unexpected output frames: %d", len(outData)/2)
 	}
 }
+
+func TestDeriveStreamID(t *testing.T) {
+	id1 := DeriveStreamID("secret-key", "room-123")
+	id2 := DeriveStreamID("secret-key", "room-123")
+	id3 := DeriveStreamID("different-secret", "room-123")
+	id4 := DeriveStreamID("", "room-123")
+
+	var empty [16]byte
+	if id1 == empty {
+		t.Fatal("DeriveStreamID returned empty stream ID")
+	}
+	if id1 != id2 {
+		t.Fatal("DeriveStreamID is not deterministic for same inputs")
+	}
+	if id1 == id3 {
+		t.Fatal("DeriveStreamID should differ for different secrets")
+	}
+	if id4 == empty {
+		t.Fatal("DeriveStreamID without secret should return valid SHA256 prefix")
+	}
+}
+
+func TestStreamerSetStreamIDAndStats(t *testing.T) {
+	s, err := NewStreamer(nil, []string{"127.0.0.1"}, DefaultStreamConfig(44100, 1), "test-node")
+	if err != nil {
+		t.Fatalf("NewStreamer: %v", err)
+	}
+
+	customID := DeriveStreamID("test-secret", "custom-stream")
+	s.SetStreamID(customID)
+	if s.StreamID() != customID {
+		t.Fatalf("StreamID mismatch: got %v want %v", s.StreamID(), customID)
+	}
+
+	stats := s.Stats()
+	if stats.StreamID == "" {
+		t.Fatal("Stats should report non-empty StreamID")
+	}
+}
