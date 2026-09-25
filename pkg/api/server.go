@@ -6,12 +6,14 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	stdSync "sync"
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
+	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,6 +23,24 @@ import (
 type StreamManager interface {
 	StartRoute(route router.StreamRoute) error
 	StopRoute(routeID string) error
+	Stats() map[string]streamer.StreamerStats
+}
+
+// RoomInfo describes a room's state and members.
+type RoomInfo struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name"`
+	Leader  string   `json:"leader,omitempty"`
+	State   string   `json:"state,omitempty"`
+	Members []string `json:"members,omitempty"`
+}
+
+// RoomManager provides management operations for group audio rooms.
+type RoomManager interface {
+	ListRooms() []RoomInfo
+	CreateRoom(id, name string) (RoomInfo, error)
+	JoinRoom(id string) error
+	LeaveRoom(id string) error
 }
 
 // Server is the HTTP control-plane API.
@@ -30,6 +50,8 @@ type Server struct {
 	disc    *discovery.Discovery
 	syncMgr *sync.Manager
 	streams StreamManager
+	roomMgr RoomManager
+	roomMgrMu stdSync.RWMutex
 	mux     *http.ServeMux
 
 	reqs         *prometheus.CounterVec
@@ -38,14 +60,19 @@ type Server struct {
 	registry     *prometheus.Registry
 }
 
-// NewServer wires the API together. streams may be nil for read-only mode.
-func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery, syncMgr *sync.Manager, streams StreamManager) *Server {
+// NewServer wires the API together. streams and roomMgr may be nil for read-only mode.
+func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery, syncMgr *sync.Manager, streams StreamManager, roomMgr ...RoomManager) *Server {
+	var rm RoomManager
+	if len(roomMgr) > 0 {
+		rm = roomMgr[0]
+	}
 	s := &Server{
 		cfg:      cfg,
 		rt:       rt,
 		disc:     disc,
 		syncMgr:  syncMgr,
 		streams:  streams,
+		roomMgr:  rm,
 		mux:      http.NewServeMux(),
 		registry: prometheus.NewRegistry(),
 	}
@@ -66,6 +93,19 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	return s
 }
 
+// SetRoomManager configures the room manager for group endpoints.
+func (s *Server) SetRoomManager(rm RoomManager) {
+	s.roomMgrMu.Lock()
+	defer s.roomMgrMu.Unlock()
+	s.roomMgr = rm
+}
+
+func (s *Server) getRoomManager() RoomManager {
+	s.roomMgrMu.RLock()
+	defer s.roomMgrMu.RUnlock()
+	return s.roomMgr
+}
+
 // Handler returns the fully-wrapped HTTP handler.
 func (s *Server) Handler() http.Handler {
 	return s.recoverPanic(s.metrics(s.authenticate(s.mux)))
@@ -77,6 +117,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/peers", s.handlePeers)
 	s.mux.HandleFunc("/sync", s.handleSync)
 	s.mux.HandleFunc("/routes", s.handleRoutes)
+	s.mux.HandleFunc("/streams/stats", s.handleStreamStats)
+	s.mux.HandleFunc("/rooms", s.handleRooms)
+	s.mux.HandleFunc("/rooms/", s.handleRoomsSubpath)
 	s.mux.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
 }
 
@@ -187,6 +230,7 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, routes)
 
 	case http.MethodPost:
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var sr router.StreamRoute
 		if err := json.NewDecoder(r.Body).Decode(&sr); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -229,5 +273,130 @@ func (s *Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleStreamStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if s.streams == nil {
+		writeJSON(w, http.StatusOK, map[string]streamer.StreamerStats{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.streams.Stats())
+}
+
+func (s *Server) handleRooms(w http.ResponseWriter, r *http.Request) {
+	roomMgr := s.getRoomManager()
+	switch r.Method {
+	case http.MethodGet:
+		if roomMgr == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "room manager not configured"})
+			return
+		}
+		rooms := roomMgr.ListRooms()
+		if rooms == nil {
+			rooms = []RoomInfo{}
+		}
+		writeJSON(w, http.StatusOK, rooms)
+
+	case http.MethodPost:
+		if roomMgr == nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "room manager not configured"})
+			return
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var req struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		room, err := roomMgr.CreateRoom(req.ID, req.Name)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusCreated, room)
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	roomMgr := s.getRoomManager()
+	if roomMgr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "room manager not configured"})
+		return
+	}
+
+	sub := strings.TrimPrefix(r.URL.Path, "/rooms/")
+	var isJoin, isLeave bool
+	var roomID string
+
+	if sub == "join" || strings.HasSuffix(sub, "/join") {
+		isJoin = true
+		roomID = strings.TrimSuffix(sub, "/join")
+		if roomID == "join" {
+			roomID = ""
+		}
+	} else if sub == "leave" || strings.HasSuffix(sub, "/leave") {
+		isLeave = true
+		roomID = strings.TrimSuffix(sub, "/leave")
+		if roomID == "leave" {
+			roomID = ""
+		}
+	} else {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	if roomID == "" {
+		roomID = r.URL.Query().Get("id")
+	}
+	if roomID == "" && r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var req struct {
+			ID     string `json:"id"`
+			RoomID string `json:"roomId"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.ID != "" {
+			roomID = req.ID
+		} else {
+			roomID = req.RoomID
+		}
+	}
+
+	if roomID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "room id is required"})
+		return
+	}
+
+	if isJoin {
+		if err := roomMgr.JoinRoom(roomID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "joined", "id": roomID})
+		return
+	}
+
+	if isLeave {
+		if err := roomMgr.LeaveRoom(roomID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "left", "id": roomID})
+		return
 	}
 }

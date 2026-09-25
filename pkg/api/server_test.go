@@ -13,6 +13,7 @@ import (
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
+	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -22,6 +23,16 @@ type mockStreamManager struct {
 	stopped  []string
 	startErr error
 	stopErr  error
+}
+
+func (m *mockStreamManager) Stats() map[string]streamer.StreamerStats {
+	return map[string]streamer.StreamerStats{
+		"route-1": {
+			StreamID:        "abcd1234abcd1234",
+			PacketsSent:     100,
+			PacketsReceived: 95,
+		},
+	}
 }
 
 func (m *mockStreamManager) StartRoute(route router.StreamRoute) error {
@@ -507,5 +518,174 @@ func TestStatusNilSyncMgr(t *testing.T) {
 	}
 	if got := int(body["syncPeers"].(float64)); got != 0 {
 		t.Fatalf("expected syncPeers 0 with nil syncMgr, got %d", got)
+	}
+}
+
+type testMockRoomManager struct {
+	rooms    map[string]RoomInfo
+	joinErr  error
+	leaveErr error
+}
+
+func newTestMockRoomManager() *testMockRoomManager {
+	return &testMockRoomManager{rooms: make(map[string]RoomInfo)}
+}
+
+func (m *testMockRoomManager) ListRooms() []RoomInfo {
+	res := make([]RoomInfo, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		res = append(res, r)
+	}
+	return res
+}
+
+func (m *testMockRoomManager) CreateRoom(id, name string) (RoomInfo, error) {
+	if id == "" {
+		id = "gen-" + name
+	}
+	info := RoomInfo{ID: id, Name: name, Leader: "node-1"}
+	m.rooms[id] = info
+	return info, nil
+}
+
+func (m *testMockRoomManager) JoinRoom(id string) error {
+	if m.joinErr != nil {
+		return m.joinErr
+	}
+	r, ok := m.rooms[id]
+	if !ok {
+		r = RoomInfo{ID: id}
+	}
+	r.Members = append(r.Members, "local-peer")
+	m.rooms[id] = r
+	return nil
+}
+
+func (m *testMockRoomManager) LeaveRoom(id string) error {
+	if m.leaveErr != nil {
+		return m.leaveErr
+	}
+	delete(m.rooms, id)
+	return nil
+}
+
+func TestServerStreamStats(t *testing.T) {
+	// 1. Without streams
+	s := newTestServer(t, nil)
+	handler := s.Handler()
+
+	w := doRequest(t, handler, http.MethodGet, "/streams/stats", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /streams/stats without streams, got %d", w.Code)
+	}
+
+	// 2. With mock streams
+	msm := &mockStreamManager{}
+	s2 := newTestServer(t, msm)
+	h2 := s2.Handler()
+
+	w2 := doRequest(t, h2, http.MethodGet, "/streams/stats", nil, "test-token")
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /streams/stats with streams, got %d", w2.Code)
+	}
+	var stats map[string]streamer.StreamerStats
+	if err := json.NewDecoder(w2.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if r1, ok := stats["route-1"]; !ok || r1.PacketsSent != 100 {
+		t.Fatalf("unexpected stream stats: %+v", stats)
+	}
+
+	// 3. Method not allowed
+	w3 := doRequest(t, h2, http.MethodPost, "/streams/stats", nil, "test-token")
+	if w3.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on POST /streams/stats, got %d", w3.Code)
+	}
+}
+
+func TestServerRoomsUnconfigured(t *testing.T) {
+	s := newTestServer(t, nil)
+	handler := s.Handler()
+
+	w := doRequest(t, handler, http.MethodGet, "/rooms", nil, "test-token")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unconfigured room manager, got %d", w.Code)
+	}
+}
+
+func TestServerRoomsListAndCreate(t *testing.T) {
+	s := newTestServer(t, nil)
+	rm := newTestMockRoomManager()
+	s.SetRoomManager(rm)
+	handler := s.Handler()
+
+	// Initially empty list
+	w := doRequest(t, handler, http.MethodGet, "/rooms", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /rooms, got %d", w.Code)
+	}
+	var rooms []RoomInfo
+	if err := json.NewDecoder(w.Body).Decode(&rooms); err != nil {
+		t.Fatalf("decode rooms: %v", err)
+	}
+	if len(rooms) != 0 {
+		t.Fatalf("expected 0 rooms, got %d", len(rooms))
+	}
+
+	// Create room
+	createBody := map[string]string{"id": "studio-1", "name": "Main Studio"}
+	w = doRequest(t, handler, http.MethodPost, "/rooms", createBody, "test-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 from POST /rooms, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// List rooms again
+	w = doRequest(t, handler, http.MethodGet, "/rooms", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /rooms, got %d", w.Code)
+	}
+	if err := json.NewDecoder(w.Body).Decode(&rooms); err != nil {
+		t.Fatalf("decode rooms: %v", err)
+	}
+	if len(rooms) != 1 || rooms[0].ID != "studio-1" {
+		t.Fatalf("expected studio-1 in rooms, got: %+v", rooms)
+	}
+}
+
+func TestServerRoomsJoinAndLeave(t *testing.T) {
+	s := newTestServer(t, nil)
+	rm := newTestMockRoomManager()
+	_, _ = rm.CreateRoom("room-alpha", "Alpha")
+	s.SetRoomManager(rm)
+	handler := s.Handler()
+
+	// Join via POST /rooms/join with JSON
+	w := doRequest(t, handler, http.MethodPost, "/rooms/join", map[string]string{"id": "room-alpha"}, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /rooms/join, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Join via POST /rooms/room-alpha/join
+	w = doRequest(t, handler, http.MethodPost, "/rooms/room-alpha/join", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /rooms/room-alpha/join, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Leave via POST /rooms/leave with query param
+	w = doRequest(t, handler, http.MethodPost, "/rooms/leave?id=room-alpha", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /rooms/leave, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Leave via POST /rooms/room-alpha/leave
+	w = doRequest(t, handler, http.MethodPost, "/rooms/room-alpha/leave", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /rooms/room-alpha/leave, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Invalid method on subpath
+	w = doRequest(t, handler, http.MethodGet, "/rooms/join", nil, "test-token")
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 on GET /rooms/join, got %d", w.Code)
 	}
 }
