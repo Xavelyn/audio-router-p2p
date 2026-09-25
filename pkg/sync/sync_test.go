@@ -41,7 +41,9 @@ func TestManagerRoundTrip(t *testing.T) {
 	nodeA := stubPeers{id: "node-A", peers: []discovery.Peer{{
 		ID: "node-B", SyncAddr: hostPort(portB),
 	}}}
-	nodeB := stubPeers{id: "node-B"}
+	nodeB := stubPeers{id: "node-B", peers: []discovery.Peer{{
+		ID: "node-A", SyncAddr: hostPort(portA),
+	}}}
 
 	mA := NewManager(&config.Config{SyncPort: portA, SyncInterval: 50 * time.Millisecond, PeerTTL: 5 * time.Second}, nodeA)
 	mB := NewManager(&config.Config{SyncPort: portB, SyncInterval: 50 * time.Millisecond, PeerTTL: 5 * time.Second}, nodeB)
@@ -98,5 +100,85 @@ func TestOffsetComputation(t *testing.T) {
 	offset := ((t2.UnixNano() - t1.UnixNano()) + (t3.UnixNano() - t4.UnixNano())) / 2
 	if time.Duration(offset) < skew-10*time.Millisecond || time.Duration(offset) > skew+10*time.Millisecond {
 		t.Fatalf("offset formula wrong: got %v want ~%v", time.Duration(offset), skew)
+	}
+}
+
+// TestSyncIgnoresClaimedIdentity verifies that a response from a discovered
+// peer is attributed to that peer's ID, not to the sender-claimed ID (finding
+// 4.1). The claimed value remains on the wire for protocol compatibility.
+func TestSyncIgnoresClaimedIdentity(t *testing.T) {
+	peerPort := freeUDPPort(t)
+	mgr := NewManager(
+		&config.Config{SyncPort: freeUDPPort(t), SyncInterval: time.Hour, PeerTTL: 5 * time.Second},
+		stubPeers{id: "node-A", peers: []discovery.Peer{{ID: "node-B", SyncAddr: hostPort(peerPort)}}},
+	)
+	defer mgr.Close()
+
+	const nonce = uint64(1234)
+	mgr.mu.Lock()
+	mgr.pending[nonce] = time.Unix(0, 100)
+	mgr.mu.Unlock()
+
+	from := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: peerPort}
+	mgr.handle(from, &message{
+		Type: msgResponse, ID: "attacker", Nonce: nonce,
+		T1: 100, T2: 200, T3: 200, T4: 300,
+	})
+
+	offsets := mgr.Offsets()
+	if _, ok := offsets["attacker"]; ok {
+		t.Fatal("sender-claimed ID was trusted for offset accounting")
+	}
+	if _, ok := offsets["node-B"]; !ok {
+		t.Fatal("response from discovered source was not attributed to its peer ID")
+	}
+}
+
+// TestSyncRejectsUndiscoveredSources verifies that both sync directions are
+// restricted to current discovery peers: an unknown source cannot add an
+// offset or induce a response. This is admission control, not a replacement
+// for cryptographic message authentication.
+func TestSyncRejectsUndiscoveredSources(t *testing.T) {
+	knownPeerPort := freeUDPPort(t)
+	mgr := NewManager(
+		&config.Config{SyncPort: freeUDPPort(t), SyncInterval: time.Hour, PeerTTL: 5 * time.Second},
+		stubPeers{id: "node-A", peers: []discovery.Peer{{ID: "node-B", SyncAddr: hostPort(knownPeerPort)}}},
+	)
+
+	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		t.Fatalf("listen receiver: %v", err)
+	}
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
+	if err != nil {
+		receiver.Close()
+		t.Fatalf("listen sender: %v", err)
+	}
+	defer sender.Close()
+	mgr.mu.Lock()
+	mgr.conn = receiver
+	const nonce = uint64(5678)
+	mgr.pending[nonce] = time.Unix(0, 100)
+	mgr.mu.Unlock()
+	defer mgr.Close()
+
+	unknown := sender.LocalAddr().(*net.UDPAddr)
+	mgr.handle(unknown, &message{
+		Type: msgResponse, ID: "node-B", Nonce: nonce,
+		T1: 100, T2: 200, T3: 200, T4: 300,
+	})
+	if offsets := mgr.Offsets(); len(offsets) != 0 {
+		t.Fatalf("undiscovered source created offsets: %v", offsets)
+	}
+
+	mgr.handle(unknown, &message{Type: msgRequest, ID: "node-B", Nonce: 1, T1: 100})
+	if err := sender.SetReadDeadline(time.Now().Add(200 * time.Millisecond)); err != nil {
+		t.Fatalf("set sender read deadline: %v", err)
+	}
+	buf := make([]byte, 256)
+	if n, _, err := sender.ReadFromUDP(buf); err == nil {
+		t.Fatalf("undiscovered source induced a %d-byte sync response", n)
+	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
+		t.Fatalf("reading from undiscovered source: %v", err)
 	}
 }

@@ -16,7 +16,7 @@ import (
 // message is the wire format for clock-sync pings/pongs (all times in ns).
 type message struct {
 	Type  string `json:"type"` // "sync-request" | "sync-response"
-	ID    string `json:"id"`   // sender node id
+	ID    string `json:"id"`   // sender node id (diagnostic only; not trusted for accounting)
 	Nonce uint64 `json:"nonce"`
 	T1    int64  `json:"t1"` // client send time
 	T2    int64  `json:"t2"` // server receive time
@@ -130,9 +130,52 @@ func (m *Manager) recvLoop(conn *net.UDPConn) {
 	}
 }
 
+// syncAddrMatches compares a source socket with an advertised UDP endpoint.
+// Discovery normally emits numeric IPv4 addresses, but resolving the advertised
+// value also keeps a configured hostname from being rejected merely because the
+// UDP source is numeric.
+func syncAddrMatches(advertised string, source *net.UDPAddr) bool {
+	if source == nil {
+		return false
+	}
+	peerAddr, err := net.ResolveUDPAddr("udp4", advertised)
+	if err != nil {
+		return false
+	}
+	return peerAddr.Port == source.Port && peerAddr.IP.Equal(source.IP)
+}
+
+// peerIDForSyncAddr resolves a sync datagram source address to the ID of a
+// currently-discovered peer. It binds accounting to the address that discovery
+// supplied rather than to a sender-claimed ID. The local node is excluded.
+//
+// This is an admission check, not cryptographic authentication: discovery's
+// current token check is LAN-level and is addressed separately in finding 4.1.
+func (m *Manager) peerIDForSyncAddr(addr *net.UDPAddr) (string, bool) {
+	if addr == nil {
+		return "", false
+	}
+	localID := m.disc.NodeID()
+	for _, p := range m.disc.Peers() {
+		if p.ID == "" || p.ID == localID || p.SyncAddr == "" {
+			continue
+		}
+		if syncAddrMatches(p.SyncAddr, addr) {
+			return p.ID, true
+		}
+	}
+	return "", false
+}
+
 func (m *Manager) handle(addr *net.UDPAddr, msg *message) {
 	switch msg.Type {
 	case msgRequest:
+		// Restrict sync to peers that discovery currently knows about. This
+		// avoids replying to arbitrary UDP senders; it does not replace
+		// message authentication, which remains an open finding 4.1 item.
+		if _, ok := m.peerIDForSyncAddr(addr); !ok {
+			return
+		}
 		now := time.Now().UnixNano()
 		resp := message{
 			Type:  msgResponse,
@@ -150,6 +193,14 @@ func (m *Manager) handle(addr *net.UDPAddr, msg *message) {
 		}
 	case msgResponse:
 		t4 := time.Now().UnixNano()
+		// The response arrived from a concrete UDP source; resolve its
+		// identity from discovery instead of trusting the sender-claimed
+		// msg.ID (which any off-path attacker can set). Do this before m.mu:
+		// PeerSource may take the discovery lock.
+		peerID, ok := m.peerIDForSyncAddr(addr)
+		if !ok {
+			return
+		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		t1, ok := m.pending[msg.Nonce]
@@ -161,7 +212,7 @@ func (m *Manager) handle(addr *net.UDPAddr, msg *message) {
 		// offset = ((t2 - t1) + (t3 - t4)) / 2
 		offset := ((msg.T2 - t1ns) + (msg.T3 - t4)) / 2
 		rtt := t4 - msg.T3 + msg.T2 - t1ns
-		m.offsets[msg.ID] = PeerOffset{
+		m.offsets[peerID] = PeerOffset{
 			Offset:     time.Duration(offset),
 			RTT:        time.Duration(rtt),
 			LastUpdate: time.Now(),
