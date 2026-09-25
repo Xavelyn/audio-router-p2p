@@ -2,6 +2,7 @@ package group
 
 import (
 	"encoding/hex"
+	"encoding/json"
 	"log"
 	"math/rand"
 	"net"
@@ -29,6 +30,21 @@ const (
 	RoomStateActive
 	RoomStateClosing
 )
+
+func (s RoomState) String() string {
+	switch s {
+	case RoomStateCreated:
+		return "created"
+	case RoomStateElection:
+		return "election"
+	case RoomStateActive:
+		return "active"
+	case RoomStateClosing:
+		return "closing"
+	default:
+		return "unknown"
+	}
+}
 
 // RoomMember represents a member of a room
 type RoomMember struct {
@@ -129,6 +145,37 @@ func (r *Room) Leader() string { return r.leader.Load().(string) }
 
 // IsLeader returns true if we are the leader
 func (r *Room) IsLeader() bool { return r.Leader() == r.localID }
+
+// Transport returns the streamer transport configured for this room.
+func (r *Room) Transport() streamer.Transport {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.transport
+}
+
+// SetTransport updates the streamer transport for this room.
+func (r *Room) SetTransport(t streamer.Transport) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.transport = t
+}
+
+// MarshalJSON provides a custom JSON serialization for Room.
+func (r *Room) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		ID      string        `json:"id"`
+		Name    string        `json:"name"`
+		Leader  string        `json:"leader"`
+		State   string        `json:"state"`
+		Members []*RoomMember `json:"members"`
+	}{
+		ID:      string(r.id),
+		Name:    r.name,
+		Leader:  r.Leader(),
+		State:   r.State().String(),
+		Members: r.Members(),
+	})
+}
 
 // Members returns all current members
 func (r *Room) Members() []*RoomMember {
