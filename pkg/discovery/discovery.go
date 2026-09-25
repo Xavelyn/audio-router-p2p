@@ -238,6 +238,10 @@ func (d *Discovery) setup() {
 		log.Printf("discovery: multicast unavailable; announcements will be unicast-only")
 	}
 
+	// With DiscoveryPort=0 the kernel assigns an ephemeral port; advertise
+	// the port actually bound so peers unicast to a reachable address.
+	boundDiscoveryPort := d.cfg.DiscoveryPort
+
 	// Use SO_REUSEADDR and port 0 for auto-assignment
 	if d.cfg.DiscoveryPort >= 0 {
 		lc := net.ListenConfig{
@@ -255,11 +259,16 @@ func (d *Discovery) setup() {
 		} else {
 			log.Printf("discovery: cannot bind unicast control port %d: %v", d.cfg.DiscoveryPort, err)
 		}
+		if d.control != nil {
+			if addr, ok := d.control.LocalAddr().(*net.UDPAddr); ok {
+				boundDiscoveryPort = addr.Port
+			}
+		}
 	}
 
 	advertisedIP := d.advertisedIP()
 	d.mu.Lock()
-	d.ownAddr = net.JoinHostPort(advertisedIP, strconv.Itoa(d.cfg.DiscoveryPort))
+	d.ownAddr = net.JoinHostPort(advertisedIP, strconv.Itoa(boundDiscoveryPort))
 	d.ownSync = net.JoinHostPort(advertisedIP, strconv.Itoa(d.cfg.SyncPort))
 	// Extract port from StreamPort (format: "host:port" or ":port")
 	_, streamPort, _ := net.SplitHostPort(d.cfg.StreamPort)

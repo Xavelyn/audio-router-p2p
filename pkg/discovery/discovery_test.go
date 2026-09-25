@@ -2,6 +2,7 @@ package discovery
 
 import (
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
@@ -122,5 +123,42 @@ func TestDiscoveryMulticastRoundTrip(t *testing.T) {
 	}
 	if !ValidAddr(dA.Peers()[0].Addr) {
 		t.Fatalf("peer addr %q not a host:port", dA.Peers()[0].Addr)
+	}
+}
+
+// TestDiscoveryOwnAddrUsesBoundPort verifies that with DiscoveryPort=0
+// (kernel-assigned ephemeral port) ownAddr advertises the port actually bound,
+// not the configured 0 (finding 3.4).
+func TestDiscoveryOwnAddrUsesBoundPort(t *testing.T) {
+	cfg := testConfig("239.255.0.1", freeUDPPort(t))
+	cfg.DiscoveryPort = 0 // ask the kernel for an ephemeral port
+
+	d, err := New(cfg, "node-ephemeral")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// setup() binds synchronously (Run() calls it before starting any
+	// goroutine), so drive it directly: no race, no sleeping, deterministic.
+	d.setup()
+	defer d.Close()
+
+	if d.control == nil {
+		t.Fatal("control socket not bound")
+	}
+	bound := d.control.LocalAddr().(*net.UDPAddr).Port
+	if bound == 0 {
+		t.Fatalf("control socket bound to port 0, want an ephemeral port")
+	}
+
+	_, portStr, err := net.SplitHostPort(d.OwnAddr())
+	if err != nil {
+		t.Fatalf("OwnAddr %q is not host:port: %v", d.OwnAddr(), err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("OwnAddr port %q not an int: %v", portStr, err)
+	}
+	if port != bound {
+		t.Fatalf("OwnAddr port = %d, want real bound port %d", port, bound)
 	}
 }
