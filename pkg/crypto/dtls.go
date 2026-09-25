@@ -24,12 +24,13 @@ import (
 
 // DTLSConfig holds configuration for DTLS connection
 type DTLSConfig struct {
-	LocalAddr  *net.UDPAddr
-	RemoteAddr *net.UDPAddr
-	CertFile   string
-	KeyFile    string
-	PSK        []byte // Pre-shared key for PSK cipher suites (optional)
-	IsServer   bool   // true for server (responder), false for client (initiator)
+	LocalAddr        *net.UDPAddr
+	RemoteAddr       *net.UDPAddr
+	CertFile         string
+	KeyFile          string
+	PSK              []byte        // Pre-shared key for PSK cipher suites (optional)
+	IsServer         bool          // true for server (responder), false for client (initiator)
+	HandshakeTimeout time.Duration // maximum time for the DTLS handshake; zero uses Pion's default
 }
 
 // DTLSConn wraps a DTLS connection with SRTP support
@@ -255,8 +256,10 @@ func buildDTLSConfig(cfg *DTLSConfig) (*dtls.Config, error) {
 	}
 
 	dtlsConfig := &dtls.Config{
-		// Self-signed certs: the connecting peer is trusted via the room's
-		// authentication layer, so skip chain verification.
+		// Certificate-chain and hostname verification are disabled because
+		// nodes use self-signed certificates. This is not peer authentication:
+		// the discovery AuthToken is currently LAN-level only. PSK mode, when
+		// configured, authenticates the DTLS peer through the shared key.
 		InsecureSkipVerify:   true,
 		Certificates:         []tls.Certificate{},
 		ExtendedMasterSecret: dtls.RequestExtendedMasterSecret,
@@ -269,6 +272,12 @@ func buildDTLSConfig(cfg *DTLSConfig) (*dtls.Config, error) {
 
 	if cert != nil {
 		dtlsConfig.Certificates = []tls.Certificate{*cert}
+	}
+
+	if cfg.HandshakeTimeout > 0 {
+		dtlsConfig.ConnectContextMaker = func() (context.Context, func()) {
+			return context.WithTimeout(context.Background(), cfg.HandshakeTimeout)
+		}
 	}
 
 	if len(cfg.PSK) > 0 {
@@ -400,8 +409,8 @@ func (d *DTLSConn) SetWriteDeadline(t time.Time) error {
 	return d.conn.SetWriteDeadline(t)
 }
 
-// Handshake is performed automatically on first Read/Write
-// This method exists for API compatibility
+// Handshake is retained for API compatibility. Connections returned by this
+// package complete their DTLS handshake before the constructor returns.
 func (d *DTLSConn) Handshake(ctx context.Context) error {
 	return nil
 }

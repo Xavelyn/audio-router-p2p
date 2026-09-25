@@ -21,7 +21,7 @@ type DTLSConfig struct {
 	KeyFile          string        // Path to key file
 	PSK              []byte        // Pre-shared key (optional)
 	IsServer         bool          // true for server (responder), false for client (initiator)
-	HandshakeTimeout time.Duration // Timeout for DTLS handshake
+	HandshakeTimeout time.Duration // maximum time for the DTLS handshake and connection wait
 }
 
 // DTLSTransport provides DTLS-encrypted UDP transport with SRTP support
@@ -50,7 +50,7 @@ func NewDTLSTransport(cfg DTLSConfig) (*DTLSTransport, error) {
 		return nil, fmt.Errorf("dtls: client role requires a non-empty RemoteAddr " +
 			"(set the single DTLS peer's stream address in routes.json)")
 	}
-	if cfg.HandshakeTimeout == 0 {
+	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = 10 * time.Second
 	}
 
@@ -68,12 +68,13 @@ func NewDTLSTransport(cfg DTLSConfig) (*DTLSTransport, error) {
 	}
 
 	cryptoCfg := &crypto.DTLSConfig{
-		LocalAddr:  localAddr,
-		RemoteAddr: remoteAddr,
-		CertFile:   cfg.CertFile,
-		KeyFile:    cfg.KeyFile,
-		PSK:        cfg.PSK,
-		IsServer:   cfg.IsServer,
+		LocalAddr:        localAddr,
+		RemoteAddr:       remoteAddr,
+		CertFile:         cfg.CertFile,
+		KeyFile:          cfg.KeyFile,
+		PSK:              cfg.PSK,
+		IsServer:         cfg.IsServer,
+		HandshakeTimeout: cfg.HandshakeTimeout,
 	}
 
 	t := &DTLSTransport{
