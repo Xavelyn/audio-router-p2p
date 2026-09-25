@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,14 +30,19 @@ type StreamRoute struct {
 
 // Router is a persistent, file-backed store of StreamRoutes.
 type Router struct {
-	mu     sync.RWMutex
-	file   string
-	routes map[string]StreamRoute
+	mu           sync.RWMutex
+	file         string
+	routes       map[string]StreamRoute
+	matrixRoutes map[string]MatrixRoute
 }
 
 // New loads the route file if present, otherwise starts empty.
 func New(filePath string) (*Router, error) {
-	r := &Router{file: filePath, routes: make(map[string]StreamRoute)}
+	r := &Router{
+		file:         filePath,
+		routes:       make(map[string]StreamRoute),
+		matrixRoutes: make(map[string]MatrixRoute),
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
@@ -45,6 +51,9 @@ func New(filePath string) (*Router, error) {
 		if err := json.Unmarshal(data, &r.routes); err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", filePath, err)
 		}
+	}
+	for _, sr := range r.routes {
+		r.matrixRoutes[sr.ID] = StreamRouteToMatrixRoute(sr)
 	}
 	return r, nil
 }
@@ -127,6 +136,7 @@ func (r *Router) Add(route StreamRoute) error {
 	}
 	r.mu.Lock()
 	r.routes[route.ID] = route
+	r.matrixRoutes[route.ID] = StreamRouteToMatrixRoute(route)
 	r.mu.Unlock()
 	return r.Save()
 }
@@ -136,9 +146,188 @@ func (r *Router) Delete(id string) error {
 	r.mu.Lock()
 	_, existed := r.routes[id]
 	delete(r.routes, id)
+	delete(r.matrixRoutes, id)
 	r.mu.Unlock()
 	if !existed {
 		return nil
 	}
 	return r.Save()
+}
+
+// GetMatrix returns the MatrixRoute with the given ID.
+func (r *Router) GetMatrix(id string) (MatrixRoute, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	mr, ok := r.matrixRoutes[id]
+	return mr, ok
+}
+
+// ListMatrix returns all MatrixRoutes sorted by ID.
+func (r *Router) ListMatrix() []MatrixRoute {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ids := make([]string, 0, len(r.matrixRoutes))
+	for id := range r.matrixRoutes {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]MatrixRoute, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, r.matrixRoutes[id])
+	}
+	return out
+}
+
+// AddMatrix inserts or replaces a MatrixRoute and persists it.
+func (r *Router) AddMatrix(mr MatrixRoute) error {
+	if err := mr.Validate(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.matrixRoutes[mr.ID] = mr
+	r.routes[mr.ID] = MatrixRouteToStreamRoute(mr)
+	r.mu.Unlock()
+	return r.Save()
+}
+
+// DeleteMatrix removes a MatrixRoute.
+func (r *Router) DeleteMatrix(id string) error {
+	return r.Delete(id)
+}
+
+// UpdateCrosspoint updates the gain for an individual crosspoint with slewing.
+func (r *Router) UpdateCrosspoint(id string, outCh, inCh int, gain float64, slewMS float64) (MatrixRoute, error) {
+	r.mu.Lock()
+	mr, ok := r.matrixRoutes[id]
+	if !ok {
+		r.mu.Unlock()
+		return MatrixRoute{}, fmt.Errorf("route %s not found", id)
+	}
+	if outCh < 0 || outCh >= mr.OutChannels || inCh < 0 || inCh >= mr.InChannels {
+		r.mu.Unlock()
+		return MatrixRoute{}, fmt.Errorf("crosspoint out of range: out=%d, in=%d", outCh, inCh)
+	}
+	if math.IsNaN(gain) || math.IsInf(gain, 0) || gain < 0.0 || gain > 2.0 {
+		r.mu.Unlock()
+		return MatrixRoute{}, fmt.Errorf("gain out of bounds [0.0, 2.0]: %f", gain)
+	}
+	idx := outCh*mr.InChannels + inCh
+	mr.Coefficients[idx] = gain
+	if slewMS > 0 {
+		mr.SlewMS = slewMS
+		mr.State = "slewing"
+	}
+	r.matrixRoutes[id] = mr
+	r.routes[id] = MatrixRouteToStreamRoute(mr)
+	r.mu.Unlock()
+
+	_ = r.Save()
+	return mr, nil
+}
+
+// PatchMatrix applies partial updates to a MatrixRoute.
+func (r *Router) PatchMatrix(id string, name *string, coeffs []float64, slewMS *float64, muted *bool) (MatrixRoute, error) {
+	r.mu.Lock()
+	mr, ok := r.matrixRoutes[id]
+	if !ok {
+		r.mu.Unlock()
+		return MatrixRoute{}, fmt.Errorf("route %s not found", id)
+	}
+	if name != nil {
+		mr.Name = *name
+	}
+	if coeffs != nil {
+		expected := mr.InChannels * mr.OutChannels
+		if len(coeffs) != expected {
+			r.mu.Unlock()
+			return MatrixRoute{}, fmt.Errorf("coefficients length mismatch: expected %d, got %d", expected, len(coeffs))
+		}
+		for i, c := range coeffs {
+			if math.IsNaN(c) || math.IsInf(c, 0) || c < 0.0 || c > 2.0 {
+				r.mu.Unlock()
+				return MatrixRoute{}, fmt.Errorf("coefficient at %d out of bounds [0.0, 2.0]: %f", i, c)
+			}
+		}
+		mr.Coefficients = make([]float64, len(coeffs))
+		copy(mr.Coefficients, coeffs)
+		mr.State = "slewing"
+	}
+	if slewMS != nil {
+		if *slewMS < 0 {
+			r.mu.Unlock()
+			return MatrixRoute{}, errors.New("slew_ms must be non-negative")
+		}
+		mr.SlewMS = *slewMS
+	}
+	if muted != nil {
+		mr.Muted = *muted
+	}
+	r.matrixRoutes[id] = mr
+	r.routes[id] = MatrixRouteToStreamRoute(mr)
+	r.mu.Unlock()
+
+	_ = r.Save()
+	return mr, nil
+}
+
+// StreamRouteToMatrixRoute converts a legacy StreamRoute to canonical MatrixRoute.
+func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
+	ch := sr.Channels
+	if ch <= 0 {
+		ch = 2
+	}
+	srcNode := "local"
+	dstNode := "local"
+	if sr.PeerID != "" {
+		dstNode = sr.PeerID
+	}
+	inChans := make([]int, ch)
+	outChans := make([]int, ch)
+	for i := 0; i < ch; i++ {
+		inChans[i] = i
+		outChans[i] = i
+	}
+	idMatrix := NewIdentityGainMatrix(ch)
+	return MatrixRoute{
+		ID:   sr.ID,
+		Name: sr.ID,
+		Source: MatrixEndpoint{
+			NodeID:   srcNode,
+			DeviceID: fmt.Sprintf("%d", sr.SourceDevice),
+			Layout:   LayoutStereo,
+			Channels: inChans,
+		},
+		Destination: MatrixEndpoint{
+			NodeID:   dstNode,
+			DeviceID: "0",
+			Layout:   LayoutStereo,
+			Channels: outChans,
+		},
+		InChannels:   ch,
+		OutChannels:  ch,
+		Coefficients: idMatrix.Coefficients,
+		SlewMS:       20.0,
+		Muted:        false,
+		State:        "active",
+	}
+}
+
+// MatrixRouteToStreamRoute converts a canonical MatrixRoute to legacy StreamRoute.
+func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
+	var srcDev int
+	_, _ = fmt.Sscanf(mr.Source.DeviceID, "%d", &srcDev)
+	var dests []string
+	if mr.Destination.NodeID != "" && mr.Destination.NodeID != "local" {
+		dests = []string{mr.Destination.NodeID}
+	} else if len(mr.Destination.Channels) > 0 {
+		dests = []string{"127.0.0.1:45678"}
+	}
+	return StreamRoute{
+		ID:           mr.ID,
+		SourceDevice: srcDev,
+		Destinations: dests,
+		SampleRate:   48000,
+		Channels:     mr.InChannels,
+		PeerID:       mr.Destination.NodeID,
+	}
 }
