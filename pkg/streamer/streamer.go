@@ -54,9 +54,12 @@ func (d StreamDirection) String() string {
 
 // RemotePeer represents a remote peer in a stream session.
 type RemotePeer struct {
-	Addr       string
-	StreamID   [16]byte
-	Direction  StreamDirection
+	Addr      string
+	StreamID  [16]byte
+	Direction StreamDirection
+	// Negotiator and Resampler are reserved for a future SDP handshake and
+	// are currently always nil: nothing assigns them in the streaming path.
+	// See the de-scope note in negotiation.go.
 	Negotiator *StreamNegotiator
 	JitterBuf  JitterBufferInterface
 	Resampler  *Resampler
@@ -184,7 +187,10 @@ func (s *Streamer) Start(input audio.AudioStream, destAddrs []string, output aud
 			Output:    output,
 		}
 		if !isLocal && s.transport != nil {
-			peer.Negotiator = NewStreamNegotiator(s.streamID, s.localNodeID, "")
+			// No SDP handshake runs here (see the de-scope note in
+			// negotiation.go): the format is fixed per route from config and
+			// is carried per packet in transport.PacketHeader. RemotePeer
+			// .Negotiator and .Resampler stay nil until that is wired.
 			jb := NewJitterBuffer(
 				s.config.Channels*2,
 				s.config.SampleRate,

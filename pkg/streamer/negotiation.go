@@ -1,5 +1,21 @@
 package streamer
 
+// SDP-style format negotiation: implemented and unit-tested, but NOT wired
+// into the streaming path (finding 3.1 de-scope decision).
+//
+// Today every participant of a stream must be configured with the same
+// format; there is no SDP message type in the wire protocol and
+// Streamer.handlePacket drops anything that is not an audio packet for a
+// known stream ID, so an offer/answer could not be exchanged today. The
+// per-packet format is instead advertised in transport.PacketHeader
+// (SampleRate, Channels), so receivers already learn the sender format.
+//
+// Wiring this later requires: (1) an SDP message type in the packet
+// protocol, (2) negotiation before audio flows, and (3) assigning
+// RemotePeer.Resampler when the remote rate differs from the local one.
+// Until then the constructors below are used only by tests, which keep the
+// handshake logic proven and ready.
+
 import (
 	"crypto/rand"
 	"encoding/json"
