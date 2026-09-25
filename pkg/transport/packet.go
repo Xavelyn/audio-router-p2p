@@ -14,8 +14,10 @@ const (
 
 // Packet control flags carried at byte 33.
 const (
-	FlagActive uint8 = 1 << 0 // 0x01: Active unsuppressed audio frame
-	FlagSID    uint8 = 1 << 1 // 0x02: Silence Insertion Descriptor keepalive frame
+	FlagActive    uint8 = 1 << 0 // 0x01: Active unsuppressed audio frame
+	FlagSID       uint8 = 1 << 1 // 0x02: Silence Insertion Descriptor keepalive frame
+	FlagFEC       uint8 = 1 << 2 // 0x04: RFC 5109 XOR Parity packet
+	FlagRedundant uint8 = 1 << 3 // 0x08: Reconstructed media packet generated via FEC recovery
 )
 
 // PacketHeader is the fixed-size wire header prepended to every audio packet.
@@ -99,7 +101,7 @@ func Unmarshal(data []byte) (PacketHeader, []byte, error) {
 	// Fallback for non-audio or arbitrary byte payloads
 	if len(data) >= HeaderSizeV2 {
 		flags := data[33]
-		if flags == FlagActive || flags == FlagSID || flags == (FlagActive|FlagSID) {
+		if flags&(FlagActive|FlagSID|FlagFEC|FlagRedundant) != 0 {
 			hdr.Flags = flags
 			return hdr, data[HeaderSizeV2:], nil
 		}
