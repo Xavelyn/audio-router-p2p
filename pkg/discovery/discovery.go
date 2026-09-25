@@ -48,6 +48,7 @@ type Discovery struct {
 	nodeID string
 
 	mu        sync.RWMutex
+	sockMu    sync.RWMutex
 	peers     map[string]*Peer
 	ownAddr   string
 	ownSync   string
@@ -176,13 +177,18 @@ func (d *Discovery) Run() {
 	}
 	d.setup()
 
-	if d.mcast != nil {
+	d.sockMu.RLock()
+	mcast := d.mcast
+	control := d.control
+	d.sockMu.RUnlock()
+
+	if mcast != nil {
 		d.wg.Add(1)
-		go d.recvLoop(d.mcast, "multicast")
+		go d.recvLoop(mcast, "multicast")
 	}
-	if d.control != nil {
+	if control != nil {
 		d.wg.Add(1)
-		go d.recvLoop(d.control, "unicast")
+		go d.recvLoop(control, "unicast")
 	}
 
 	annTicker := time.NewTicker(d.cfg.AnnounceInterval)
@@ -211,30 +217,33 @@ func (d *Discovery) setup() {
 	group := &net.UDPAddr{IP: net.ParseIP(d.cfg.MulticastGroup), Port: d.cfg.MulticastPort}
 	d.group = group
 
+	var mcastConn, annSendConn, controlConn *net.UDPConn
+	dialed := false
+
 	// Join the multicast group on the first suitable interface.
 	for _, ifc := range candidateInterfaces() {
 		c, err := net.ListenMulticastUDP("udp4", ifc, group)
 		if err != nil {
 			continue
 		}
-		d.mcast = c
+		mcastConn = c
 		if ip := interfaceIPv4(ifc.Name); ip != "" {
 			// Binding the send socket to the interface address forces multicast
 			// delivery out of that interface without needing IP_MULTICAST_IF.
 			if s, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.ParseIP(ip), Port: 0}); err == nil {
-				d.annSend = s
+				annSendConn = s
 			}
 		}
 		break
 	}
-	if d.annSend == nil {
+	if annSendConn == nil {
 		// Fall back to a routed socket; the kernel picks the interface.
 		if s, err := net.DialUDP("udp4", nil, group); err == nil {
-			d.annSend = s
-			d.dialed = true
+			annSendConn = s
+			dialed = true
 		}
 	}
-	if d.mcast == nil || d.annSend == nil {
+	if mcastConn == nil || annSendConn == nil {
 		log.Printf("discovery: multicast unavailable; announcements will be unicast-only")
 	}
 
@@ -251,20 +260,27 @@ func (d *Discovery) setup() {
 				})
 			},
 		}
-		if d.control != nil {
-			d.control.Close()
-		}
 		if c, err := lc.ListenPacket(context.Background(), "udp4", fmt.Sprintf(":%d", d.cfg.DiscoveryPort)); err == nil {
-			d.control = c.(*net.UDPConn)
+			controlConn = c.(*net.UDPConn)
 		} else {
 			log.Printf("discovery: cannot bind unicast control port %d: %v", d.cfg.DiscoveryPort, err)
 		}
-		if d.control != nil {
-			if addr, ok := d.control.LocalAddr().(*net.UDPAddr); ok {
+		if controlConn != nil {
+			if addr, ok := controlConn.LocalAddr().(*net.UDPAddr); ok {
 				boundDiscoveryPort = addr.Port
 			}
 		}
 	}
+
+	d.sockMu.Lock()
+	if d.control != nil {
+		d.control.Close()
+	}
+	d.mcast = mcastConn
+	d.annSend = annSendConn
+	d.control = controlConn
+	d.dialed = dialed
+	d.sockMu.Unlock()
 
 	advertisedIP := d.advertisedIP()
 	d.mu.Lock()
@@ -315,8 +331,11 @@ func (d *Discovery) advertisedIP() string {
 	if d.cfg.AdvHost != "" {
 		return d.cfg.AdvHost
 	}
-	if d.annSend != nil {
-		if la, ok := d.annSend.LocalAddr().(*net.UDPAddr); ok {
+	d.sockMu.RLock()
+	annSend := d.annSend
+	d.sockMu.RUnlock()
+	if annSend != nil {
+		if la, ok := annSend.LocalAddr().(*net.UDPAddr); ok {
 			if ip := la.IP; ip != nil && !ip.IsUnspecified() {
 				return ip.String()
 			}
@@ -379,13 +398,18 @@ func (d *Discovery) sendAnnounceNow() {
 		log.Printf("discovery: marshal announcement: %v", err)
 		return
 	}
-	if d.annSend != nil {
-		if d.dialed {
-			_, werr := d.annSend.Write(payload)
+	d.sockMu.RLock()
+	annSend := d.annSend
+	dialed := d.dialed
+	d.sockMu.RUnlock()
+
+	if annSend != nil {
+		if dialed {
+			_, werr := annSend.Write(payload)
 			if werr != nil && !d.isStopping() {
 				log.Printf("discovery: multicast announce: %v", werr)
 			}
-		} else if _, werr := d.annSend.WriteToUDP(payload, d.group); werr != nil && !d.isStopping() {
+		} else if _, werr := annSend.WriteToUDP(payload, d.group); werr != nil && !d.isStopping() {
 			log.Printf("discovery: multicast announce: %v", werr)
 		}
 	}
@@ -481,7 +505,14 @@ func (d *Discovery) Close() {
 }
 
 func (d *Discovery) closeSockets() {
-	for _, conn := range []*net.UDPConn{d.annSend, d.control, d.mcast} {
+	d.sockMu.Lock()
+	conns := []*net.UDPConn{d.annSend, d.control, d.mcast}
+	d.annSend = nil
+	d.control = nil
+	d.mcast = nil
+	d.sockMu.Unlock()
+
+	for _, conn := range conns {
 		if conn != nil {
 			_ = conn.Close()
 		}
