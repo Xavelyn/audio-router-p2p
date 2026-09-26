@@ -108,6 +108,7 @@ type DefaultRoomManager struct {
 	syncMgr     *syncmgr.Manager
 	trans       streamer.Transport
 	router      *router.Router
+	streamMgr   StreamManager
 	devProvider DeviceProvider
 
 	rooms  map[string]*managedRoom
@@ -160,6 +161,21 @@ func (m *DefaultRoomManager) SetRouter(rt *router.Router) {
 
 	for _, r := range rooms {
 		r.SetRouter(rt)
+	}
+}
+
+// SetStreamManager configures the stream manager and propagates it to active rooms.
+func (m *DefaultRoomManager) SetStreamManager(sm StreamManager) {
+	m.mu.Lock()
+	m.streamMgr = sm
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, mr := range m.rooms {
+		rooms = append(rooms, mr.room)
+	}
+	m.mu.Unlock()
+
+	for _, r := range rooms {
+		r.SetStreamManager(sm)
 	}
 }
 
@@ -233,14 +249,15 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 	}
 
 	room := NewRoom(RoomConfig{
-		ID:          RoomID(id),
-		Name:        name,
-		LocalPeerID: localPeerID,
-		Config:      m.cfg,
-		Discovery:   m.disc,
-		SyncManager: m.syncMgr,
-		Transport:   m.trans,
-		Router:      m.router,
+		ID:            RoomID(id),
+		Name:          name,
+		LocalPeerID:   localPeerID,
+		Config:        m.cfg,
+		Discovery:     m.disc,
+		SyncManager:   m.syncMgr,
+		Transport:     m.trans,
+		Router:        m.router,
+		StreamManager: m.streamMgr,
 	})
 
 	roomID := room.ID()

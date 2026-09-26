@@ -64,6 +64,12 @@ type RoomMember struct {
 	Drift      time.Duration `json:"drift"`  // clock drift rate (ns/s)
 }
 
+// StreamManager abstracts route start and stop operations for real-time audio.
+type StreamManager interface {
+	StartRoute(route router.StreamRoute) error
+	StopRoute(id string) error
+}
+
 // Room is a group of peers that play audio in sync
 type Room struct {
 	mu        sync.RWMutex
@@ -78,6 +84,7 @@ type Room struct {
 	syncMgr   *syncmgr.Manager
 	transport streamer.Transport
 	router    *router.Router
+	streamMgr StreamManager
 
 	inputs         []string
 	outputs        []string
@@ -102,14 +109,15 @@ type Room struct {
 
 // RoomConfig holds the configuration for creating a room
 type RoomConfig struct {
-	ID          RoomID
-	Name        string
-	LocalPeerID string
-	Config      *config.Config
-	Discovery   *discovery.Discovery
-	SyncManager *syncmgr.Manager
-	Transport   streamer.Transport
-	Router      *router.Router
+	ID            RoomID
+	Name          string
+	LocalPeerID   string
+	Config        *config.Config
+	Discovery     *discovery.Discovery
+	SyncManager   *syncmgr.Manager
+	Transport     streamer.Transport
+	Router        *router.Router
+	StreamManager StreamManager
 }
 
 // NewRoom creates a new room
@@ -131,6 +139,7 @@ func NewRoom(cfg RoomConfig) *Room {
 		syncMgr:        cfg.SyncManager,
 		transport:      cfg.Transport,
 		router:         cfg.Router,
+		streamMgr:      cfg.StreamManager,
 		inputs:         make([]string, 0),
 		outputs:        make([]string, 0),
 		inputGains:     make(map[string]float64),
@@ -239,6 +248,14 @@ func (r *Room) SetRouter(rt *router.Router) {
 		r.clearCompiledRoutesLocked()
 	}
 	r.router = rt
+	r.recompileRoutesLocked()
+}
+
+// SetStreamManager sets or replaces the StreamManager for real-time streaming routes.
+func (r *Room) SetStreamManager(sm StreamManager) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.streamMgr = sm
 	r.recompileRoutesLocked()
 }
 
@@ -544,11 +561,13 @@ func cleanDeviceList(list []string) []string {
 }
 
 func (r *Room) clearCompiledRoutesLocked() {
-	if r.router == nil {
-		return
-	}
 	for routeID := range r.compiledRoutes {
-		_ = r.router.DeleteMatrix(routeID)
+		if r.streamMgr != nil {
+			_ = r.streamMgr.StopRoute(routeID)
+		}
+		if r.router != nil {
+			_ = r.router.DeleteMatrix(routeID)
+		}
 	}
 	r.compiledRoutes = make(map[string]struct{})
 }
@@ -608,6 +627,9 @@ func (r *Room) recompileRoutesLocked() {
 	// Remove routes no longer wanted
 	for oldID := range r.compiledRoutes {
 		if _, stillWanted := desired[oldID]; !stillWanted {
+			if r.streamMgr != nil {
+				_ = r.streamMgr.StopRoute(oldID)
+			}
 			_ = r.router.DeleteMatrix(oldID)
 			delete(r.compiledRoutes, oldID)
 		}
@@ -617,6 +639,10 @@ func (r *Room) recompileRoutesLocked() {
 	for routeID, mr := range desired {
 		_ = r.router.AddMatrix(mr)
 		r.compiledRoutes[routeID] = struct{}{}
+		if r.streamMgr != nil {
+			sr := router.MatrixRouteToStreamRoute(mr)
+			_ = r.streamMgr.StartRoute(sr)
+		}
 	}
 }
 

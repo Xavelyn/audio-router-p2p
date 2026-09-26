@@ -113,6 +113,8 @@ func main() {
 
 	// Room Manager
 	roomMgr := group.NewDefaultRoomManager(cfg, disc, sm, trans)
+	roomMgr.SetRouter(rt)
+	roomMgr.SetStreamManager(streams)
 	if cfg.RoomAutoJoin || cfg.RoomID != "" {
 		roomID := cfg.RoomID
 		if roomID == "" {
@@ -298,10 +300,11 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 
 	for _, d := range destAddrs {
 		if destIsLocal(d, m.localIPs) {
-			out, err = audio.OpenOutput(-1, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+			outDev := sr.DestDevice
+			out, err = audio.OpenOutput(outDev, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
 			if err != nil {
 				_ = in.Close()
-				return fmt.Errorf("open local output: %w", err)
+				return fmt.Errorf("open local output device %d: %w", outDev, err)
 			}
 			break
 		}

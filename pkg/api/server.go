@@ -103,9 +103,12 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	})
 	s.registry.MustRegister(s.reqs, s.peerCnt, s.routesActive)
 
-	if rm != nil && s.rt != nil {
-		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok {
+	if rm != nil {
+		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok && s.rt != nil {
 			rSetter.SetRouter(s.rt)
+		}
+		if smSetter, ok := rm.(interface{ SetStreamManager(StreamManager) }); ok && s.streams != nil {
+			smSetter.SetStreamManager(s.streams)
 		}
 	}
 
@@ -146,9 +149,12 @@ func (s *Server) SetRoomManager(rm RoomManager) {
 	s.roomMgrMu.Lock()
 	defer s.roomMgrMu.Unlock()
 	s.roomMgr = rm
-	if rm != nil && s.rt != nil {
-		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok {
+	if rm != nil {
+		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok && s.rt != nil {
 			rSetter.SetRouter(s.rt)
+		}
+		if smSetter, ok := rm.(interface{ SetStreamManager(StreamManager) }); ok && s.streams != nil {
+			smSetter.SetStreamManager(s.streams)
 		}
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -15,6 +16,7 @@ import (
 type StreamRoute struct {
 	ID           string   `json:"id"`
 	SourceDevice int      `json:"sourceDevice"`
+	DestDevice   int      `json:"destDevice,omitempty"`
 	Destinations []string `json:"destinations"`
 	SampleRate   int      `json:"sampleRate,omitempty"`
 	Channels     int      `json:"channels,omitempty"`
@@ -315,7 +317,23 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 // MatrixRouteToStreamRoute converts a canonical MatrixRoute to legacy StreamRoute.
 func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 	var srcDev int
-	_, _ = fmt.Sscanf(mr.Source.DeviceID, "%d", &srcDev)
+	trimmedSrc := strings.TrimPrefix(mr.Source.DeviceID, "hw:")
+	trimmedSrc = strings.TrimPrefix(trimmedSrc, "dev:")
+	trimmedSrc = strings.TrimPrefix(trimmedSrc, "virt-")
+	trimmedSrc = strings.TrimPrefix(trimmedSrc, "virt:")
+	if _, err := fmt.Sscanf(trimmedSrc, "%d", &srcDev); err != nil {
+		srcDev = 0
+	}
+
+	var dstDev int = -1
+	trimmedDst := strings.TrimPrefix(mr.Destination.DeviceID, "hw:")
+	trimmedDst = strings.TrimPrefix(trimmedDst, "dev:")
+	trimmedDst = strings.TrimPrefix(trimmedDst, "virt-")
+	trimmedDst = strings.TrimPrefix(trimmedDst, "virt:")
+	if _, err := fmt.Sscanf(trimmedDst, "%d", &dstDev); err != nil {
+		dstDev = -1
+	}
+
 	var dests []string
 	if mr.Destination.NodeID != "" && mr.Destination.NodeID != "local" {
 		dests = []string{mr.Destination.NodeID}
@@ -325,6 +343,7 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 	return StreamRoute{
 		ID:           mr.ID,
 		SourceDevice: srcDev,
+		DestDevice:   dstDev,
 		Destinations: dests,
 		SampleRate:   48000,
 		Channels:     mr.InChannels,
