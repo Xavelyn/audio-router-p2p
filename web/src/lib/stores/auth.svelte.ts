@@ -21,7 +21,10 @@ class AuthStore {
       }
       if (savedUrl) {
         this.activeDaemonUrl = savedUrl;
-      } else if (window.location.origin && window.location.port !== '5173') {
+      } else if (window.location.port === '5173') {
+        // In Vite dev mode, use relative path so Vite proxy forwards to https://127.0.0.1:8443
+        this.activeDaemonUrl = '';
+      } else if (window.location.origin) {
         this.activeDaemonUrl = window.location.origin;
       }
     }

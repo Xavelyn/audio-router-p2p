@@ -6,6 +6,7 @@ tools/env.sh
 routes.json
 cert.pem
 key.pem
+audio-router-node
 web/node_modules/
 web/dist/
 

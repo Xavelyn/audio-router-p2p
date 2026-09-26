@@ -135,15 +135,25 @@ func main() {
 	// HTTP API.
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
-	if err := ensureTLS(cfg); err != nil {
-		log.Fatalf("TLS: %v", err)
-	}
-	go func() {
-		log.Printf("API listening on https://%s", cfg.ListenAddr)
-		if err := srv.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("API server error: %v", err)
+
+	if cfg.NoTLS {
+		go func() {
+			log.Printf("API listening on http://%s (plaintext HTTP)", cfg.ListenAddr)
+			if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("API server error: %v", err)
+			}
+		}()
+	} else {
+		if err := ensureTLS(cfg); err != nil {
+			log.Fatalf("TLS: %v", err)
 		}
-	}()
+		go func() {
+			log.Printf("API listening on https://%s (TLS enabled - self-signed certificate)", cfg.ListenAddr)
+			if err := srv.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("API server error: %v", err)
+			}
+		}()
+	}
 
 	// Graceful shutdown.
 	stop := make(chan os.Signal, 1)

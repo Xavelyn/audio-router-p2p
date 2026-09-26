@@ -12,6 +12,7 @@ type Config struct {
 	ListenAddr  string
 	CertFile    string
 	KeyFile     string
+	NoTLS       bool   // disable TLS and serve plain HTTP
 	AuthToken   string
 	UseEmulator bool   // true when running with the -use-emulator flag or the noaudio build
 	Encrypt     bool   // enable DTLS/SRTP encryption for audio streams
@@ -56,9 +57,10 @@ func LoadFromArgs(args []string) (*Config, error) {
 	cfg := &Config{}
 	fs := flag.NewFlagSet("audio-router", flag.ContinueOnError)
 
-	fs.StringVar(&cfg.ListenAddr, "listen", ":8443", "HTTP listen address (TLS)")
+	fs.StringVar(&cfg.ListenAddr, "listen", ":8443", "HTTP listen address (TLS or plaintext)")
 	fs.StringVar(&cfg.CertFile, "cert", "cert.pem", "TLS certificate file")
 	fs.StringVar(&cfg.KeyFile, "key", "key.pem", "TLS key file")
+	fs.BoolVar(&cfg.NoTLS, "no-tls", false, "Disable TLS and serve plain HTTP")
 	fs.StringVar(&cfg.AuthToken, "auth-token", "", "Authentication token for the API and peer handshakes")
 	fs.BoolVar(&cfg.UseEmulator, "use-emulator", false, "Use the audio emulator instead of real devices")
 	fs.BoolVar(&cfg.Encrypt, "encrypt", false, "Enable DTLS/SRTP encryption for audio streams")
