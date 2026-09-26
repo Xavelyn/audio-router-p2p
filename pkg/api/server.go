@@ -195,9 +195,31 @@ func (a *v1RoomManagerAdapter) LeaveRoom(id string) error {
 	return rm.LeaveRoom(id)
 }
 
-// Handler returns the fully-wrapped HTTP handler with body size limiting, metrics, and panic recovery.
+// Handler returns the fully-wrapped HTTP handler with CORS, body size limiting, metrics, and panic recovery.
 func (s *Server) Handler() http.Handler {
-	return s.recoverPanic(s.metrics(s.maxBytes(s.mux)))
+	return s.cors(s.recoverPanic(s.metrics(s.maxBytes(s.mux))))
+}
+
+func (s *Server) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		} else {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Auth-Token, Accept, Origin, Cache-Control, X-Requested-With")
+		w.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Type, Date, ETag")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) routes() {

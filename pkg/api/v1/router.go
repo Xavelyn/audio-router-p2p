@@ -124,6 +124,10 @@ func (s *V1Server) Authenticate(r *http.Request) bool {
 // AuthMiddleware wraps a handler with OpenAPI security checks.
 func (s *V1Server) AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		if !s.Authenticate(r) {
 			s.WriteError(w, http.StatusUnauthorized, "ERR_UNAUTHORIZED", "missing or invalid authentication credentials")
 			return
