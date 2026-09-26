@@ -6,3 +6,6 @@ tools/env.sh
 routes.json
 cert.pem
 key.pem
+web/node_modules/
+web/dist/
+
