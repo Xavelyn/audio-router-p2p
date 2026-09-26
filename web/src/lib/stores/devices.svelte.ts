@@ -12,6 +12,14 @@ class DeviceStore {
   virtualDevices = $derived(this.devices.filter((d) => d.is_virtual));
   hardwareDevices = $derived(this.devices.filter((d) => !d.is_virtual));
 
+  // Device-level matrix sources (columns): only devices with max_input > 0
+  // Output-only devices (max_input === 0) are strictly excluded.
+  matrixSourceDevices = $derived(this.devices.filter((d) => d.max_input > 0));
+
+  // Device-level matrix destinations (rows): only devices with max_output > 0
+  // Input-only devices (max_output === 0) are strictly excluded.
+  matrixDestinationDevices = $derived(this.devices.filter((d) => d.max_output > 0));
+
   // Generates flat list of input ports for Matrix Crossbar columns
   matrixInputPorts = $derived.by<MatrixPort[]>(() => {
     const ports: MatrixPort[] = [];

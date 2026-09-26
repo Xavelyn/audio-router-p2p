@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -62,8 +61,7 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 	if paInitCount.Add(1) == 1 {
 		if err := portaudio.Initialize(); err != nil {
 			paInitCount.Add(-1)
-			log.Printf("audio: portaudio init failed (%v); falling back to software emulator", err)
-			return newEmulatorInput(deviceID, sampleRate, channels), nil
+			return nil, err
 		}
 	}
 	dev, err := resolveInputDevice(deviceID)
@@ -71,8 +69,7 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 		if paInitCount.Add(-1) == 0 {
 			portaudio.Terminate()
 		}
-		log.Printf("audio: input device %d unavailable (%v); falling back to software emulator", deviceID, err)
-		return newEmulatorInput(deviceID, sampleRate, channels), nil
+		return nil, err
 	}
 	if channels > dev.MaxInputChannels {
 		channels = dev.MaxInputChannels
@@ -91,16 +88,14 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 		if paInitCount.Add(-1) == 0 {
 			portaudio.Terminate()
 		}
-		log.Printf("audio: failed to open hardware input stream (%v); falling back to software emulator", err)
-		return newEmulatorInput(deviceID, sampleRate, channels), nil
+		return nil, err
 	}
 	if err := st.Start(); err != nil {
 		st.Close()
 		if paInitCount.Add(-1) == 0 {
 			portaudio.Terminate()
 		}
-		log.Printf("audio: failed to start hardware input stream (%v); falling back to software emulator", err)
-		return newEmulatorInput(deviceID, sampleRate, channels), nil
+		return nil, err
 	}
 	return &portaudioInput{stream: st, buf: buf}, nil
 }
@@ -192,8 +187,7 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 	if paInitCount.Add(1) == 1 {
 		if err := portaudio.Initialize(); err != nil {
 			paInitCount.Add(-1)
-			log.Printf("audio: portaudio init failed (%v); falling back to software emulator", err)
-			return newEmulatorOutput(deviceID), nil
+			return nil, err
 		}
 	}
 	dev, err := resolveOutputDevice(deviceID)
@@ -201,8 +195,7 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 		if paInitCount.Add(-1) == 0 {
 			portaudio.Terminate()
 		}
-		log.Printf("audio: output device %d unavailable (%v); falling back to software emulator", deviceID, err)
-		return newEmulatorOutput(deviceID), nil
+		return nil, err
 	}
 	if channels > dev.MaxOutputChannels {
 		channels = dev.MaxOutputChannels
@@ -221,16 +214,14 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 		if paInitCount.Add(-1) == 0 {
 			portaudio.Terminate()
 		}
-		log.Printf("audio: failed to open hardware output stream (%v); falling back to software emulator", err)
-		return newEmulatorOutput(deviceID), nil
+		return nil, err
 	}
 	if err := st.Start(); err != nil {
 		st.Close()
 		if paInitCount.Add(-1) == 0 {
 			portaudio.Terminate()
 		}
-		log.Printf("audio: failed to start hardware output stream (%v); falling back to software emulator", err)
-		return newEmulatorOutput(deviceID), nil
+		return nil, err
 	}
 	return &portaudioOutput{
 		stream:     st,

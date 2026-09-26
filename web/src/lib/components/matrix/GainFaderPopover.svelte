@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { matrixStore, type CrosspointCell } from '$lib/stores/matrix.svelte';
+  import { matrixStore } from '$lib/stores/matrix.svelte';
+  import { deviceStore } from '$lib/stores/devices.svelte';
   import { linearToDb, dbToLinear, formatDb } from '$lib/api/types';
   import X from '@lucide/svelte/icons/x';
   import Volume2 from '@lucide/svelte/icons/volume-2';
@@ -9,10 +10,21 @@
   let cell = $derived(matrixStore.activeFaderCell);
   let coords = $derived(matrixStore.activeFaderCoords);
 
+  let sourceDevice = $derived(
+    matrixStore.activeFaderSourceDevice ??
+    deviceStore.devices.find((d) => d.id === cell?.sourceDeviceId)
+  );
+  let destDevice = $derived(
+    matrixStore.activeFaderDestinationDevice ??
+    deviceStore.devices.find((d) => d.id === cell?.destinationDeviceId)
+  );
+
+  let sourceName = $derived(sourceDevice?.name || cell?.sourceDeviceId || 'Input Source');
+  let destName = $derived(destDevice?.name || cell?.destinationDeviceId || 'Output Destination');
+
   // Local fader state in dB
   let currentDb = $state(0);
   let currentMuted = $state(false);
-  let isDragging = $state(false);
   let showSlewAnimation = $state(false);
 
   // Sync state whenever active cell changes
@@ -39,7 +51,7 @@
   function triggerGainUpdate(gainLinear: number) {
     if (!cell) return;
     showSlewAnimation = true;
-    matrixStore.setGain(cell.routeId, cell.outChannel, cell.inChannel, gainLinear, 20.0);
+    matrixStore.setGain(cell.routeId, gainLinear, 20.0);
     setTimeout(() => {
       showSlewAnimation = false;
     }, 150);
@@ -81,22 +93,29 @@
 
   <!-- Floating Fader Card -->
   <div
-    class="fixed z-50 w-64 rounded-xl border border-zinc-700/80 bg-zinc-950 p-4 shadow-2xl shadow-cyan-950/40 text-zinc-100 animate-in fade-in zoom-in-95"
-    style="top: {Math.max(10, Math.min(window.innerHeight - 380, coords.y - 120))}px; left: {Math.max(10, Math.min(window.innerWidth - 280, coords.x + 24))}px;"
+    class="fixed z-50 w-72 rounded-xl border border-zinc-700/80 bg-zinc-950 p-4 shadow-2xl shadow-cyan-950/40 text-zinc-100 animate-in fade-in zoom-in-95"
+    style="top: {Math.max(10, Math.min(window.innerHeight - 420, coords.y - 120))}px; left: {Math.max(10, Math.min(window.innerWidth - 310, coords.x + 24))}px;"
   >
     <!-- Header -->
-    <div class="flex items-center justify-between border-b border-zinc-800 pb-2.5 mb-3">
-      <div class="flex flex-col">
+    <div class="flex items-start justify-between border-b border-zinc-800 pb-2.5 mb-3">
+      <div class="flex flex-col min-w-0 pr-2">
         <span class="text-[10px] font-mono font-semibold tracking-wider text-cyan-400">
-          CROSSPOINT GAIN FADER
+          DEVICE ROUTE GAIN
         </span>
-        <span class="text-xs font-mono text-zinc-300 truncate max-w-[180px]">
-          In: {cell.inChannel} &rarr; Out: {cell.outChannel}
-        </span>
+        <div class="text-xs font-mono text-zinc-200 font-medium truncate mt-0.5" title="{sourceName} &rarr; {destName}">
+          <span class="text-cyan-300">{sourceName}</span>
+          <span class="text-zinc-500 mx-1">&rarr;</span>
+          <span class="text-zinc-100">{destName}</span>
+        </div>
+        <div class="flex items-center gap-2 mt-1 text-[10px] font-mono text-zinc-400">
+          <span>In: {sourceDevice?.max_input ?? 2} Ch ({sourceDevice?.is_virtual ? 'VIRT' : 'HW'})</span>
+          <span>&bull;</span>
+          <span>Out: {destDevice?.max_output ?? 2} Ch ({destDevice?.is_virtual ? 'VIRT' : 'HW'})</span>
+        </div>
       </div>
       <button
         onclick={close}
-        class="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors"
+        class="rounded p-1 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-colors shrink-0"
         aria-label="Close"
       >
         <X class="w-3.5 h-3.5" />
@@ -154,6 +173,7 @@
 
         <!-- Unity Gain Button -->
         <button
+          type="button"
           onclick={setUnity}
           class="w-full rounded border border-cyan-500/30 bg-cyan-500/10 py-1 text-xs font-mono font-semibold text-cyan-300 hover:bg-cyan-500/20 transition-all"
         >
@@ -162,6 +182,7 @@
 
         <!-- -inf dB Button -->
         <button
+          type="button"
           onclick={setMuteZero}
           class="w-full rounded border border-zinc-800 bg-zinc-900 py-1 text-xs font-mono text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 transition-all"
         >
@@ -172,8 +193,9 @@
 
     <!-- Mute Switch -->
     <div class="mt-2 pt-2.5 border-t border-zinc-800 flex items-center justify-between">
-      <span class="text-xs font-medium text-zinc-300">Channel Mute</span>
+      <span class="text-xs font-medium text-zinc-300">Route Mute</span>
       <button
+        type="button"
         onclick={toggleMute}
         class="inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all {currentMuted
           ? 'bg-red-500 text-white shadow-sm shadow-red-500/40'

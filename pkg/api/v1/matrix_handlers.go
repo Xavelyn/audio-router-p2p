@@ -40,6 +40,30 @@ func (s *V1Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Validate device capabilities: source must have input channels, destination must have output channels
+		if s.devReg != nil {
+			if req.Source.DeviceID != "" {
+				if dev, ok := s.devReg.GetDevice(req.Source.DeviceID); ok {
+					if dev.MaxInput <= 0 {
+						s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_DEVICE_DIRECTION",
+							fmt.Sprintf("source device %q (id %s) has no input channels; outputs cannot be used as sources", dev.Name, dev.ID))
+						return
+					}
+				}
+			}
+			if req.Destination.NodeID == "" || req.Destination.NodeID == "local" {
+				if req.Destination.DeviceID != "" {
+					if dev, ok := s.devReg.GetDevice(req.Destination.DeviceID); ok {
+						if dev.MaxOutput <= 0 {
+							s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_DEVICE_DIRECTION",
+								fmt.Sprintf("destination device %q (id %s) has no output channels; inputs cannot be used as destinations", dev.Name, dev.ID))
+							return
+						}
+					}
+				}
+			}
+		}
+
 		inCh := len(req.Source.Channels)
 		if inCh == 0 {
 			inCh = 2
