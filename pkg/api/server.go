@@ -1,11 +1,10 @@
 package api
 
 import (
-	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	stdSync "sync"
 
 	"github.com/audio-router-p2p/internal/config"
@@ -138,19 +137,85 @@ func (s *Server) getRoomManager() RoomManager {
 	return s.roomMgr
 }
 
-// Handler returns the fully-wrapped HTTP handler.
+// v1RoomManagerAdapter adapts api.RoomManager to v1.RoomManager dynamically.
+type v1RoomManagerAdapter struct {
+	s *Server
+}
+
+func (a *v1RoomManagerAdapter) ListRooms() []v1.RoomInfo {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return nil
+	}
+	rooms := rm.ListRooms()
+	res := make([]v1.RoomInfo, len(rooms))
+	for i, r := range rooms {
+		res[i] = v1.RoomInfo{
+			ID:      r.ID,
+			Name:    r.Name,
+			Leader:  r.Leader,
+			State:   r.State,
+			Members: r.Members,
+		}
+	}
+	return res
+}
+
+func (a *v1RoomManagerAdapter) CreateRoom(id, name string) (v1.RoomInfo, error) {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return v1.RoomInfo{}, fmt.Errorf("room manager not configured")
+	}
+	r, err := rm.CreateRoom(id, name)
+	if err != nil {
+		return v1.RoomInfo{}, err
+	}
+	return v1.RoomInfo{
+		ID:      r.ID,
+		Name:    r.Name,
+		Leader:  r.Leader,
+		State:   r.State,
+		Members: r.Members,
+	}, nil
+}
+
+func (a *v1RoomManagerAdapter) JoinRoom(id string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.JoinRoom(id)
+}
+
+func (a *v1RoomManagerAdapter) LeaveRoom(id string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.LeaveRoom(id)
+}
+
+// Handler returns the fully-wrapped HTTP handler with body size limiting, metrics, and panic recovery.
 func (s *Server) Handler() http.Handler {
-	return s.recoverPanic(s.metrics(s.authenticate(s.mux)))
+	return s.recoverPanic(s.metrics(s.maxBytes(s.mux)))
 }
 
 func (s *Server) routes() {
-	// 1. Backward-compatible unversioned endpoints
-	s.registerLegacyRoutes()
-
-	// 2. Prometheus metrics
+	// 1. Prometheus metrics endpoint
 	s.mux.Handle("/metrics", promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{}))
 
-	// 3. OpenAPI 3.1 canonical V1 endpoints
+	// 2. Canonical /status alias simply forwarding to /api/v1/system/status
+	s.mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL.Path = "/api/v1/system/status"
+		s.mux.ServeHTTP(w, r2)
+	})
+
+	// 3. Canonical OpenAPI 3.1 V1 endpoints
 	s.V1().MountRoutes(s.mux)
 }
 
@@ -162,24 +227,11 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	}
 }
 
-func (s *Server) authenticate(next http.Handler) http.Handler {
+// maxBytes limits incoming request bodies to 1MB.
+func (s *Server) maxBytes(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Canonical OpenAPI 3.1 routes (/api/v1/*) manage their own authentication middleware
-		// with multi-modal credential extraction and standardized ErrorResponse.
-		if strings.HasPrefix(r.URL.Path, "/api/v1/") {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		if s.cfg != nil && s.cfg.AuthToken != "" {
-			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if token == "" {
-				token = r.Header.Get("X-Auth-Token")
-			}
-			if subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.AuthToken)) != 1 {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-				return
-			}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		}
 		next.ServeHTTP(w, r)
 	})
@@ -187,10 +239,10 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 func (s *Server) metrics(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
 		if s.reqs != nil {
 			s.reqs.WithLabelValues(r.Method, r.URL.Path).Inc()
 		}
+		next.ServeHTTP(w, r)
 	})
 }
 

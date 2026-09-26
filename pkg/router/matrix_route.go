@@ -68,6 +68,37 @@ type MatrixEndpoint struct {
 type RouteSource = MatrixEndpoint
 type RouteDestination = MatrixEndpoint
 
+// FormatConversion specifies sample rate, channel count, and layout adaptations between endpoints.
+type FormatConversion struct {
+	InSampleRate  int           `json:"in_sample_rate"`
+	OutSampleRate int           `json:"out_sample_rate"`
+	InLayout      ChannelLayout `json:"in_layout,omitempty"`
+	OutLayout     ChannelLayout `json:"out_layout,omitempty"`
+	InChannels    int           `json:"in_channels"`
+	OutChannels   int           `json:"out_channels"`
+}
+
+// NeedsResampling returns true if sample rate conversion is required.
+func (fc *FormatConversion) NeedsResampling() bool {
+	return fc.InSampleRate > 0 && fc.OutSampleRate > 0 && fc.InSampleRate != fc.OutSampleRate
+}
+
+// NeedsRemixing returns true if channel count conversion is required.
+func (fc *FormatConversion) NeedsRemixing() bool {
+	return fc.InChannels > 0 && fc.OutChannels > 0 && fc.InChannels != fc.OutChannels
+}
+
+// Validate checks that sample rates and channel counts are positive.
+func (fc *FormatConversion) Validate() error {
+	if fc.InChannels <= 0 || fc.OutChannels <= 0 {
+		return errors.New("channel counts must be positive")
+	}
+	if fc.InSampleRate <= 0 || fc.OutSampleRate <= 0 {
+		return errors.New("sample rates must be positive")
+	}
+	return nil
+}
+
 // MatrixRoute defines an arbitrary N:M matrix routing session between endpoints.
 type MatrixRoute struct {
 	ID           string           `json:"id"`
@@ -106,6 +137,39 @@ func (r *MatrixRoute) Validate() error {
 	if r.SlewMS < 0 {
 		return fmt.Errorf("slew_ms must be non-negative, got %f", r.SlewMS)
 	}
+	return nil
+}
+
+// SetCrosspoint updates an individual crosspoint gain with default 20ms slewing.
+func (r *MatrixRoute) SetCrosspoint(outCh, inCh int, gain float32) error {
+	if outCh < 0 || outCh >= r.OutChannels || inCh < 0 || inCh >= r.InChannels {
+		return fmt.Errorf("crosspoint out of range: out=%d, in=%d", outCh, inCh)
+	}
+	if math.IsNaN(float64(gain)) || math.IsInf(float64(gain), 0) || gain < 0.0 || gain > 2.0 {
+		return fmt.Errorf("gain out of bounds [0.0, 2.0]: %f", gain)
+	}
+	r.Coefficients[outCh*r.InChannels+inCh] = float64(gain)
+	r.SlewMS = 20.0
+	r.State = "slewing"
+	return nil
+}
+
+// SetLiveGain updates the full coefficient matrix and transitions smoothly over transitionMs milliseconds.
+func (r *MatrixRoute) SetLiveGain(matrix GainMatrix, transitionMs int) error {
+	if err := matrix.Validate(); err != nil {
+		return err
+	}
+	if matrix.InChannels != r.InChannels || matrix.OutChannels != r.OutChannels {
+		return fmt.Errorf("matrix dimensions mismatch: expected %dx%d, got %dx%d",
+			r.OutChannels, r.InChannels, matrix.OutChannels, matrix.InChannels)
+	}
+	if transitionMs <= 0 {
+		transitionMs = 20
+	}
+	r.Coefficients = make([]float64, len(matrix.Coefficients))
+	copy(r.Coefficients, matrix.Coefficients)
+	r.SlewMS = float64(transitionMs)
+	r.State = "slewing"
 	return nil
 }
 
@@ -317,6 +381,7 @@ func (gm *GainMatrix) Evaluate(inPCM, outPCM []byte) (int, error) {
 // (e.g., 20ms = 960 samples @ 48kHz) to eliminate digital clicks and zipper artifacts.
 type SlewGainMatrix struct {
 	mu               sync.RWMutex
+	sampleRate       int
 	inChannels       int
 	outChannels      int
 	currentWeights   []float32
@@ -327,10 +392,18 @@ type SlewGainMatrix struct {
 	slewing          bool
 }
 
-// NewSlewGainMatrix initializes a SlewGainMatrix with initial coefficients.
+// NewSlewGainMatrix initializes a SlewGainMatrix with initial coefficients at default 48kHz sample rate.
 func NewSlewGainMatrix(inChannels, outChannels int, initial []float32) (*SlewGainMatrix, error) {
+	return NewSlewGainMatrixWithSampleRate(inChannels, outChannels, 48000, initial)
+}
+
+// NewSlewGainMatrixWithSampleRate initializes a SlewGainMatrix with initial coefficients and custom sample rate.
+func NewSlewGainMatrixWithSampleRate(inChannels, outChannels, sampleRate int, initial []float32) (*SlewGainMatrix, error) {
 	if inChannels <= 0 || outChannels <= 0 {
 		return nil, errors.New("channel counts must be positive")
+	}
+	if sampleRate <= 0 {
+		sampleRate = 48000
 	}
 	expected := inChannels * outChannels
 	if len(initial) != expected {
@@ -344,6 +417,7 @@ func NewSlewGainMatrix(inChannels, outChannels int, initial []float32) (*SlewGai
 	copy(target, initial)
 
 	return &SlewGainMatrix{
+		sampleRate:     sampleRate,
 		inChannels:     inChannels,
 		outChannels:    outChannels,
 		currentWeights: curr,
@@ -351,6 +425,55 @@ func NewSlewGainMatrix(inChannels, outChannels int, initial []float32) (*SlewGai
 		deltaWeights:   delta,
 		slewing:        false,
 	}, nil
+}
+
+// SampleRate returns the configured sample rate in Hz.
+func (s *SlewGainMatrix) SampleRate() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sampleRate
+}
+
+// SetSampleRate updates the configured sample rate in Hz.
+func (s *SlewGainMatrix) SetSampleRate(rate int) {
+	if rate <= 0 {
+		rate = 48000
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sampleRate = rate
+}
+
+func (s *SlewGainMatrix) slewSamplesForDuration(ms int) int {
+	if ms <= 0 {
+		ms = 20
+	}
+	return (ms * s.sampleRate) / 1000
+}
+
+func (s *SlewGainMatrix) initiateSlewLocked(slewSamples int) error {
+	expected := s.inChannels * s.outChannels
+	if slewSamples <= 0 {
+		// Snap immediately
+		copy(s.currentWeights, s.targetWeights)
+		for i := range s.deltaWeights {
+			s.deltaWeights[i] = 0
+		}
+		s.slewing = false
+		s.remainingSamples = 0
+		s.totalSlewSamples = 0
+		return nil
+	}
+
+	s.remainingSamples = slewSamples
+	s.totalSlewSamples = slewSamples
+	s.slewing = true
+
+	stepScale := 1.0 / float32(slewSamples)
+	for i := 0; i < expected; i++ {
+		s.deltaWeights[i] = (s.targetWeights[i] - s.currentWeights[i]) * stepScale
+	}
+	return nil
 }
 
 // SetTarget updates the target matrix coefficients and engages linear slewing over slewSamples.
@@ -369,30 +492,51 @@ func (s *SlewGainMatrix) SetTarget(target []float32, slewSamples int) error {
 		}
 	}
 
-	if slewSamples <= 0 {
-		// Snap immediately
-		copy(s.currentWeights, target)
-		copy(s.targetWeights, target)
-		for i := range s.deltaWeights {
-			s.deltaWeights[i] = 0
-		}
-		s.slewing = false
-		s.remainingSamples = 0
-		s.totalSlewSamples = 0
-		return nil
-	}
-
 	copy(s.targetWeights, target)
-	s.remainingSamples = slewSamples
-	s.totalSlewSamples = slewSamples
-	s.slewing = true
+	return s.initiateSlewLocked(slewSamples)
+}
 
-	stepScale := 1.0 / float32(slewSamples)
-	for i := 0; i < expected; i++ {
-		s.deltaWeights[i] = (s.targetWeights[i] - s.currentWeights[i]) * stepScale
+// SetCrosspoint updates an individual crosspoint (outCh, inCh) target gain and begins 20ms linear slewing.
+// Over 48kHz sample rate, 20ms linearly interpolates over 960 samples to prevent acoustic pops.
+func (s *SlewGainMatrix) SetCrosspoint(outCh, inCh int, gain float32) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if outCh < 0 || outCh >= s.outChannels || inCh < 0 || inCh >= s.inChannels {
+		return fmt.Errorf("crosspoint out of range: out=%d, in=%d", outCh, inCh)
+	}
+	if math.IsNaN(float64(gain)) || math.IsInf(float64(gain), 0) || gain < 0.0 || gain > 2.0 {
+		return fmt.Errorf("gain out of bounds [0.0, 2.0]: %f", gain)
 	}
 
-	return nil
+	idx := outCh*s.inChannels + inCh
+	s.targetWeights[idx] = gain
+	slewSamples := s.slewSamplesForDuration(20)
+	return s.initiateSlewLocked(slewSamples)
+}
+
+// SetLiveGain updates the full coefficient matrix and transitions smoothly over transitionMs milliseconds.
+func (s *SlewGainMatrix) SetLiveGain(matrix GainMatrix, transitionMs int) error {
+	if err := matrix.Validate(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if matrix.InChannels != s.inChannels || matrix.OutChannels != s.outChannels {
+		return fmt.Errorf("matrix dimensions mismatch: expected %dx%d, got %dx%d",
+			s.outChannels, s.inChannels, matrix.OutChannels, matrix.InChannels)
+	}
+
+	for i, c := range matrix.Coefficients {
+		s.targetWeights[i] = float32(c)
+	}
+
+	if transitionMs <= 0 {
+		transitionMs = 20
+	}
+	slewSamples := s.slewSamplesForDuration(transitionMs)
+	return s.initiateSlewLocked(slewSamples)
 }
 
 // IsSlewing returns whether the matrix is actively interpolating coefficients.

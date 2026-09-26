@@ -1,16 +1,20 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
-	"github.com/audio-router-p2p/pkg/audio"
+	v1 "github.com/audio-router-p2p/pkg/api/v1"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
@@ -54,11 +58,53 @@ func (m *mockStreamManager) StopRoute(routeID string) error {
 	return nil
 }
 
-var errTest = &testError{"test error"}
+type testMockRoomManager struct {
+	rooms    map[string]RoomInfo
+	joinErr  error
+	leaveErr error
+}
 
-type testError struct{ msg string }
+func newTestMockRoomManager() *testMockRoomManager {
+	return &testMockRoomManager{rooms: make(map[string]RoomInfo)}
+}
 
-func (e *testError) Error() string { return e.msg }
+func (m *testMockRoomManager) ListRooms() []RoomInfo {
+	res := make([]RoomInfo, 0, len(m.rooms))
+	for _, r := range m.rooms {
+		res = append(res, r)
+	}
+	return res
+}
+
+func (m *testMockRoomManager) CreateRoom(id, name string) (RoomInfo, error) {
+	if id == "" {
+		id = "gen-" + name
+	}
+	info := RoomInfo{ID: id, Name: name, Leader: "node-1", State: "active"}
+	m.rooms[id] = info
+	return info, nil
+}
+
+func (m *testMockRoomManager) JoinRoom(id string) error {
+	if m.joinErr != nil {
+		return m.joinErr
+	}
+	r, ok := m.rooms[id]
+	if !ok {
+		return fmt.Errorf("room %s not found", id)
+	}
+	r.Members = append(r.Members, "local-peer")
+	m.rooms[id] = r
+	return nil
+}
+
+func (m *testMockRoomManager) LeaveRoom(id string) error {
+	if m.leaveErr != nil {
+		return m.leaveErr
+	}
+	delete(m.rooms, id)
+	return nil
+}
 
 func testConfig() *config.Config {
 	return &config.Config{
@@ -108,14 +154,14 @@ func newTestServer(t *testing.T, streams StreamManager) *Server {
 	disc := testDiscovery(t)
 	sm := testSyncMgr(t)
 
-	// Create server with custom prometheus registry to avoid duplicate registration
 	s := &Server{
-		cfg:     cfg,
-		rt:      rt,
-		disc:    disc,
-		syncMgr: sm,
-		streams: streams,
-		mux:     http.NewServeMux(),
+		cfg:      cfg,
+		rt:       rt,
+		disc:     disc,
+		syncMgr:  sm,
+		streams:  streams,
+		mux:      http.NewServeMux(),
+		registry: prometheus.NewRegistry(),
 	}
 	s.reqs = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "audio_router_api_requests_total",
@@ -129,73 +175,56 @@ func newTestServer(t *testing.T, streams StreamManager) *Server {
 		Name: "audio_router_active_routes",
 		Help: "Current number of active stream routes.",
 	})
-	// Use a custom registry for testing
-	s.registry = prometheus.NewRegistry()
 	s.registry.MustRegister(s.reqs, s.peerCnt, s.routesActive)
+	_ = s.Hub()
+	_ = s.V1()
 	s.routes()
 	return s
 }
 
-func makeRequest(t *testing.T, method, path string, body interface{}, token string) *httptest.ResponseRecorder {
-	var buf bytes.Buffer
-	if body != nil {
-		if err := json.NewEncoder(&buf).Encode(body); err != nil {
-			t.Fatalf("encode body: %v", err)
-		}
-	}
-	req := httptest.NewRequest(method, path, &buf)
-	req.Header.Set("Content-Type", "application/json")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-	return httptest.NewRecorder()
-}
-
 func doRequest(t *testing.T, handler http.Handler, method, path string, body interface{}, token string) *httptest.ResponseRecorder {
-	w := makeRequest(t, method, path, body, token)
-	req := w.Result().Request
-	if req == nil {
-		req = httptest.NewRequest(method, path, nil)
-	}
-	// Actually, let's just use the request we made
-	req = httptest.NewRequest(method, path, nil)
+	var req *http.Request
 	if body != nil {
 		var buf bytes.Buffer
-		json.NewEncoder(&buf).Encode(body)
+		if err := json.NewEncoder(&buf).Encode(body); err != nil {
+			t.Fatalf("json encode: %v", err)
+		}
 		req = httptest.NewRequest(method, path, &buf)
 		req.Header.Set("Content-Type", "application/json")
+	} else {
+		req = httptest.NewRequest(method, path, nil)
 	}
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	w = httptest.NewRecorder()
+	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
 	return w
 }
 
-func TestServerAuthentication(t *testing.T) {
+func TestServerAuthenticationModalities(t *testing.T) {
 	s := newTestServer(t, nil)
 	handler := s.Handler()
 
-	// No token provided - should fail
+	// 1. Missing token -> 401
 	w := doRequest(t, handler, http.MethodGet, "/status", nil, "")
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 without token, got %d", w.Code)
 	}
 
-	// Wrong token - should fail
+	// 2. Wrong token -> 401
 	w = doRequest(t, handler, http.MethodGet, "/status", nil, "wrong-token")
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 with wrong token, got %d", w.Code)
 	}
 
-	// Correct token - should succeed
+	// 3. Bearer header -> 200
 	w = doRequest(t, handler, http.MethodGet, "/status", nil, "test-token")
 	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 with correct token, got %d", w.Code)
+		t.Errorf("expected 200 with Bearer token, got %d", w.Code)
 	}
 
-	// Test X-Auth-Token header
+	// 4. X-Auth-Token header -> 200
 	req := httptest.NewRequest(http.MethodGet, "/status", nil)
 	req.Header.Set("X-Auth-Token", "test-token")
 	w = httptest.NewRecorder()
@@ -203,290 +232,401 @@ func TestServerAuthentication(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 with X-Auth-Token, got %d", w.Code)
 	}
+
+	// 5. Cookie auth: audio_session -> 200
+	req = httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.AddCookie(&http.Cookie{Name: "audio_session", Value: "test-token"})
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with audio_session cookie, got %d", w.Code)
+	}
+
+	// 6. Query parameter token fallback: ?token=... -> 200
+	req = httptest.NewRequest(http.MethodGet, "/status?token=test-token", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 with ?token= query param, got %d", w.Code)
+	}
 }
 
-func TestServerStatus(t *testing.T) {
+func TestServerStatusAlias(t *testing.T) {
 	s := newTestServer(t, nil)
 	handler := s.Handler()
 
+	// GET /status alias forwards to /api/v1/system/status
 	w := doRequest(t, handler, http.MethodGet, "/status", nil, "test-token")
-
 	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+		t.Fatalf("expected 200 from /status, got %d: %s", w.Code, w.Body.String())
 	}
 
-	var resp map[string]interface{}
-	json.NewDecoder(w.Body).Decode(&resp)
-
-	if resp["status"] != "ok" {
-		t.Errorf("status not ok: %v", resp["status"])
+	var status v1.SystemStatus
+	if err := json.NewDecoder(w.Body).Decode(&status); err != nil {
+		t.Fatalf("decode SystemStatus: %v", err)
 	}
-	if resp["nodeID"] != "test-node" {
-		t.Errorf("nodeID mismatch: %v", resp["nodeID"])
-	}
-	// peerCount depends on discovery state
-	_ = resp["peerCount"]
-	if resp["routeCount"] != float64(0) {
-		t.Errorf("routeCount mismatch: %v", resp["routeCount"])
-	}
-}
-
-func TestServerDevices(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/devices", nil, "test-token")
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
+	if status.Status != "ok" {
+		t.Errorf("expected status 'ok', got %s", status.Status)
 	}
 
-	var devs []audio.Device
-	json.NewDecoder(w.Body).Decode(&devs)
-	// In noaudio mode, should return emulated devices
-	if len(devs) == 0 {
-		t.Log("no devices returned (expected in some environments)")
-	}
-}
-
-func TestServerPeers(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/peers", nil, "test-token")
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	var peers []discovery.Peer
-	json.NewDecoder(w.Body).Decode(&peers)
-	// Discovery might not have peers yet
-	_ = peers
-}
-
-func TestServerSync(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/sync", nil, "test-token")
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	var offsets map[string]sync.PeerOffset
-	json.NewDecoder(w.Body).Decode(&offsets)
-	// Sync might not have offsets yet
-	_ = offsets
-}
-
-func TestServerRoutesGet(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/routes", nil, "test-token")
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	var routes []router.StreamRoute
-	json.NewDecoder(w.Body).Decode(&routes)
-	if len(routes) != 0 {
-		t.Errorf("expected 0 routes, got %d", len(routes))
-	}
-}
-
-func TestServerRoutesPost(t *testing.T) {
-	msm := &mockStreamManager{}
-	s := newTestServer(t, msm)
-	handler := s.Handler()
-
-	route := router.StreamRoute{
-		ID:           "test-route",
-		SourceDevice: 0,
-		Destinations: []string{"127.0.0.1:45678"},
-		SampleRate:   44100,
-		Channels:     1,
-	}
-
-	w := doRequest(t, handler, http.MethodPost, "/routes", route, "test-token")
-
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-
-	var resp router.StreamRoute
-	json.NewDecoder(w.Body).Decode(&resp)
-	if resp.ID != "test-route" {
-		t.Errorf("route ID mismatch: %s", resp.ID)
-	}
-
-	if len(msm.started) != 1 {
-		t.Errorf("stream manager not called: %d", len(msm.started))
-	}
-}
-
-func TestServerRoutesPostInvalid(t *testing.T) {
-	msm := &mockStreamManager{}
-	s := newTestServer(t, msm)
-	handler := s.Handler()
-
-	route := router.StreamRoute{
-		SourceDevice: 0,
-		Destinations: []string{"127.0.0.1:45678"},
-	}
-
-	w := doRequest(t, handler, http.MethodPost, "/routes", route, "test-token")
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400, got %d", w.Code)
-	}
-}
-
-func TestServerRoutesPostStreamManagerError(t *testing.T) {
-	msm := &mockStreamManager{startErr: errTest}
-	s := newTestServer(t, msm)
-	handler := s.Handler()
-
-	route := router.StreamRoute{
-		ID:           "test-route",
-		SourceDevice: 0,
-		Destinations: []string{"127.0.0.1:45678"},
-		SampleRate:   44100,
-		Channels:     1,
-	}
-
-	w := doRequest(t, handler, http.MethodPost, "/routes", route, "test-token")
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestServerRoutesDelete(t *testing.T) {
-	msm := &mockStreamManager{}
-	s := newTestServer(t, msm)
-	handler := s.Handler()
-
-	// First add a route via the server's router (need to access it)
-	// We can't directly access s.rt, so add via POST first
-	route := router.StreamRoute{
-		ID:           "to-delete",
-		SourceDevice: 0,
-		Destinations: []string{"127.0.0.1:45678"},
-		SampleRate:   44100,
-		Channels:     1,
-	}
-	w := doRequest(t, handler, http.MethodPost, "/routes", route, "test-token")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("failed to add route: %d", w.Code)
-	}
-
-	w = doRequest(t, handler, http.MethodDelete, "/routes?id=to-delete", nil, "test-token")
-
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d", w.Code)
-	}
-
-	if len(msm.stopped) != 1 || msm.stopped[0] != "to-delete" {
-		t.Errorf("stream manager stop not called: %v", msm.stopped)
-	}
-}
-
-func TestServerRoutesDeleteMissingID(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodDelete, "/routes", nil, "test-token")
-
-	if w.Code != http.StatusBadRequest {
-		t.Errorf("expected 400, got %d", w.Code)
-	}
-}
-
-func TestServerRoutesDeleteNotFound(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodDelete, "/routes?id=nonexistent", nil, "test-token")
-
-	if w.Code != http.StatusNoContent {
-		t.Errorf("expected 204, got %d", w.Code)
-	}
-}
-
-func TestServerMethodNotAllowed(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	// PUT on /status
-	w := doRequest(t, handler, http.MethodPut, "/status", nil, "test-token")
+	// Non-GET method on /status returns 405
+	w = doRequest(t, handler, http.MethodPost, "/status", nil, "test-token")
 	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", w.Code)
+		t.Errorf("expected 405 on POST /status, got %d", w.Code)
+	}
+}
+
+func TestServerSystemEndpoints(t *testing.T) {
+	s := newTestServer(t, nil)
+	handler := s.Handler()
+
+	// GET /api/v1/system/status
+	w := doRequest(t, handler, http.MethodGet, "/api/v1/system/status", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/v1/system/status, got %d", w.Code)
+	}
+	var stat v1.SystemStatus
+	if err := json.NewDecoder(w.Body).Decode(&stat); err != nil {
+		t.Fatalf("decode status: %v", err)
+	}
+	if stat.Status != "ok" {
+		t.Errorf("expected ok status, got %s", stat.Status)
 	}
 
-	// PATCH on /routes
-	w = doRequest(t, handler, http.MethodPatch, "/routes", nil, "test-token")
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Errorf("expected 405, got %d", w.Code)
+	// GET /api/v1/system/peers
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/system/peers", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/v1/system/peers, got %d", w.Code)
+	}
+
+	// POST /api/v1/system/peers
+	connectReq := v1.ConnectPeerRequest{Addr: "192.168.1.55:7001"}
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/system/peers", connectReq, "test-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 from POST /api/v1/system/peers, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// GET /api/v1/system/clock-sync
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/system/clock-sync", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/v1/system/clock-sync, got %d", w.Code)
+	}
+}
+
+func TestServerDevicesCRUDAndVirtual(t *testing.T) {
+	s := newTestServer(t, nil)
+	handler := s.Handler()
+
+	// 1. GET /api/v1/devices
+	w := doRequest(t, handler, http.MethodGet, "/api/v1/devices", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/v1/devices, got %d", w.Code)
+	}
+
+	// 2. POST /api/v1/devices/virtual
+	createVirt := v1.CreateVirtualDeviceRequest{
+		Name:        "Virtual-Loopback-Test",
+		Direction:   "duplex",
+		Channels:    2,
+		SampleRate:  48000,
+		BufferSizeFrames: 480,
+	}
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/devices/virtual", createVirt, "test-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 from POST /api/v1/devices/virtual, got %d: %s", w.Code, w.Body.String())
+	}
+	var createdDev v1.AudioDevice
+	if err := json.NewDecoder(w.Body).Decode(&createdDev); err != nil {
+		t.Fatalf("decode created device: %v", err)
+	}
+	if !createdDev.IsVirtual || createdDev.Name != "Virtual-Loopback-Test" {
+		t.Errorf("unexpected virtual device: %+v", createdDev)
+	}
+
+	// 3. GET /api/v1/devices/{deviceId}
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/devices/"+createdDev.ID, nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/v1/devices/{id}, got %d", w.Code)
+	}
+
+	// 4. PATCH /api/v1/devices/{deviceId}
+	vol := 0.8
+	muted := true
+	patchReq := v1.UpdateDeviceRequest{Volume: &vol, Muted: &muted}
+	w = doRequest(t, handler, http.MethodPatch, "/api/v1/devices/"+createdDev.ID, patchReq, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from PATCH /api/v1/devices/{id}, got %d: %s", w.Code, w.Body.String())
+	}
+	var updatedDev v1.AudioDevice
+	if err := json.NewDecoder(w.Body).Decode(&updatedDev); err != nil {
+		t.Fatalf("decode patched device: %v", err)
+	}
+	if updatedDev.Volume != 0.8 || !updatedDev.Muted {
+		t.Errorf("unexpected volume/muted state: %+v", updatedDev)
+	}
+
+	// 5. DELETE /api/v1/devices/virtual/{deviceId}
+	w = doRequest(t, handler, http.MethodDelete, "/api/v1/devices/virtual/"+createdDev.ID, nil, "test-token")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 from DELETE /api/v1/devices/virtual/{id}, got %d", w.Code)
+	}
+
+	// Verify device is gone
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/devices/"+createdDev.ID, nil, "test-token")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 after deletion, got %d", w.Code)
+	}
+}
+
+func TestServerMatrixRoutingCrosspointAndSlew(t *testing.T) {
+	msm := &mockStreamManager{}
+	s := newTestServer(t, msm)
+	handler := s.Handler()
+
+	// 1. POST /api/v1/routes (Create route)
+	createReq := v1.CreateRouteRequest{
+		ID:   "matrix-route-test-1",
+		Name: "Monitor Output Feed",
+		Source: router.MatrixEndpoint{
+			NodeID:   "local",
+			DeviceID: "0",
+			Layout:   router.LayoutStereo,
+			Channels: []int{0, 1},
+		},
+		Destination: router.MatrixEndpoint{
+			NodeID:   "local",
+			DeviceID: "1",
+			Layout:   router.LayoutStereo,
+			Channels: []int{0, 1},
+		},
+		Coefficients: []float64{1.0, 0.0, 0.0, 1.0},
+		SlewMS:       20.0,
+	}
+	w := doRequest(t, handler, http.MethodPost, "/api/v1/routes", createReq, "test-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 from POST /api/v1/routes, got %d: %s", w.Code, w.Body.String())
+	}
+	var mr router.MatrixRoute
+	if err := json.NewDecoder(w.Body).Decode(&mr); err != nil {
+		t.Fatalf("decode route: %v", err)
+	}
+	if mr.ID != "matrix-route-test-1" {
+		t.Errorf("route ID mismatch: %s", mr.ID)
+	}
+
+	// 2. GET /api/v1/routes/{id}
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/routes/matrix-route-test-1", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/v1/routes/{id}, got %d", w.Code)
+	}
+
+	// 3. POST /api/v1/routes/{id}/crosspoint (Dynamic crosspoint modification with 20ms slew)
+	cpReq := v1.CrosspointGainRequest{
+		OutChannel: 0,
+		InChannel:  1,
+		Gain:       0.7071,
+		SlewMS:     20.0,
+	}
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/routes/matrix-route-test-1/crosspoint", cpReq, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from crosspoint update, got %d: %s", w.Code, w.Body.String())
+	}
+	var cpRoute router.MatrixRoute
+	if err := json.NewDecoder(w.Body).Decode(&cpRoute); err != nil {
+		t.Fatalf("decode crosspoint route: %v", err)
+	}
+	if cpRoute.Coefficients[1] != 0.7071 || cpRoute.State != "slewing" {
+		t.Errorf("crosspoint update unexpected: coeff=%f, state=%s", cpRoute.Coefficients[1], cpRoute.State)
+	}
+
+	// 4. PATCH /api/v1/routes/{id} (Live gain slew update)
+	newCoeffs := []float64{0.5, 0.5, 0.5, 0.5}
+	slewTime := 15.0
+	patchReq := v1.PatchRouteRequest{
+		Coefficients: newCoeffs,
+		SlewMS:       &slewTime,
+	}
+	w = doRequest(t, handler, http.MethodPatch, "/api/v1/routes/matrix-route-test-1", patchReq, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from PATCH /api/v1/routes/{id}, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. DELETE /api/v1/routes/{id}
+	w = doRequest(t, handler, http.MethodDelete, "/api/v1/routes/matrix-route-test-1", nil, "test-token")
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("expected 204 from DELETE /api/v1/routes/{id}, got %d", w.Code)
+	}
+
+	// Verify route is deleted
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/routes/matrix-route-test-1", nil, "test-token")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 after route deletion, got %d", w.Code)
+	}
+}
+
+func TestServerRoomsLifecycle(t *testing.T) {
+	s := newTestServer(t, nil)
+	rm := newTestMockRoomManager()
+	s.SetRoomManager(rm)
+	handler := s.Handler()
+
+	// 1. GET /api/v1/rooms (initially empty)
+	w := doRequest(t, handler, http.MethodGet, "/api/v1/rooms", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/v1/rooms, got %d", w.Code)
+	}
+	var rooms []v1.RoomInfo
+	_ = json.NewDecoder(w.Body).Decode(&rooms)
+	if len(rooms) != 0 {
+		t.Fatalf("expected 0 rooms initially, got %d", len(rooms))
+	}
+
+	// 2. POST /api/v1/rooms (Create room)
+	createReq := v1.CreateRoomRequest{ID: "studio-alpha", Name: "Studio Alpha Stage"}
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/rooms", createReq, "test-token")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201 from POST /api/v1/rooms, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. GET /api/v1/rooms/{id}
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/rooms/studio-alpha", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from GET /api/v1/rooms/{id}, got %d", w.Code)
+	}
+
+	// 4. POST /api/v1/rooms/{id}/join
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/rooms/studio-alpha/join", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /api/v1/rooms/{id}/join, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 5. POST /api/v1/rooms/{id}/leave
+	w = doRequest(t, handler, http.MethodPost, "/api/v1/rooms/studio-alpha/leave", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from POST /api/v1/rooms/{id}/leave, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestServerTelemetryStreamStatsAndSSE(t *testing.T) {
+	msm := &mockStreamManager{}
+	s := newTestServer(t, msm)
+	handler := s.Handler()
+
+	// 1. GET /api/v1/telemetry/stream-stats
+	w := doRequest(t, handler, http.MethodGet, "/api/v1/telemetry/stream-stats", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/v1/telemetry/stream-stats, got %d", w.Code)
+	}
+	var stats map[string]v1.StreamStats
+	if err := json.NewDecoder(w.Body).Decode(&stats); err != nil {
+		t.Fatalf("decode stats: %v", err)
+	}
+	if stats["route-1"].PacketsSent != 100 {
+		t.Errorf("expected packets_sent 100, got %d", stats["route-1"].PacketsSent)
+	}
+
+	// 2. SSE Meter Stream /api/v1/telemetry/meters
+	hub := s.Hub()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ts := httptest.NewServer(handler)
+	defer ts.Close()
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, ts.URL+"/api/v1/telemetry/meters?token=test-token", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/v1/telemetry/meters failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from SSE stream, got %d", resp.StatusCode)
+	}
+
+	// Broadcast test meter frame from hub
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		hub.Broadcast([]byte(`{"stream_id":"test-stream","timestamp_ns":123456,"channels":[]}`))
+	}()
+
+	scanner := bufio.NewScanner(resp.Body)
+	var gotEvent bool
+	deadline := time.After(500 * time.Millisecond)
+	ch := make(chan string, 1)
+
+	go func() {
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data: ") {
+				ch <- line
+				return
+			}
+		}
+	}()
+
+	select {
+	case line := <-ch:
+		if strings.Contains(line, "test-stream") {
+			gotEvent = true
+		}
+	case <-deadline:
+		t.Fatal("timed out waiting for SSE meter frame")
+	}
+
+	if !gotEvent {
+		t.Error("failed to receive broadcasted SSE meter frame")
+	}
+}
+
+func TestServerMetricsPrometheus(t *testing.T) {
+	s := newTestServer(t, nil)
+	handler := s.Handler()
+
+	_ = doRequest(t, handler, http.MethodGet, "/status", nil, "test-token")
+	w := doRequest(t, handler, http.MethodGet, "/metrics", nil, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "audio_router_api_requests_total") {
+		t.Errorf("expected audio_router_api_requests_total in metrics, got: %s", body)
+	}
+}
+
+func TestServerMaxBytesLimit(t *testing.T) {
+	s := newTestServer(t, nil)
+	handler := s.Handler()
+
+	// Body exceeding 1MB limit
+	hugeBody := bytes.Repeat([]byte("a"), 2*1024*1024)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/system/peers", bytes.NewReader(hugeBody))
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// MaxBytesReader returns 400 Bad Request on decoding oversized payload
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for oversized payload, got %d", w.Code)
 	}
 }
 
 func TestServerPanicRecovery(t *testing.T) {
-	cfg := testConfig()
-	rt := testRouter(t)
-	disc := testDiscovery(t)
-	s := NewServer(cfg, rt, disc, nil, nil)
-	// Nil syncMgr no longer panics in handleStatus (3.3 mirrors handleSync),
-	// so exercise the recovery middleware deterministically via a panic route.
-	s.mux.HandleFunc("/boom", func(w http.ResponseWriter, r *http.Request) {
-		panic("boom")
+	s := newTestServer(t, nil)
+	s.mux.HandleFunc("/panic-test", func(w http.ResponseWriter, r *http.Request) {
+		panic("test panic recovery")
 	})
 	handler := s.Handler()
 
-	w := doRequest(t, handler, http.MethodGet, "/boom", nil, "test-token")
-
-	// Should recover and return 500
+	w := doRequest(t, handler, http.MethodGet, "/panic-test", nil, "test-token")
 	if w.Code != http.StatusInternalServerError {
-		t.Errorf("expected 500 on panic, got %d", w.Code)
+		t.Fatalf("expected 500 on panic, got %d", w.Code)
 	}
 	var resp map[string]string
-	json.NewDecoder(w.Body).Decode(&resp)
+	_ = json.NewDecoder(w.Body).Decode(&resp)
 	if resp["error"] != "internal error" {
-		t.Errorf("unexpected error message: %v", resp)
-	}
-}
-
-func TestMetricsEndpoint(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/metrics", nil, "test-token")
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200 for /metrics, got %d", w.Code)
-	}
-	if len(w.Body.String()) == 0 {
-		t.Error("metrics endpoint returned empty body")
-	}
-}
-
-func TestWriteJSON(t *testing.T) {
-	w := httptest.NewRecorder()
-	writeJSON(w, http.StatusOK, map[string]string{"key": "value"})
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-	if w.Header().Get("Content-Type") != "application/json" {
-		t.Errorf("wrong content type: %s", w.Header().Get("Content-Type"))
-	}
-	var resp map[string]string
-	json.NewDecoder(w.Body).Decode(&resp)
-	if resp["key"] != "value" {
-		t.Errorf("value mismatch: %v", resp)
+		t.Errorf("unexpected error payload: %+v", resp)
 	}
 }
 
@@ -497,195 +637,5 @@ func TestConstantTimeCompare(t *testing.T) {
 	}
 	if subtle.ConstantTimeCompare(token, []byte("wrong")) == 1 {
 		t.Error("constant time compare should fail for different")
-	}
-}
-func TestStatusNilSyncMgr(t *testing.T) {
-	// Server without a sync manager must serve /status in a read-only mode
-	// (200, syncPeers: 0) instead of dereferencing a nil syncMgr (3.3).
-	cfg := testConfig()
-	rt := testRouter(t)
-	disc := testDiscovery(t)
-	s := NewServer(cfg, rt, disc, nil, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/status", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 with nil syncMgr, got %d", w.Code)
-	}
-	var body map[string]interface{}
-	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
-		t.Fatalf("decode /status: %v", err)
-	}
-	if got := int(body["syncPeers"].(float64)); got != 0 {
-		t.Fatalf("expected syncPeers 0 with nil syncMgr, got %d", got)
-	}
-}
-
-type testMockRoomManager struct {
-	rooms    map[string]RoomInfo
-	joinErr  error
-	leaveErr error
-}
-
-func newTestMockRoomManager() *testMockRoomManager {
-	return &testMockRoomManager{rooms: make(map[string]RoomInfo)}
-}
-
-func (m *testMockRoomManager) ListRooms() []RoomInfo {
-	res := make([]RoomInfo, 0, len(m.rooms))
-	for _, r := range m.rooms {
-		res = append(res, r)
-	}
-	return res
-}
-
-func (m *testMockRoomManager) CreateRoom(id, name string) (RoomInfo, error) {
-	if id == "" {
-		id = "gen-" + name
-	}
-	info := RoomInfo{ID: id, Name: name, Leader: "node-1"}
-	m.rooms[id] = info
-	return info, nil
-}
-
-func (m *testMockRoomManager) JoinRoom(id string) error {
-	if m.joinErr != nil {
-		return m.joinErr
-	}
-	r, ok := m.rooms[id]
-	if !ok {
-		r = RoomInfo{ID: id}
-	}
-	r.Members = append(r.Members, "local-peer")
-	m.rooms[id] = r
-	return nil
-}
-
-func (m *testMockRoomManager) LeaveRoom(id string) error {
-	if m.leaveErr != nil {
-		return m.leaveErr
-	}
-	delete(m.rooms, id)
-	return nil
-}
-
-func TestServerStreamStats(t *testing.T) {
-	// 1. Without streams
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/streams/stats", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from /streams/stats without streams, got %d", w.Code)
-	}
-
-	// 2. With mock streams
-	msm := &mockStreamManager{}
-	s2 := newTestServer(t, msm)
-	h2 := s2.Handler()
-
-	w2 := doRequest(t, h2, http.MethodGet, "/streams/stats", nil, "test-token")
-	if w2.Code != http.StatusOK {
-		t.Fatalf("expected 200 from /streams/stats with streams, got %d", w2.Code)
-	}
-	var stats map[string]streamer.StreamerStats
-	if err := json.NewDecoder(w2.Body).Decode(&stats); err != nil {
-		t.Fatalf("decode stats: %v", err)
-	}
-	if r1, ok := stats["route-1"]; !ok || r1.PacketsSent != 100 {
-		t.Fatalf("unexpected stream stats: %+v", stats)
-	}
-
-	// 3. Method not allowed
-	w3 := doRequest(t, h2, http.MethodPost, "/streams/stats", nil, "test-token")
-	if w3.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405 on POST /streams/stats, got %d", w3.Code)
-	}
-}
-
-func TestServerRoomsUnconfigured(t *testing.T) {
-	s := newTestServer(t, nil)
-	handler := s.Handler()
-
-	w := doRequest(t, handler, http.MethodGet, "/rooms", nil, "test-token")
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404 for unconfigured room manager, got %d", w.Code)
-	}
-}
-
-func TestServerRoomsListAndCreate(t *testing.T) {
-	s := newTestServer(t, nil)
-	rm := newTestMockRoomManager()
-	s.SetRoomManager(rm)
-	handler := s.Handler()
-
-	// Initially empty list
-	w := doRequest(t, handler, http.MethodGet, "/rooms", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from GET /rooms, got %d", w.Code)
-	}
-	var rooms []RoomInfo
-	if err := json.NewDecoder(w.Body).Decode(&rooms); err != nil {
-		t.Fatalf("decode rooms: %v", err)
-	}
-	if len(rooms) != 0 {
-		t.Fatalf("expected 0 rooms, got %d", len(rooms))
-	}
-
-	// Create room
-	createBody := map[string]string{"id": "studio-1", "name": "Main Studio"}
-	w = doRequest(t, handler, http.MethodPost, "/rooms", createBody, "test-token")
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201 from POST /rooms, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// List rooms again
-	w = doRequest(t, handler, http.MethodGet, "/rooms", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from GET /rooms, got %d", w.Code)
-	}
-	if err := json.NewDecoder(w.Body).Decode(&rooms); err != nil {
-		t.Fatalf("decode rooms: %v", err)
-	}
-	if len(rooms) != 1 || rooms[0].ID != "studio-1" {
-		t.Fatalf("expected studio-1 in rooms, got: %+v", rooms)
-	}
-}
-
-func TestServerRoomsJoinAndLeave(t *testing.T) {
-	s := newTestServer(t, nil)
-	rm := newTestMockRoomManager()
-	_, _ = rm.CreateRoom("room-alpha", "Alpha")
-	s.SetRoomManager(rm)
-	handler := s.Handler()
-
-	// Join via POST /rooms/join with JSON
-	w := doRequest(t, handler, http.MethodPost, "/rooms/join", map[string]string{"id": "room-alpha"}, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from POST /rooms/join, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// Join via POST /rooms/room-alpha/join
-	w = doRequest(t, handler, http.MethodPost, "/rooms/room-alpha/join", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from POST /rooms/room-alpha/join, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// Leave via POST /rooms/leave with query param
-	w = doRequest(t, handler, http.MethodPost, "/rooms/leave?id=room-alpha", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from POST /rooms/leave, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// Leave via POST /rooms/room-alpha/leave
-	w = doRequest(t, handler, http.MethodPost, "/rooms/room-alpha/leave", nil, "test-token")
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 from POST /rooms/room-alpha/leave, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// Invalid method on subpath
-	w = doRequest(t, handler, http.MethodGet, "/rooms/join", nil, "test-token")
-	if w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("expected 405 on GET /rooms/join, got %d", w.Code)
 	}
 }

@@ -399,26 +399,22 @@ func TestE2E_FullControlPlaneWorkflow(t *testing.T) {
 	}
 
 	// -------------------------------------------------------------------------
-	// 7. Test Backward Compatibility: Legacy routes reflect the matrix route
+	// 7. Verify /status forwarding alias to /api/v1/system/status
 	// -------------------------------------------------------------------------
-	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/routes", nil)
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/status", nil)
 	req.Header.Set("Authorization", "Bearer "+authToken)
 	resp, err = client.Do(req)
 	if err != nil {
-		t.Fatalf("GET /routes failed: %v", err)
+		t.Fatalf("GET /status failed: %v", err)
 	}
-	var legRoutes []router.StreamRoute
-	_ = json.NewDecoder(resp.Body).Decode(&legRoutes)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 OK from /status, got %d", resp.StatusCode)
+	}
+	var stat v1.SystemStatus
+	_ = json.NewDecoder(resp.Body).Decode(&stat)
 	resp.Body.Close()
-	var foundInLeg bool
-	for _, r := range legRoutes {
-		if r.ID == "e2e-matrix-route" {
-			foundInLeg = true
-			break
-		}
-	}
-	if !foundInLeg {
-		t.Errorf("matrix route e2e-matrix-route not found in legacy /routes")
+	if stat.Status != "ok" || stat.ActiveRoutes < 1 {
+		t.Errorf("unexpected status from /status alias: %+v", stat)
 	}
 
 	// -------------------------------------------------------------------------

@@ -323,3 +323,187 @@ func TestSlewGainMatrix_ProceduralHelper(t *testing.T) {
 		t.Fatalf("SlewGainMatrix helper failed: n=%d, err=%v", n, err)
 	}
 }
+
+func TestFormatConversion(t *testing.T) {
+	fc := FormatConversion{
+		InSampleRate:  44100,
+		OutSampleRate: 48000,
+		InChannels:    1,
+		OutChannels:   2,
+		InLayout:      LayoutMono,
+		OutLayout:     LayoutStereo,
+	}
+
+	if err := fc.Validate(); err != nil {
+		t.Fatalf("fc.Validate() failed: %v", err)
+	}
+	if !fc.NeedsResampling() {
+		t.Error("expected NeedsResampling to be true")
+	}
+	if !fc.NeedsRemixing() {
+		t.Error("expected NeedsRemixing to be true")
+	}
+
+	fcSame := FormatConversion{
+		InSampleRate:  48000,
+		OutSampleRate: 48000,
+		InChannels:    2,
+		OutChannels:   2,
+	}
+	if fcSame.NeedsResampling() {
+		t.Error("expected NeedsResampling to be false")
+	}
+	if fcSame.NeedsRemixing() {
+		t.Error("expected NeedsRemixing to be false")
+	}
+
+	// Invalid cases
+	invalidFC := FormatConversion{InSampleRate: 0, OutSampleRate: 48000, InChannels: 2, OutChannels: 2}
+	if err := invalidFC.Validate(); err == nil {
+		t.Error("expected error for zero in_sample_rate")
+	}
+	invalidFC2 := FormatConversion{InSampleRate: 48000, OutSampleRate: 48000, InChannels: 0, OutChannels: 2}
+	if err := invalidFC2.Validate(); err == nil {
+		t.Error("expected error for zero in_channels")
+	}
+}
+
+func TestSlewGainMatrix_SetCrosspoint(t *testing.T) {
+	// 2x2 identity matrix, 48kHz sample rate
+	sgm, err := NewSlewGainMatrix(2, 2, []float32{1.0, 0.0, 0.0, 1.0})
+	if err != nil {
+		t.Fatalf("NewSlewGainMatrix failed: %v", err)
+	}
+
+	// Set crosspoint (out=0, in=1) from 0.0 to 1.0 with 20ms slew (960 samples @ 48kHz)
+	if err := sgm.SetCrosspoint(0, 1, 1.0); err != nil {
+		t.Fatalf("SetCrosspoint failed: %v", err)
+	}
+	if !sgm.IsSlewing() {
+		t.Fatal("expected IsSlewing() to be true")
+	}
+
+	// Total slew is 960 samples
+	slewSamples := 960
+	inPCM := make([]byte, slewSamples*2*2)
+	outPCM := make([]byte, slewSamples*2*2)
+
+	// Feed in[0] = 0, in[1] = 10000
+	for i := 0; i < slewSamples; i++ {
+		// in[0] = 0
+		binary.LittleEndian.PutUint16(inPCM[i*4:i*4+2], 0)
+		// in[1] = 10000
+		binary.LittleEndian.PutUint16(inPCM[i*4+2:i*4+4], 10000)
+	}
+
+	n, err := sgm.Process(inPCM, outPCM)
+	if err != nil || n != len(outPCM) {
+		t.Fatalf("Process failed: %v", err)
+	}
+
+	if sgm.IsSlewing() {
+		t.Error("expected IsSlewing() to be false after 960 samples")
+	}
+
+	// out[0] should have ramped from 0 up to 10000
+	var prevOut0 int16 = -1
+	for i := 0; i < slewSamples; i++ {
+		samp0 := int16(binary.LittleEndian.Uint16(outPCM[i*4 : i*4+2]))
+		if samp0 < prevOut0 {
+			t.Fatalf("out[0] at %d (%d) is not monotonically increasing from %d", i, samp0, prevOut0)
+		}
+		prevOut0 = samp0
+	}
+
+	lastSamp0 := int16(binary.LittleEndian.Uint16(outPCM[(slewSamples-1)*4 : (slewSamples-1)*4+2]))
+	if math.Abs(float64(lastSamp0-10000)) > 1.0 {
+		t.Errorf("last slewed sample = %d; want 10000", lastSamp0)
+	}
+
+	// Test bounds validation
+	if err := sgm.SetCrosspoint(2, 0, 1.0); err == nil {
+		t.Error("expected error for outCh >= outChannels")
+	}
+	if err := sgm.SetCrosspoint(0, 2, 1.0); err == nil {
+		t.Error("expected error for inCh >= inChannels")
+	}
+	if err := sgm.SetCrosspoint(0, 0, 2.5); err == nil {
+		t.Error("expected error for gain > 2.0")
+	}
+}
+
+func TestSlewGainMatrix_SetLiveGain(t *testing.T) {
+	sgm, err := NewSlewGainMatrix(2, 2, []float32{1.0, 0.0, 0.0, 1.0})
+	if err != nil {
+		t.Fatalf("NewSlewGainMatrix failed: %v", err)
+	}
+
+	newMatrix, err := NewGainMatrix(2, 2, []float64{0.5, 0.5, 0.5, 0.5})
+	if err != nil {
+		t.Fatalf("NewGainMatrix failed: %v", err)
+	}
+
+	// Slew over 10ms (480 samples @ 48kHz)
+	if err := sgm.SetLiveGain(*newMatrix, 10); err != nil {
+		t.Fatalf("SetLiveGain failed: %v", err)
+	}
+	if !sgm.IsSlewing() {
+		t.Fatal("expected IsSlewing() to be true")
+	}
+
+	blockSamples := 480
+	inPCM := make([]byte, blockSamples*2*2)
+	outPCM := make([]byte, blockSamples*2*2)
+	for i := 0; i < blockSamples; i++ {
+		binary.LittleEndian.PutUint16(inPCM[i*4:i*4+2], 10000)
+		binary.LittleEndian.PutUint16(inPCM[i*4+2:i*4+4], 10000)
+	}
+
+	if _, err := sgm.Process(inPCM, outPCM); err != nil {
+		t.Fatalf("Process failed: %v", err)
+	}
+	if sgm.IsSlewing() {
+		t.Fatal("expected slewing finished after 480 samples")
+	}
+
+	// At end of 10ms, out[0] = 0.5*10000 + 0.5*10000 = 10000
+	lastSamp := int16(binary.LittleEndian.Uint16(outPCM[(blockSamples-1)*4 : (blockSamples-1)*4+2]))
+	if math.Abs(float64(lastSamp-10000)) > 2.0 {
+		t.Errorf("lastSamp = %d; want 10000", lastSamp)
+	}
+
+	// Mismatched dimensions error
+	badMatrix, _ := NewGainMatrix(1, 1, []float64{1.0})
+	if err := sgm.SetLiveGain(*badMatrix, 10); err == nil {
+		t.Error("expected error for dimension mismatch")
+	}
+}
+
+func TestMatrixRoute_DynamicModification(t *testing.T) {
+	mr := MatrixRoute{
+		ID:           "test-dyn-route",
+		InChannels:   2,
+		OutChannels:  2,
+		Coefficients: []float64{1.0, 0.0, 0.0, 1.0},
+		SlewMS:       0,
+		State:        "active",
+	}
+
+	if err := mr.SetCrosspoint(0, 1, 0.7071); err != nil {
+		t.Fatalf("mr.SetCrosspoint failed: %v", err)
+	}
+	if mr.Coefficients[1] != float64(float32(0.7071)) {
+		t.Errorf("crosspoint coefficient = %f; want 0.7071", mr.Coefficients[1])
+	}
+	if mr.State != "slewing" || mr.SlewMS != 20.0 {
+		t.Errorf("unexpected state/slew: state=%s, slew=%f", mr.State, mr.SlewMS)
+	}
+
+	gm, _ := NewGainMatrix(2, 2, []float64{0.5, 0.5, 0.5, 0.5})
+	if err := mr.SetLiveGain(*gm, 30); err != nil {
+		t.Fatalf("mr.SetLiveGain failed: %v", err)
+	}
+	if mr.SlewMS != 30.0 || mr.Coefficients[0] != 0.5 {
+		t.Errorf("SetLiveGain result unexpected: %+v", mr)
+	}
+}
