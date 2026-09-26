@@ -1,10 +1,13 @@
 package group
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/audio-router-p2p/pkg/audio"
+	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/transport"
 )
 
@@ -143,4 +146,158 @@ func TestDefaultRoomManager_Close(t *testing.T) {
 	if err := mgr.JoinRoom("room-1"); err == nil {
 		t.Fatal("expected error on JoinRoom after Close")
 	}
+}
+
+func TestDefaultRoomManager_BindingsAndSync(t *testing.T) {
+	trans, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("create transport: %v", err)
+	}
+	defer trans.Close()
+
+	routesFile := t.TempDir() + "/manager_routes.json"
+	rt, err := router.New(routesFile)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	vp := NewVirtualDeviceProvider(nil, nil)
+	mgr := NewDefaultRoomManager(nil, nil, nil, trans, vp)
+	mgr.SetRouter(rt)
+	defer mgr.Close()
+
+	// 1. Create Room
+	info, err := mgr.CreateRoom("room-bus-mgr", "Bus Manager Room")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	if info.Synced {
+		t.Fatal("expected room to be unsynced initially")
+	}
+
+	// 2. Add Inputs & Outputs
+	if err := mgr.AddInput("room-bus-mgr", "in-dev-1"); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	if err := mgr.AddOutput("room-bus-mgr", "out-dev-1"); err != nil {
+		t.Fatalf("AddOutput: %v", err)
+	}
+
+	// Verify route synthesized in router
+	routeID := "room-room-bus-mgr-in-dev-1-out-dev-1"
+	if _, ok := rt.GetMatrix(routeID); !ok {
+		t.Fatalf("expected matrix route %s in router", routeID)
+	}
+
+	// 3. Set Room Sync
+	if err := mgr.SetRoomSync("room-bus-mgr", true); err != nil {
+		t.Fatalf("SetRoomSync: %v", err)
+	}
+	rooms := mgr.ListRooms()
+	if len(rooms) != 1 || !rooms[0].Synced {
+		t.Fatal("expected room to be synced")
+	}
+
+	// 4. Set Room Bindings (bulk update)
+	if err := mgr.SetRoomBindings("room-bus-mgr", []string{"in-dev-2"}, []string{"out-dev-2"}, false); err != nil {
+		t.Fatalf("SetRoomBindings: %v", err)
+	}
+	if _, ok := rt.GetMatrix(routeID); ok {
+		t.Fatalf("old route %s should have been removed", routeID)
+	}
+	newRouteID := "room-room-bus-mgr-in-dev-2-out-dev-2"
+	if _, ok := rt.GetMatrix(newRouteID); !ok {
+		t.Fatalf("new route %s should exist", newRouteID)
+	}
+
+	// 5. Test errors on non-existent room
+	if err := mgr.AddInput("non-existent", "dev"); err == nil {
+		t.Fatal("expected error on AddInput for non-existent room")
+	}
+	if err := mgr.RemoveInput("non-existent", "dev"); err == nil {
+		t.Fatal("expected error on RemoveInput for non-existent room")
+	}
+	if err := mgr.AddOutput("non-existent", "dev"); err == nil {
+		t.Fatal("expected error on AddOutput for non-existent room")
+	}
+	if err := mgr.RemoveOutput("non-existent", "dev"); err == nil {
+		t.Fatal("expected error on RemoveOutput for non-existent room")
+	}
+	if err := mgr.SetRoomSync("non-existent", true); err == nil {
+		t.Fatal("expected error on SetRoomSync for non-existent room")
+	}
+	if err := mgr.SetRoomBindings("non-existent", nil, nil, true); err == nil {
+		t.Fatal("expected error on SetRoomBindings for non-existent room")
+	}
+}
+
+func TestDefaultRoomManager_ConcurrentAccess(t *testing.T) {
+	trans, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("create transport: %v", err)
+	}
+	defer trans.Close()
+
+	routesFile := t.TempDir() + "/concurrent_routes.json"
+	rt, err := router.New(routesFile)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	vp := NewVirtualDeviceProvider(nil, nil)
+	mgr := NewDefaultRoomManager(nil, nil, nil, trans, vp)
+	mgr.SetRouter(rt)
+	defer mgr.Close()
+
+	roomID := "race-room"
+	_, err = mgr.CreateRoom(roomID, "Race Room")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const iterations = 50
+
+	// Goroutine 1: Rapidly add and remove inputs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			devID := fmt.Sprintf("mic-%d", i%5)
+			_ = mgr.AddInput(roomID, devID)
+			_ = mgr.RemoveInput(roomID, devID)
+		}
+	}()
+
+	// Goroutine 2: Rapidly add and remove outputs
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			devID := fmt.Sprintf("spk-%d", i%5)
+			_ = mgr.AddOutput(roomID, devID)
+			_ = mgr.RemoveOutput(roomID, devID)
+		}
+	}()
+
+	// Goroutine 3: Toggle sync and bulk bindings
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = mgr.SetRoomSync(roomID, i%2 == 0)
+			_ = mgr.SetRoomBindings(roomID, []string{"in-a", "in-b"}, []string{"out-a"}, i%2 == 1)
+		}
+	}()
+
+	// Goroutine 4: Read room info concurrently
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations; i++ {
+			_ = mgr.ListRooms()
+		}
+	}()
+
+	wg.Wait()
 }

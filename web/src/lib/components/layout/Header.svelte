@@ -12,14 +12,16 @@
   import Shield from '@lucide/svelte/icons/shield';
   import Key from '@lucide/svelte/icons/key';
   import Clock from '@lucide/svelte/icons/clock';
+  import Workflow from '@lucide/svelte/icons/workflow';
 
-  export type TabId = 'matrix' | 'meters' | 'devices' | 'rooms' | 'diagnostics';
+  export type TabId = 'flow' | 'matrix' | 'meters' | 'devices' | 'rooms' | 'diagnostics';
 
-  let { activeTab = $bindable('matrix' as TabId) } = $props<{ activeTab: TabId }>();
+  let { activeTab = $bindable('flow' as TabId) } = $props<{ activeTab: TabId }>();
 
   let isAuthOpen = $state(false);
 
   const tabs: { id: TabId; label: string; icon: any }[] = [
+    { id: 'flow', label: 'Audio Flow', icon: Workflow },
     { id: 'matrix', label: 'Matrix Crossbar', icon: Sliders },
     { id: 'meters', label: 'Live Meters', icon: Activity },
     { id: 'devices', label: 'Audio Devices', icon: Speaker },

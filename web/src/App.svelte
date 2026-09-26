@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Header, { type TabId } from '$lib/components/layout/Header.svelte';
+  import RoomCanvas from '$lib/components/rooms/RoomCanvas.svelte';
   import MatrixCrossbar from '$lib/components/matrix/MatrixCrossbar.svelte';
   import MeterRack from '$lib/components/meters/MeterRack.svelte';
   import DeviceManager from '$lib/components/devices/DeviceManager.svelte';
@@ -12,7 +13,7 @@
   import X from '@lucide/svelte/icons/x';
   import Key from '@lucide/svelte/icons/key';
 
-  let activeTab = $state<TabId>('matrix');
+  let activeTab = $state<TabId>('flow');
   let dismissBanner = $state(false);
 
   onMount(() => {
@@ -52,7 +53,9 @@
 
   <!-- Active View Viewport -->
   <main class="flex-1 overflow-hidden relative">
-    {#if activeTab === 'matrix'}
+    {#if activeTab === 'flow'}
+      <RoomCanvas />
+    {:else if activeTab === 'matrix'}
       <MatrixCrossbar />
     {:else if activeTab === 'meters'}
       <MeterRack />

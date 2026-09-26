@@ -27,11 +27,16 @@ type StreamManager interface {
 
 // RoomInfo describes a room's state and members.
 type RoomInfo struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Leader  string   `json:"leader,omitempty"`
-	State   string   `json:"state,omitempty"`
-	Members []string `json:"members,omitempty"`
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Leader      string             `json:"leader,omitempty"`
+	State       string             `json:"state,omitempty"`
+	Members     []string           `json:"members,omitempty"`
+	Inputs      []string           `json:"inputs,omitempty"`
+	Outputs     []string           `json:"outputs,omitempty"`
+	Synced      bool               `json:"synced"`
+	InputGains  map[string]float64 `json:"input_gains,omitempty"`
+	OutputGains map[string]float64 `json:"output_gains,omitempty"`
 }
 
 // RoomManager provides management operations for group audio rooms.
@@ -40,6 +45,12 @@ type RoomManager interface {
 	CreateRoom(id, name string) (RoomInfo, error)
 	JoinRoom(id string) error
 	LeaveRoom(id string) error
+	AddInput(roomID, deviceID string) error
+	RemoveInput(roomID, deviceID string) error
+	AddOutput(roomID, deviceID string) error
+	RemoveOutput(roomID, deviceID string) error
+	SetRoomSync(roomID string, synced bool) error
+	SetRoomBindings(roomID string, inputs, outputs []string, synced bool) error
 }
 
 // Server is the HTTP control-plane API.
@@ -92,6 +103,12 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	})
 	s.registry.MustRegister(s.reqs, s.peerCnt, s.routesActive)
 
+	if rm != nil && s.rt != nil {
+		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok {
+			rSetter.SetRouter(s.rt)
+		}
+	}
+
 	// Pre-initialize telemetry hub and canonical v1 server
 	_ = s.Hub()
 	_ = s.V1()
@@ -129,6 +146,11 @@ func (s *Server) SetRoomManager(rm RoomManager) {
 	s.roomMgrMu.Lock()
 	defer s.roomMgrMu.Unlock()
 	s.roomMgr = rm
+	if rm != nil && s.rt != nil {
+		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok {
+			rSetter.SetRouter(s.rt)
+		}
+	}
 }
 
 func (s *Server) getRoomManager() RoomManager {
@@ -151,11 +173,16 @@ func (a *v1RoomManagerAdapter) ListRooms() []v1.RoomInfo {
 	res := make([]v1.RoomInfo, len(rooms))
 	for i, r := range rooms {
 		res[i] = v1.RoomInfo{
-			ID:      r.ID,
-			Name:    r.Name,
-			Leader:  r.Leader,
-			State:   r.State,
-			Members: r.Members,
+			ID:          r.ID,
+			Name:        r.Name,
+			Leader:      r.Leader,
+			State:       r.State,
+			Members:     r.Members,
+			Inputs:      r.Inputs,
+			Outputs:     r.Outputs,
+			Synced:      r.Synced,
+			InputGains:  r.InputGains,
+			OutputGains: r.OutputGains,
 		}
 	}
 	return res
@@ -171,11 +198,16 @@ func (a *v1RoomManagerAdapter) CreateRoom(id, name string) (v1.RoomInfo, error) 
 		return v1.RoomInfo{}, err
 	}
 	return v1.RoomInfo{
-		ID:      r.ID,
-		Name:    r.Name,
-		Leader:  r.Leader,
-		State:   r.State,
-		Members: r.Members,
+		ID:          r.ID,
+		Name:        r.Name,
+		Leader:      r.Leader,
+		State:       r.State,
+		Members:     r.Members,
+		Inputs:      r.Inputs,
+		Outputs:     r.Outputs,
+		Synced:      r.Synced,
+		InputGains:  r.InputGains,
+		OutputGains: r.OutputGains,
 	}, nil
 }
 
@@ -193,6 +225,76 @@ func (a *v1RoomManagerAdapter) LeaveRoom(id string) error {
 		return fmt.Errorf("room manager not configured")
 	}
 	return rm.LeaveRoom(id)
+}
+
+func (a *v1RoomManagerAdapter) AddInput(roomID, deviceID string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.AddInput(roomID, deviceID)
+}
+
+func (a *v1RoomManagerAdapter) RemoveInput(roomID, deviceID string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.RemoveInput(roomID, deviceID)
+}
+
+func (a *v1RoomManagerAdapter) AddOutput(roomID, deviceID string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.AddOutput(roomID, deviceID)
+}
+
+func (a *v1RoomManagerAdapter) RemoveOutput(roomID, deviceID string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.RemoveOutput(roomID, deviceID)
+}
+
+func (a *v1RoomManagerAdapter) SetRoomSync(roomID string, synced bool) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.SetRoomSync(roomID, synced)
+}
+
+func (a *v1RoomManagerAdapter) SetRoomBindings(roomID string, inputs, outputs []string, synced bool) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.SetRoomBindings(roomID, inputs, outputs, synced)
+}
+
+func (a *v1RoomManagerAdapter) SetInputGain(roomID, deviceID string, gain float64) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	if gSetter, ok := rm.(interface{ SetInputGain(string, string, float64) error }); ok {
+		return gSetter.SetInputGain(roomID, deviceID, gain)
+	}
+	return nil
+}
+
+func (a *v1RoomManagerAdapter) SetOutputGain(roomID, deviceID string, gain float64) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	if gSetter, ok := rm.(interface{ SetOutputGain(string, string, float64) error }); ok {
+		return gSetter.SetOutputGain(roomID, deviceID, gain)
+	}
+	return nil
 }
 
 // Handler returns the fully-wrapped HTTP handler with CORS, body size limiting, metrics, and panic recovery.

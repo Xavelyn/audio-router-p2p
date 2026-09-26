@@ -167,6 +167,11 @@ export interface RoomInfo {
   leader?: string;
   state: 'idle' | 'active' | 'degraded';
   members?: string[];
+  inputs: string[];
+  outputs: string[];
+  synced: boolean;
+  input_gains?: Record<string, number>;
+  output_gains?: Record<string, number>;
 }
 
 export type Room = RoomInfo;
@@ -186,6 +191,22 @@ export interface CreateRoomRequest {
 }
 
 export type RoomCreateRequest = CreateRoomRequest;
+
+export interface UpdateRoomBindingsRequest {
+  inputs: string[];
+  outputs: string[];
+  synced?: boolean;
+}
+
+export interface RoomDeviceBindingRequest {
+  device_id: string;
+  gain?: number;
+  muted?: boolean;
+}
+
+export interface SetRoomSyncRequest {
+  synced: boolean;
+}
 
 // ============================================================================
 // TELEMETRY & DIAGNOSTICS

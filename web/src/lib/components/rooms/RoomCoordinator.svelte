@@ -10,6 +10,8 @@
   import Clock from '@lucide/svelte/icons/clock';
   import Radio from '@lucide/svelte/icons/radio';
   import X from '@lucide/svelte/icons/x';
+  import Zap from '@lucide/svelte/icons/zap';
+  import { Switch } from 'bits-ui';
 
   let isCreateModalOpen = $state(false);
   let isPeerModalOpen = $state(false);
@@ -180,6 +182,64 @@
                     <span class="text-xs font-mono font-bold text-amber-300 truncate">
                       {room.leader || 'node-local'}
                     </span>
+                  </div>
+                </div>
+
+                <!-- Mesh Peer Sync Switch (Bits UI Switch) -->
+                <div class="mt-3 flex items-center justify-between rounded-lg bg-zinc-950/70 p-2.5 border border-zinc-800/80">
+                  <div class="flex flex-col">
+                    <span class="text-[10px] font-mono text-zinc-400">P2P MESH SYNC</span>
+                    <span class="text-xs font-mono font-bold {room.synced ? 'text-emerald-400' : 'text-zinc-500'}">
+                      {room.synced ? 'SYNC ENABLED' : 'LOCAL BUS ONLY'}
+                    </span>
+                  </div>
+                  <Switch.Root
+                    checked={room.synced}
+                    onCheckedChange={(checked) => roomStore.setRoomSync(room.id, checked)}
+                    class="relative inline-flex h-5 w-10 shrink-0 cursor-pointer rounded-full border border-zinc-700 bg-zinc-800 transition-colors duration-200 ease-in-out focus:outline-none data-[state=checked]:bg-cyan-500"
+                    aria-label="Toggle Mesh Sync"
+                  >
+                    <Switch.Thumb
+                      class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-zinc-200 shadow-md transition duration-200 ease-in-out data-[state=checked]:translate-x-5 data-[state=checked]:bg-zinc-950 data-[state=unchecked]:translate-x-0.5"
+                    />
+                  </Switch.Root>
+                </div>
+
+                <!-- Assigned Audio Devices Bus -->
+                <div class="mt-3 rounded-lg bg-zinc-950/60 p-2.5 border border-zinc-800/80">
+                  <div class="flex items-center justify-between text-[10px] font-mono mb-2">
+                    <span class="text-zinc-400">SUMMING AUDIO BUS</span>
+                    <span class="text-cyan-300 font-bold">
+                      {(room.inputs?.length || 0) * (room.outputs?.length || 0)} Active Links
+                    </span>
+                  </div>
+                  <div class="grid grid-cols-2 gap-2 text-[10px] font-mono">
+                    <div>
+                      <span class="text-cyan-400 block mb-1">Inputs ({room.inputs?.length || 0}):</span>
+                      <div class="flex flex-wrap gap-1">
+                        {#each room.inputs || [] as inDev}
+                          <span class="rounded bg-zinc-900 border border-cyan-500/30 px-1.5 py-0.5 text-zinc-300 truncate max-w-full">
+                            {inDev}
+                          </span>
+                        {/each}
+                        {#if !room.inputs || room.inputs.length === 0}
+                          <span class="text-zinc-500 italic">None</span>
+                        {/if}
+                      </div>
+                    </div>
+                    <div>
+                      <span class="text-purple-400 block mb-1">Outputs ({room.outputs?.length || 0}):</span>
+                      <div class="flex flex-wrap gap-1">
+                        {#each room.outputs || [] as outDev}
+                          <span class="rounded bg-zinc-900 border border-purple-500/30 px-1.5 py-0.5 text-zinc-300 truncate max-w-full">
+                            {outDev}
+                          </span>
+                        {/each}
+                        {#if !room.outputs || room.outputs.length === 0}
+                          <span class="text-zinc-500 italic">None</span>
+                        {/if}
+                      </div>
+                    </div>
                   </div>
                 </div>
 

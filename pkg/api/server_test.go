@@ -106,6 +106,86 @@ func (m *testMockRoomManager) LeaveRoom(id string) error {
 	return nil
 }
 
+func (m *testMockRoomManager) AddInput(roomID, deviceID string) error {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	r.Inputs = append(r.Inputs, deviceID)
+	m.rooms[roomID] = r
+	return nil
+}
+
+func (m *testMockRoomManager) RemoveInput(roomID, deviceID string) error {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	idx := -1
+	for i, id := range r.Inputs {
+		if id == deviceID {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		r.Inputs = append(r.Inputs[:idx], r.Inputs[idx+1:]...)
+		m.rooms[roomID] = r
+	}
+	return nil
+}
+
+func (m *testMockRoomManager) AddOutput(roomID, deviceID string) error {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	r.Outputs = append(r.Outputs, deviceID)
+	m.rooms[roomID] = r
+	return nil
+}
+
+func (m *testMockRoomManager) RemoveOutput(roomID, deviceID string) error {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	idx := -1
+	for i, id := range r.Outputs {
+		if id == deviceID {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		r.Outputs = append(r.Outputs[:idx], r.Outputs[idx+1:]...)
+		m.rooms[roomID] = r
+	}
+	return nil
+}
+
+func (m *testMockRoomManager) SetRoomSync(roomID string, synced bool) error {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	r.Synced = synced
+	m.rooms[roomID] = r
+	return nil
+}
+
+func (m *testMockRoomManager) SetRoomBindings(roomID string, inputs, outputs []string, synced bool) error {
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	r.Inputs = append([]string(nil), inputs...)
+	r.Outputs = append([]string(nil), outputs...)
+	r.Synced = synced
+	m.rooms[roomID] = r
+	return nil
+}
+
 func testConfig() *config.Config {
 	return &config.Config{
 		ListenAddr:       ":8443",

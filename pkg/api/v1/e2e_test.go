@@ -71,6 +71,72 @@ func (m *mockE2ERoomManager) LeaveRoom(id string) error {
 	return nil
 }
 
+func (m *mockE2ERoomManager) AddInput(roomID, deviceID string) error {
+	if r, ok := m.rooms[roomID]; ok {
+		r.Inputs = append(r.Inputs, deviceID)
+		m.rooms[roomID] = r
+		return nil
+	}
+	return fmt.Errorf("room not found: %s", roomID)
+}
+
+func (m *mockE2ERoomManager) RemoveInput(roomID, deviceID string) error {
+	if r, ok := m.rooms[roomID]; ok {
+		for i, id := range r.Inputs {
+			if id == deviceID {
+				r.Inputs = append(r.Inputs[:i], r.Inputs[i+1:]...)
+				m.rooms[roomID] = r
+				break
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("room not found: %s", roomID)
+}
+
+func (m *mockE2ERoomManager) AddOutput(roomID, deviceID string) error {
+	if r, ok := m.rooms[roomID]; ok {
+		r.Outputs = append(r.Outputs, deviceID)
+		m.rooms[roomID] = r
+		return nil
+	}
+	return fmt.Errorf("room not found: %s", roomID)
+}
+
+func (m *mockE2ERoomManager) RemoveOutput(roomID, deviceID string) error {
+	if r, ok := m.rooms[roomID]; ok {
+		for i, id := range r.Outputs {
+			if id == deviceID {
+				r.Outputs = append(r.Outputs[:i], r.Outputs[i+1:]...)
+				m.rooms[roomID] = r
+				break
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("room not found: %s", roomID)
+}
+
+func (m *mockE2ERoomManager) SetRoomSync(roomID string, synced bool) error {
+	if r, ok := m.rooms[roomID]; ok {
+		r.Synced = synced
+		m.rooms[roomID] = r
+		return nil
+	}
+	return fmt.Errorf("room not found: %s", roomID)
+}
+
+func (m *mockE2ERoomManager) SetRoomBindings(roomID string, inputs, outputs []string, synced bool) error {
+	if r, ok := m.rooms[roomID]; ok {
+		r.Inputs = append([]string(nil), inputs...)
+		r.Outputs = append([]string(nil), outputs...)
+		r.Synced = synced
+		m.rooms[roomID] = r
+		return nil
+	}
+	return fmt.Errorf("room not found: %s", roomID)
+}
+
 func setupE2EServer(t *testing.T) (*httptest.Server, *api.Server, *router.Router) {
 	t.Helper()
 	tmpDir := t.TempDir()

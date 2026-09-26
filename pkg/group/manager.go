@@ -11,6 +11,7 @@ import (
 	"github.com/audio-router-p2p/pkg/api"
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/discovery"
+	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	syncmgr "github.com/audio-router-p2p/pkg/sync"
 )
@@ -106,6 +107,7 @@ type DefaultRoomManager struct {
 	disc        *discovery.Discovery
 	syncMgr     *syncmgr.Manager
 	trans       streamer.Transport
+	router      *router.Router
 	devProvider DeviceProvider
 
 	rooms  map[string]*managedRoom
@@ -146,6 +148,28 @@ func NewDefaultRoomManager(
 	}
 }
 
+// SetRouter configures the router and propagates it to all active managed rooms.
+func (m *DefaultRoomManager) SetRouter(rt *router.Router) {
+	m.mu.Lock()
+	m.router = rt
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, mr := range m.rooms {
+		rooms = append(rooms, mr.room)
+	}
+	m.mu.Unlock()
+
+	for _, r := range rooms {
+		r.SetRouter(rt)
+	}
+}
+
+// Router returns the configured matrix router.
+func (m *DefaultRoomManager) Router() *router.Router {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.router
+}
+
 // SetDeviceProvider updates the device provider.
 func (m *DefaultRoomManager) SetDeviceProvider(dp DeviceProvider) {
 	m.mu.Lock()
@@ -173,11 +197,16 @@ func (m *DefaultRoomManager) roomInfoLocked(r *Room) api.RoomInfo {
 	}
 
 	return api.RoomInfo{
-		ID:      string(r.ID()),
-		Name:    r.Name(),
-		Leader:  r.Leader(),
-		State:   r.State().String(),
-		Members: memberIDs,
+		ID:          string(r.ID()),
+		Name:        r.Name(),
+		Leader:      r.Leader(),
+		State:       r.State().String(),
+		Members:     memberIDs,
+		Inputs:      r.Inputs(),
+		Outputs:     r.Outputs(),
+		Synced:      r.Synced(),
+		InputGains:  r.InputGains(),
+		OutputGains: r.OutputGains(),
 	}
 }
 
@@ -211,6 +240,7 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 		Discovery:   m.disc,
 		SyncManager: m.syncMgr,
 		Transport:   m.trans,
+		Router:      m.router,
 	})
 
 	roomID := room.ID()
@@ -229,6 +259,96 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 	m.rooms[id] = mr
 
 	return m.roomInfoLocked(room), nil
+}
+
+// AddInput binds an audio input device to a room and re-synthesizes intra-room routes.
+func (m *DefaultRoomManager) AddInput(roomID, deviceID string) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	return mr.room.AddInput(deviceID)
+}
+
+// RemoveInput unbinds an audio input device from a room and cleans up routes.
+func (m *DefaultRoomManager) RemoveInput(roomID, deviceID string) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	return mr.room.RemoveInput(deviceID)
+}
+
+// AddOutput binds an audio output device to a room and re-synthesizes intra-room routes.
+func (m *DefaultRoomManager) AddOutput(roomID, deviceID string) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	return mr.room.AddOutput(deviceID)
+}
+
+// RemoveOutput unbinds an audio output device from a room and cleans up routes.
+func (m *DefaultRoomManager) RemoveOutput(roomID, deviceID string) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	return mr.room.RemoveOutput(deviceID)
+}
+
+// SetRoomSync configures the distributed synchronization flag for a room.
+func (m *DefaultRoomManager) SetRoomSync(roomID string, synced bool) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	return mr.room.SetRoomSync(synced)
+}
+
+// SetRoomBindings updates inputs, outputs, and sync state for a room in a single atomic transaction.
+func (m *DefaultRoomManager) SetRoomBindings(roomID string, inputs, outputs []string, synced bool) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	return mr.room.SetRoomBindings(inputs, outputs, synced)
+}
+
+// SetInputGain updates trim gain for an input device in a room.
+func (m *DefaultRoomManager) SetInputGain(roomID, deviceID string, gain float64) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	mr.room.SetInputGain(deviceID, gain)
+	return nil
+}
+
+// SetOutputGain updates trim gain for an output device in a room.
+func (m *DefaultRoomManager) SetOutputGain(roomID, deviceID string, gain float64) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	mr.room.SetOutputGain(deviceID, gain)
+	return nil
 }
 
 // JoinRoom joins the specified room and begins audio streaming.

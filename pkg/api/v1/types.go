@@ -100,11 +100,35 @@ type CrosspointGainRequest struct {
 
 // RoomInfo captures distributed room session state.
 type RoomInfo struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name"`
-	Leader  string   `json:"leader,omitempty"`
-	State   string   `json:"state"` // idle, active, degraded
-	Members []string `json:"members,omitempty"`
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Leader      string             `json:"leader,omitempty"`
+	State       string             `json:"state"` // idle, active, degraded
+	Members     []string           `json:"members,omitempty"`
+	Inputs      []string           `json:"inputs"`
+	Outputs     []string           `json:"outputs"`
+	Synced      bool               `json:"synced"`
+	InputGains  map[string]float64 `json:"input_gains,omitempty"`
+	OutputGains map[string]float64 `json:"output_gains,omitempty"`
+}
+
+// RoomDeviceBindingRequest assigns or updates an input or output device in a room.
+type RoomDeviceBindingRequest struct {
+	DeviceID string   `json:"device_id"`
+	Gain     *float64 `json:"gain,omitempty"`
+	Muted    *bool    `json:"muted,omitempty"`
+}
+
+// UpdateRoomBindingsRequest provisions a batch update to inputs, outputs, and sync state.
+type UpdateRoomBindingsRequest struct {
+	Inputs  []string `json:"inputs"`
+	Outputs []string `json:"outputs"`
+	Synced  *bool    `json:"synced,omitempty"`
+}
+
+// SetRoomSyncRequest modifies peer synchronization status for a room.
+type SetRoomSyncRequest struct {
+	Synced *bool `json:"synced,omitempty"`
 }
 
 // CreateRoomRequest provisions a new conference audio room.

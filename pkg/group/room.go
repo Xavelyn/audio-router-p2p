@@ -3,6 +3,8 @@ package group
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"math/rand"
 	"net"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/discovery"
+	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	syncmgr "github.com/audio-router-p2p/pkg/sync"
 )
@@ -74,6 +77,14 @@ type Room struct {
 	disc      *discovery.Discovery
 	syncMgr   *syncmgr.Manager
 	transport streamer.Transport
+	router    *router.Router
+
+	inputs         []string
+	outputs        []string
+	synced         bool
+	inputGains     map[string]float64
+	outputGains    map[string]float64
+	compiledRoutes map[string]struct{}
 
 	stopCh    chan struct{}
 	closeOnce sync.Once
@@ -98,6 +109,7 @@ type RoomConfig struct {
 	Discovery   *discovery.Discovery
 	SyncManager *syncmgr.Manager
 	Transport   streamer.Transport
+	Router      *router.Router
 }
 
 // NewRoom creates a new room
@@ -110,15 +122,21 @@ func NewRoom(cfg RoomConfig) *Room {
 		localID = cfg.Discovery.NodeID()
 	}
 	r := &Room{
-		id:        cfg.ID,
-		name:      cfg.Name,
-		members:   make(map[string]*RoomMember),
-		localID:   localID,
-		cfg:       cfg.Config,
-		disc:      cfg.Discovery,
-		syncMgr:   cfg.SyncManager,
-		transport: cfg.Transport,
-		stopCh:    make(chan struct{}),
+		id:             cfg.ID,
+		name:           cfg.Name,
+		members:        make(map[string]*RoomMember),
+		localID:        localID,
+		cfg:            cfg.Config,
+		disc:           cfg.Discovery,
+		syncMgr:        cfg.SyncManager,
+		transport:      cfg.Transport,
+		router:         cfg.Router,
+		inputs:         make([]string, 0),
+		outputs:        make([]string, 0),
+		inputGains:     make(map[string]float64),
+		outputGains:    make(map[string]float64),
+		compiledRoutes: make(map[string]struct{}),
+		stopCh:         make(chan struct{}),
 	}
 	r.state.Store(RoomState(RoomStateCreated))
 	r.leader.Store("")
@@ -162,19 +180,444 @@ func (r *Room) SetTransport(t streamer.Transport) {
 
 // MarshalJSON provides a custom JSON serialization for Room.
 func (r *Room) MarshalJSON() ([]byte, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	members := make([]*RoomMember, 0, len(r.members))
+	for _, m := range r.members {
+		cp := *m
+		members = append(members, &cp)
+	}
+	sort.Slice(members, func(i, j int) bool { return members[i].PeerID < members[j].PeerID })
+
+	inputs := make([]string, len(r.inputs))
+	copy(inputs, r.inputs)
+
+	outputs := make([]string, len(r.outputs))
+	copy(outputs, r.outputs)
+
+	inGains := make(map[string]float64, len(r.inputGains))
+	for k, v := range r.inputGains {
+		inGains[k] = v
+	}
+
+	outGains := make(map[string]float64, len(r.outputGains))
+	for k, v := range r.outputGains {
+		outGains[k] = v
+	}
+
 	return json.Marshal(struct {
-		ID      string        `json:"id"`
-		Name    string        `json:"name"`
-		Leader  string        `json:"leader"`
-		State   string        `json:"state"`
-		Members []*RoomMember `json:"members"`
+		ID          string             `json:"id"`
+		Name        string             `json:"name"`
+		Leader      string             `json:"leader"`
+		State       string             `json:"state"`
+		Members     []*RoomMember      `json:"members"`
+		Inputs      []string           `json:"inputs"`
+		Outputs     []string           `json:"outputs"`
+		Synced      bool               `json:"synced"`
+		InputGains  map[string]float64 `json:"input_gains,omitempty"`
+		OutputGains map[string]float64 `json:"output_gains,omitempty"`
 	}{
-		ID:      string(r.id),
-		Name:    r.name,
-		Leader:  r.Leader(),
-		State:   r.State().String(),
-		Members: r.Members(),
+		ID:          string(r.id),
+		Name:        r.name,
+		Leader:      r.Leader(),
+		State:       r.State().String(),
+		Members:     members,
+		Inputs:      inputs,
+		Outputs:     outputs,
+		Synced:      r.synced,
+		InputGains:  inGains,
+		OutputGains: outGains,
 	})
+}
+
+// SetRouter sets or replaces the Matrix Router backing this room and recompiles routes.
+func (r *Room) SetRouter(rt *router.Router) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.router != nil && r.router != rt {
+		r.clearCompiledRoutesLocked()
+	}
+	r.router = rt
+	r.recompileRoutesLocked()
+}
+
+// Router returns the active router.Router reference.
+func (r *Room) Router() *router.Router {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.router
+}
+
+// Inputs returns a snapshot copy of assigned input device IDs.
+func (r *Room) Inputs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, len(r.inputs))
+	copy(out, r.inputs)
+	return out
+}
+
+// Outputs returns a snapshot copy of assigned output device IDs.
+func (r *Room) Outputs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, len(r.outputs))
+	copy(out, r.outputs)
+	return out
+}
+
+// Synced returns whether peer synchronization is active for the room.
+func (r *Room) Synced() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.synced
+}
+
+// InputGains returns a copy of per-device input gain modifiers.
+func (r *Room) InputGains() map[string]float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]float64, len(r.inputGains))
+	for k, v := range r.inputGains {
+		out[k] = v
+	}
+	return out
+}
+
+// OutputGains returns a copy of per-device output gain modifiers.
+func (r *Room) OutputGains() map[string]float64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make(map[string]float64, len(r.outputGains))
+	for k, v := range r.outputGains {
+		out[k] = v
+	}
+	return out
+}
+
+// SetInputGain updates the trim gain for an input device and recompiles routes.
+func (r *Room) SetInputGain(deviceID string, gain float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inputGains == nil {
+		r.inputGains = make(map[string]float64)
+	}
+	r.inputGains[deviceID] = gain
+	r.recompileRoutesLocked()
+}
+
+// SetOutputGain updates the trim gain for an output device and recompiles routes.
+func (r *Room) SetOutputGain(deviceID string, gain float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.outputGains == nil {
+		r.outputGains = make(map[string]float64)
+	}
+	r.outputGains[deviceID] = gain
+	r.recompileRoutesLocked()
+}
+
+// AddInput binds an audio input device to the room and updates routes.
+// Supports both AddInput(deviceID) and AddInput(roomID, deviceID).
+func (r *Room) AddInput(args ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(args) == 0 {
+		return errors.New("device ID required")
+	}
+	devID := args[len(args)-1]
+	if devID == "" {
+		return errors.New("device ID cannot be empty")
+	}
+	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
+	}
+
+	for _, id := range r.inputs {
+		if id == devID {
+			return nil
+		}
+	}
+	r.inputs = append(r.inputs, devID)
+	r.recompileRoutesLocked()
+	return nil
+}
+
+// RemoveInput unbinds an audio input device from the room and updates routes.
+// Supports both RemoveInput(deviceID) and RemoveInput(roomID, deviceID).
+func (r *Room) RemoveInput(args ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(args) == 0 {
+		return errors.New("device ID required")
+	}
+	devID := args[len(args)-1]
+	if devID == "" {
+		return errors.New("device ID cannot be empty")
+	}
+	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
+	}
+
+	idx := -1
+	for i, id := range r.inputs {
+		if id == devID {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		r.inputs = append(r.inputs[:idx], r.inputs[idx+1:]...)
+		delete(r.inputGains, devID)
+		r.recompileRoutesLocked()
+	}
+	return nil
+}
+
+// AddOutput binds an audio output device to the room and updates routes.
+// Supports both AddOutput(deviceID) and AddOutput(roomID, deviceID).
+func (r *Room) AddOutput(args ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(args) == 0 {
+		return errors.New("device ID required")
+	}
+	devID := args[len(args)-1]
+	if devID == "" {
+		return errors.New("device ID cannot be empty")
+	}
+	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
+	}
+
+	for _, id := range r.outputs {
+		if id == devID {
+			return nil
+		}
+	}
+	r.outputs = append(r.outputs, devID)
+	r.recompileRoutesLocked()
+	return nil
+}
+
+// RemoveOutput unbinds an audio output device from the room and updates routes.
+// Supports both RemoveOutput(deviceID) and RemoveOutput(roomID, deviceID).
+func (r *Room) RemoveOutput(args ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(args) == 0 {
+		return errors.New("device ID required")
+	}
+	devID := args[len(args)-1]
+	if devID == "" {
+		return errors.New("device ID cannot be empty")
+	}
+	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
+	}
+
+	idx := -1
+	for i, id := range r.outputs {
+		if id == devID {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		r.outputs = append(r.outputs[:idx], r.outputs[idx+1:]...)
+		delete(r.outputGains, devID)
+		r.recompileRoutesLocked()
+	}
+	return nil
+}
+
+// SetSynced updates peer sync flag.
+func (r *Room) SetSynced(synced bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.synced = synced
+}
+
+// SetRoomSync sets the peer sync status.
+// Accepts (synced bool) or (roomID string, synced bool).
+func (r *Room) SetRoomSync(args ...any) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if len(args) == 0 {
+		return errors.New("synced argument required")
+	}
+	if len(args) == 1 {
+		if s, ok := args[0].(bool); ok {
+			r.synced = s
+			return nil
+		}
+		return errors.New("synced argument must be a boolean")
+	}
+	if len(args) >= 2 {
+		if roomID, ok := args[0].(string); ok && roomID != "" && roomID != string(r.id) {
+			return fmt.Errorf("room ID mismatch: %s != %s", roomID, r.id)
+		}
+		if s, ok := args[1].(bool); ok {
+			r.synced = s
+			return nil
+		}
+		return errors.New("synced argument must be a boolean")
+	}
+	return nil
+}
+
+// SetBindings replaces inputs, outputs, and sync state atomically.
+func (r *Room) SetBindings(inputs, outputs []string, synced bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.inputs = cleanDeviceList(inputs)
+	r.outputs = cleanDeviceList(outputs)
+	r.synced = synced
+	r.recompileRoutesLocked()
+}
+
+// SetRoomBindings updates inputs, outputs, and sync state.
+// Accepts (inputs, outputs []string, synced bool) or (roomID string, inputs, outputs []string, synced bool).
+func (r *Room) SetRoomBindings(args ...any) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var inputs, outputs []string
+	var synced bool
+
+	if len(args) == 3 {
+		var ok bool
+		if inputs, ok = args[0].([]string); !ok {
+			return errors.New("inputs must be []string")
+		}
+		if outputs, ok = args[1].([]string); !ok {
+			return errors.New("outputs must be []string")
+		}
+		if synced, ok = args[2].(bool); !ok {
+			return errors.New("synced must be bool")
+		}
+	} else if len(args) == 4 {
+		if roomID, ok := args[0].(string); ok && roomID != "" && roomID != string(r.id) {
+			return fmt.Errorf("room ID mismatch: %s != %s", roomID, r.id)
+		}
+		var ok bool
+		if inputs, ok = args[1].([]string); !ok {
+			return errors.New("inputs must be []string")
+		}
+		if outputs, ok = args[2].([]string); !ok {
+			return errors.New("outputs must be []string")
+		}
+		if synced, ok = args[3].(bool); !ok {
+			return errors.New("synced must be bool")
+		}
+	} else {
+		return errors.New("invalid arguments for SetRoomBindings")
+	}
+
+	r.inputs = cleanDeviceList(inputs)
+	r.outputs = cleanDeviceList(outputs)
+	r.synced = synced
+	r.recompileRoutesLocked()
+	return nil
+}
+
+func cleanDeviceList(list []string) []string {
+	seen := make(map[string]struct{}, len(list))
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		if item == "" {
+			continue
+		}
+		if _, ok := seen[item]; !ok {
+			seen[item] = struct{}{}
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func (r *Room) clearCompiledRoutesLocked() {
+	if r.router == nil {
+		return
+	}
+	for routeID := range r.compiledRoutes {
+		_ = r.router.DeleteMatrix(routeID)
+	}
+	r.compiledRoutes = make(map[string]struct{})
+}
+
+func (r *Room) recompileRoutesLocked() {
+	if r.router == nil {
+		return
+	}
+
+	desired := make(map[string]router.MatrixRoute)
+	for _, inDev := range r.inputs {
+		for _, outDev := range r.outputs {
+			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, inDev, outDev)
+
+			inGain := 1.0
+			if g, ok := r.inputGains[inDev]; ok {
+				inGain = g
+			}
+			outGain := 1.0
+			if g, ok := r.outputGains[outDev]; ok {
+				outGain = g
+			}
+			totalGain := inGain * outGain
+			if totalGain < 0.0 {
+				totalGain = 0.0
+			} else if totalGain > 2.0 {
+				totalGain = 2.0
+			}
+
+			coeffs := []float64{totalGain, 0.0, 0.0, totalGain}
+
+			desired[routeID] = router.MatrixRoute{
+				ID:   routeID,
+				Name: fmt.Sprintf("room-%s-%s-%s", r.id, inDev, outDev),
+				Source: router.MatrixEndpoint{
+					NodeID:   "local",
+					DeviceID: inDev,
+					Layout:   router.LayoutStereo,
+					Channels: []int{0, 1},
+				},
+				Destination: router.MatrixEndpoint{
+					NodeID:   "local",
+					DeviceID: outDev,
+					Layout:   router.LayoutStereo,
+					Channels: []int{0, 1},
+				},
+				InChannels:   2,
+				OutChannels:  2,
+				Coefficients: coeffs,
+				SlewMS:       20.0,
+				Muted:        false,
+				State:        "active",
+			}
+		}
+	}
+
+	// Remove routes no longer wanted
+	for oldID := range r.compiledRoutes {
+		if _, stillWanted := desired[oldID]; !stillWanted {
+			_ = r.router.DeleteMatrix(oldID)
+			delete(r.compiledRoutes, oldID)
+		}
+	}
+
+	// Add or update desired routes
+	for routeID, mr := range desired {
+		_ = r.router.AddMatrix(mr)
+		r.compiledRoutes[routeID] = struct{}{}
+	}
 }
 
 // Members returns all current members
@@ -214,12 +657,15 @@ func (r *Room) Join() error {
 	return nil
 }
 
-// Leave stops the room loop
+// Leave stops the room loop and clears active routes
 func (r *Room) Leave() error {
 	r.closeOnce.Do(func() {
 		close(r.stopCh)
 	})
 	r.wg.Wait()
+	r.mu.Lock()
+	r.clearCompiledRoutesLocked()
+	r.mu.Unlock()
 	return nil
 }
 

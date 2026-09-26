@@ -12,6 +12,7 @@ import type {
   CrosspointGainRequest,
   RoomInfo,
   CreateRoomRequest,
+  UpdateRoomBindingsRequest,
   StreamStats,
   ErrorResponse,
 } from './types';
@@ -244,6 +245,46 @@ export class ApiClient {
   async leaveRoom(roomId: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/leave`, {
       method: 'POST',
+    });
+  }
+
+  async updateRoomBindings(roomId: string, req: UpdateRoomBindingsRequest): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/bindings`, {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    });
+  }
+
+  async addRoomInput(roomId: string, devId: string, gain?: number): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/inputs`, {
+      method: 'POST',
+      body: JSON.stringify({ device_id: devId, gain }),
+    });
+  }
+
+  async removeRoomInput(roomId: string, devId: string): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/inputs/${encodeURIComponent(devId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async addRoomOutput(roomId: string, devId: string, gain?: number): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs`, {
+      method: 'POST',
+      body: JSON.stringify({ device_id: devId, gain }),
+    });
+  }
+
+  async removeRoomOutput(roomId: string, devId: string): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs/${encodeURIComponent(devId)}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async setRoomSync(roomId: string, synced: boolean): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/sync`, {
+      method: 'POST',
+      body: JSON.stringify({ synced }),
     });
   }
 
