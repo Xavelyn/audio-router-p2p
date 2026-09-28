@@ -416,26 +416,12 @@ func TestBroadcastCalculation(t *testing.T) {
 	}
 }
 
-// TestVirtualInterfaceFiltering verifies container/virtual interfaces are correctly classified.
-func TestVirtualInterfaceFiltering(t *testing.T) {
-	virtualNames := []string{
-		"docker0", "docker1", "veth1234", "veth_abc", "virbr0", "virbr1",
-		"incusbr0", "lxdbr0",
-		"br-1234567890ab", "br0", "br1", "cni0", "tun0", "tun1", "utun0", "utun1",
-		"tap0", "tailscale0", "wg0", "vboxnet0", "vmnet1", "awdl0", "llw0",
-	}
-	for _, name := range virtualNames {
-		if !isVirtualInterface(name) {
-			t.Errorf("expected %q to be identified as virtual interface", name)
-		}
-	}
-
-	physicalNames := []string{
-		"eth0", "eth1", "enp3s0", "ens33", "wlan0", "wlp2s0",
-	}
-	for _, name := range physicalNames {
-		if isVirtualInterface(name) {
-			t.Errorf("expected %q to NOT be identified as virtual interface", name)
+// TestFindBroadcastAddresses verifies discovering broadcast addresses without panicking.
+func TestFindBroadcastAddresses(t *testing.T) {
+	bcasts := findBroadcastAddresses()
+	for _, b := range bcasts {
+		if b.To4() == nil {
+			t.Errorf("expected IPv4 address, got %v", b)
 		}
 	}
 }

@@ -1,7 +1,6 @@
 package discovery
 
 import (
-	"context"
 	crand "crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -11,26 +10,20 @@ import (
 	"io"
 	"log"
 	"net"
-	"regexp"
 	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/hashicorp/memberlist"
-	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
 )
 
 const (
 	beaconMagic        = "ARP2P"
 	maxConcurrentJoins = 8
 )
-
-var virtualIfaceRegex = regexp.MustCompile(`^(docker\d+|veth.*|virbr\d+|incusbr\d+|lxdbr\d+|br-[a-f0-9]+|br\d+|cni\d+|u?tun\d+|tap\d+|tailscale\d+|wg\d+|vboxnet\d+|vmnet\d+|awdl\d+|llw\d+)`)
 
 // Ensure Discovery implements all required Memberlist delegate interfaces at compile time.
 var (
@@ -91,15 +84,12 @@ type Discovery struct {
 	mlistMu sync.RWMutex
 	mlist   *memberlist.Memberlist
 
-	sockMu          sync.RWMutex
-	candidateIfaces []*net.Interface
-	bcastAddrs      []*net.UDPAddr
-	globalBcast     *net.UDPAddr
-	annSend         *net.UDPConn
-	annSendPConn    *ipv4.PacketConn
-	mcast           *net.UDPConn
-	group           *net.UDPAddr
-	dialed          bool
+	sockMu      sync.RWMutex
+	bcastAddrs  []*net.UDPAddr
+	globalBcast *net.UDPAddr
+	annSend     *net.UDPConn
+	mcast       *net.UDPConn
+	group       *net.UDPAddr
 
 	joinMu          sync.Mutex
 	lastJoinAttempt map[string]time.Time
@@ -113,7 +103,7 @@ type Discovery struct {
 }
 
 // New creates a Discovery instance and synchronously initializes sockets,
-// determines candidate interfaces, and creates the HashiCorp Memberlist cluster.
+// discovers local broadcast targets, and creates the HashiCorp Memberlist cluster.
 func New(cfg *config.Config, nodeID string) (*Discovery, error) {
 	if nodeID == "" {
 		gen, err := generateNodeID()
@@ -250,23 +240,14 @@ func SubnetBroadcast(ip net.IP, mask net.IPMask) net.IP {
 	return bcast
 }
 
-func isVirtualInterface(name string) bool {
-	return virtualIfaceRegex.MatchString(name)
-}
-
-func findCandidateInterfaces() (candidates []*net.Interface, bcastIPs []net.IP) {
+func findBroadcastAddresses() []net.IP {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		return nil, nil
+		return nil
 	}
-
-	var physical []*net.Interface
-	var virtual []*net.Interface
-	bcastMap := make(map[string]net.IP)
-	physBcastMap := make(map[string]net.IP)
-
-	for i := range ifaces {
-		ifc := &ifaces[i]
+	seen := make(map[string]struct{})
+	var bcastIPs []net.IP
+	for _, ifc := range ifaces {
 		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
 			continue
 		}
@@ -274,8 +255,6 @@ func findCandidateInterfaces() (candidates []*net.Interface, bcastIPs []net.IP) 
 		if err != nil {
 			continue
 		}
-		hasValidIPv4 := false
-		var ifcBcasts []net.IP
 		for _, a := range addrs {
 			ipn, ok := a.(*net.IPNet)
 			if !ok {
@@ -285,71 +264,26 @@ func findCandidateInterfaces() (candidates []*net.Interface, bcastIPs []net.IP) 
 			if ip4 == nil || ip4.IsLoopback() || ip4.IsUnspecified() || ip4.IsLinkLocalUnicast() {
 				continue
 			}
-			hasValidIPv4 = true
 			if bcast := SubnetBroadcast(ip4, ipn.Mask); bcast != nil {
-				ifcBcasts = append(ifcBcasts, bcast)
-			}
-		}
-		if !hasValidIPv4 {
-			continue
-		}
-
-		if isVirtualInterface(ifc.Name) {
-			virtual = append(virtual, ifc)
-			for _, b := range ifcBcasts {
-				bcastMap[b.String()] = b
-			}
-		} else {
-			physical = append(physical, ifc)
-			for _, b := range ifcBcasts {
-				physBcastMap[b.String()] = b
+				key := bcast.String()
+				if _, exists := seen[key]; !exists {
+					seen[key] = struct{}{}
+					bcastIPs = append(bcastIPs, bcast)
+				}
 			}
 		}
 	}
-
-	if len(physical) > 0 {
-		candidates = physical
-		for _, b := range physBcastMap {
-			bcastIPs = append(bcastIPs, b)
-		}
-	} else if len(virtual) > 0 {
-		log.Printf("[DISCOVERY:WARN] no physical interfaces found, falling back to virtual/container interfaces")
-		candidates = virtual
-		for _, b := range bcastMap {
-			bcastIPs = append(bcastIPs, b)
-		}
-	}
-
 	sort.Slice(bcastIPs, func(i, j int) bool {
 		return bcastIPs[i].String() < bcastIPs[j].String()
 	})
-
-	return candidates, bcastIPs
-}
-
-func listenConfigDualMode() net.ListenConfig {
-	return net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BROADCAST, 1)
-			})
-		},
-	}
-}
-
-func listenConfigBroadcast() net.ListenConfig {
-	return net.ListenConfig{
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BROADCAST, 1)
-			})
-		},
-	}
+	return bcastIPs
 }
 
 func (d *Discovery) setup() error {
+	if d.isStopping() {
+		return errors.New("discovery is closed")
+	}
+
 	d.closeSockets()
 
 	d.mlistMu.Lock()
@@ -359,7 +293,7 @@ func (d *Discovery) setup() error {
 	}
 	d.mlistMu.Unlock()
 
-	candidates, bcastIPs := findCandidateInterfaces()
+	bcastIPs := findBroadcastAddresses()
 
 	var bcastAddrs []*net.UDPAddr
 	var globalBcast *net.UDPAddr
@@ -372,67 +306,41 @@ func (d *Discovery) setup() error {
 
 	var group *net.UDPAddr
 	var mcastConn, annSendConn *net.UDPConn
-	var annSendPConn *ipv4.PacketConn
-	dialed := false
 
-	mcastIP := net.ParseIP(d.cfg.MulticastGroup)
-	if mcastIP != nil && mcastIP.IsMulticast() && d.cfg.MulticastPort > 0 {
-		group = &net.UDPAddr{IP: mcastIP, Port: d.cfg.MulticastPort}
-
-		// Wildcard multicast & broadcast listener on MulticastPort
-		lcMcast := listenConfigDualMode()
-		if pc, err := lcMcast.ListenPacket(context.Background(), "udp4", fmt.Sprintf("0.0.0.0:%d", d.cfg.MulticastPort)); err == nil {
-			mcastConn = pc.(*net.UDPConn)
-			pconn := ipv4.NewPacketConn(mcastConn)
-			if len(candidates) > 0 {
-				for _, ifc := range candidates {
-					if err := pconn.JoinGroup(ifc, group); err != nil {
-						log.Printf("[DISCOVERY:WARN] join multicast group on %s: %v", ifc.Name, err)
-					}
-				}
-			} else {
-				if err := pconn.JoinGroup(nil, group); err != nil {
-					log.Printf("[DISCOVERY:WARN] join multicast group default: %v", err)
-				}
-			}
-			if lo, err := net.InterfaceByName("lo"); err == nil {
-				_ = pconn.JoinGroup(lo, group)
-			}
-		} else {
-			log.Printf("[DISCOVERY:WARN] cannot bind wildcard dual-mode socket on :%d: %v", d.cfg.MulticastPort, err)
-		}
-	}
-
-	// Outbound send socket configured with SO_BROADCAST
 	if d.cfg.MulticastPort > 0 {
-		lcSend := listenConfigBroadcast()
-		if pc, err := lcSend.ListenPacket(context.Background(), "udp4", ":0"); err == nil {
-			annSendConn = pc.(*net.UDPConn)
-			annSendPConn = ipv4.NewPacketConn(annSendConn)
-			_ = annSendPConn.SetMulticastLoopback(true)
-		} else {
-			log.Printf("[DISCOVERY:WARN] cannot bind outbound broadcast socket: %v", err)
-			if c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0}); err == nil {
-				annSendConn = c
-				annSendPConn = ipv4.NewPacketConn(annSendConn)
-			} else if group != nil {
-				if s, err := net.DialUDP("udp4", nil, group); err == nil {
-					annSendConn = s
-					dialed = true
-				}
+		mcastIP := net.ParseIP(d.cfg.MulticastGroup)
+		if mcastIP != nil && mcastIP.IsMulticast() {
+			group = &net.UDPAddr{IP: mcastIP, Port: d.cfg.MulticastPort}
+			// Inbound beacon socket: standard net.ListenMulticastUDP
+			if mc, err := net.ListenMulticastUDP("udp4", nil, group); err == nil {
+				mcastConn = mc
+			} else {
+				log.Printf("[DISCOVERY:WARN] listen multicast UDP failed: %v, falling back to ListenUDP", err)
 			}
+		}
+		// Fallback to standard net.ListenUDP on MulticastPort
+		if mcastConn == nil {
+			if uc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: d.cfg.MulticastPort}); err == nil {
+				mcastConn = uc
+			} else {
+				log.Printf("[DISCOVERY:WARN] listen inbound beacon UDP on port %d failed: %v", d.cfg.MulticastPort, err)
+			}
+		}
+
+		// Outbound beacon socket: standard net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
+		if sc, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0}); err == nil {
+			annSendConn = sc
+		} else {
+			log.Printf("[DISCOVERY:WARN] cannot bind outbound beacon socket: %v", err)
 		}
 	}
 
 	d.sockMu.Lock()
 	d.group = group
-	d.candidateIfaces = candidates
 	d.bcastAddrs = bcastAddrs
 	d.globalBcast = globalBcast
 	d.mcast = mcastConn
 	d.annSend = annSendConn
-	d.annSendPConn = annSendPConn
-	d.dialed = dialed
 	d.sockMu.Unlock()
 
 	advertisedIP := d.advertisedIP()
@@ -468,9 +376,7 @@ func (d *Discovery) setup() error {
 	}
 	mcfg.BindPort = bindPort
 	mcfg.AdvertiseAddr = advertisedIP
-	if bindPort > 0 {
-		mcfg.AdvertisePort = bindPort
-	}
+	mcfg.AdvertisePort = bindPort
 	mcfg.Delegate = d
 	mcfg.Alive = d
 	mcfg.Events = d
@@ -503,42 +409,22 @@ func (d *Discovery) setup() error {
 	d.mlist = mlist
 	d.mlistMu.Unlock()
 
-	ifaceNames := make([]string, 0, len(candidates))
-	for _, c := range candidates {
-		ifaceNames = append(ifaceNames, c.Name)
-	}
 	bcastStrs := make([]string, 0, len(bcastAddrs))
 	for _, b := range bcastAddrs {
 		bcastStrs = append(bcastStrs, b.String())
 	}
-	log.Printf("[DISCOVERY:BIND] memberlist=%s advertised=%s multicast_group=%s:%d ifaces=%v bcast_targets=%v",
-		d.ownAddr, advertisedIP, d.cfg.MulticastGroup, d.cfg.MulticastPort, ifaceNames, bcastStrs)
+	log.Printf("[DISCOVERY:BIND] memberlist=%s advertised=%s multicast_group=%s:%d bcast_targets=%v",
+		d.ownAddr, advertisedIP, d.cfg.MulticastGroup, d.cfg.MulticastPort, bcastStrs)
 
 	return nil
 }
 
 // Init synchronously initializes discovery sockets, interfaces, and Memberlist (alias for setup).
 func (d *Discovery) Init() error {
+	if d.isStopping() {
+		return errors.New("discovery is closed")
+	}
 	return d.setup()
-}
-
-func interfaceIPv4(name string) string {
-	ifc, err := net.InterfaceByName(name)
-	if err != nil {
-		return ""
-	}
-	addrs, err := ifc.Addrs()
-	if err != nil {
-		return ""
-	}
-	for _, a := range addrs {
-		if ipn, ok := a.(*net.IPNet); ok {
-			if ip := ipn.IP.To4(); ip != nil && !ip.IsUnspecified() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() {
-				return ip.String()
-			}
-		}
-	}
-	return ""
 }
 
 func (d *Discovery) advertisedIP() string {
@@ -556,17 +442,6 @@ func (d *Discovery) advertisedIP() string {
 		return d.cfg.AdvHost
 	}
 
-	d.sockMu.RLock()
-	candidates := d.candidateIfaces
-	d.sockMu.RUnlock()
-
-	if len(candidates) > 0 {
-		for _, ifc := range candidates {
-			if ip := interfaceIPv4(ifc.Name); ip != "" {
-				return ip
-			}
-		}
-	}
 	if ip := firstNonLoopbackIPv4(); ip != "" {
 		return ip
 	}
@@ -659,7 +534,7 @@ func (d *Discovery) NotifyAlive(peer *memberlist.Node) error {
 		return fmt.Errorf("unmarshal metadata: %w", err)
 	}
 	token := meta.getAuthToken()
-	if d.cfg.AuthToken == "" || subtle.ConstantTimeCompare([]byte(token), []byte(d.cfg.AuthToken)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(token), []byte(d.cfg.AuthToken)) != 1 {
 		log.Printf("[DISCOVERY:WARN] unauthorized node rejected from %s (%s): token mismatch", peer.Name, peer.Address())
 		return errors.New("auth token mismatch")
 	}
@@ -789,30 +664,25 @@ func (d *Discovery) NotifyConflict(existing, other *memberlist.Node) {
 // Run starts the seed peer join sequence, LAN beacon listener, and beacon emitter.
 // It blocks until Close() is called.
 func (d *Discovery) Run() {
-	if d.isStopping() {
-		return
-	}
-	if d.started.Swap(true) {
+	d.closeMu.RLock()
+	if d.isStopping() || d.started.Swap(true) {
+		d.closeMu.RUnlock()
 		return
 	}
 	d.wg.Add(1)
+	d.closeMu.RUnlock()
 	defer d.wg.Done()
 
 	d.mlistMu.RLock()
 	mlist := d.mlist
 	d.mlistMu.RUnlock()
 	if mlist == nil {
-		if err := d.setup(); err != nil {
-			log.Printf("[DISCOVERY:WARN] setup failed: %v", err)
-			return
-		}
-		d.mlistMu.RLock()
-		mlist = d.mlist
-		d.mlistMu.RUnlock()
+		log.Printf("[DISCOVERY:WARN] memberlist not initialized; aborting Run")
+		return
 	}
 
 	// 1. Join static seed peers from cfg.StaticPeers with background retry
-	if len(d.cfg.StaticPeers) > 0 && mlist != nil {
+	if len(d.cfg.StaticPeers) > 0 {
 		var seedAddrs []string
 		for _, sp := range d.cfg.StaticPeers {
 			if sp.Addr != "" {
@@ -820,8 +690,12 @@ func (d *Discovery) Run() {
 			}
 		}
 		if len(seedAddrs) > 0 {
-			d.wg.Add(1)
-			go d.seedJoinLoop(seedAddrs)
+			d.closeMu.RLock()
+			if !d.isStopping() {
+				d.wg.Add(1)
+				go d.seedJoinLoop(seedAddrs)
+			}
+			d.closeMu.RUnlock()
 		}
 	}
 
@@ -831,8 +705,12 @@ func (d *Discovery) Run() {
 	d.sockMu.RUnlock()
 
 	if mcast != nil {
-		d.wg.Add(1)
-		go d.beaconRecvLoop(mcast)
+		d.closeMu.RLock()
+		if !d.isStopping() {
+			d.wg.Add(1)
+			go d.beaconRecvLoop(mcast)
+		}
+		d.closeMu.RUnlock()
 	}
 
 	// 3. Periodic beacon emitter & sweep ticker
@@ -967,7 +845,7 @@ func (d *Discovery) handleBeacon(b beaconMessage, srcAddr *net.UDPAddr) {
 	if b.Magic != beaconMagic || b.ID == "" || b.ID == d.nodeID {
 		return
 	}
-	if d.cfg.AuthToken == "" || subtle.ConstantTimeCompare([]byte(b.Token), []byte(d.cfg.AuthToken)) != 1 {
+	if subtle.ConstantTimeCompare([]byte(b.Token), []byte(d.cfg.AuthToken)) != 1 {
 		log.Printf("[DISCOVERY:WARN] rejected beacon from node %s: token mismatch", b.ID)
 		return
 	}
@@ -1048,6 +926,7 @@ func (d *Discovery) sendBeaconNow() {
 	if d.isStopping() {
 		return
 	}
+
 	d.mu.RLock()
 	b := beaconMessage{
 		Magic: beaconMagic,
@@ -1066,10 +945,7 @@ func (d *Discovery) sendBeaconNow() {
 
 	d.sockMu.RLock()
 	annSend := d.annSend
-	annSendPConn := d.annSendPConn
-	dialed := d.dialed
 	group := d.group
-	candidates := d.candidateIfaces
 	bcastAddrs := d.bcastAddrs
 	globalBcast := d.globalBcast
 	d.sockMu.RUnlock()
@@ -1078,35 +954,13 @@ func (d *Discovery) sendBeaconNow() {
 		return
 	}
 
-	if dialed {
-		_, _ = annSend.Write(payload)
-		return
-	}
-
-	// 1. Multicast egress
+	// 1. Multicast beacon egress
 	if group != nil {
-		if annSendPConn != nil && len(candidates) > 0 {
-			for _, ifc := range candidates {
-				_ = annSendPConn.SetMulticastInterface(ifc)
-				if _, err := annSend.WriteToUDP(payload, group); err != nil {
-					if errors.Is(err, net.ErrClosed) || d.isStopping() {
-						return
-					}
-					log.Printf("[DISCOVERY:WARN] multicast beacon to %s on %s: %v", group, ifc.Name, err)
-				}
+		if _, err := annSend.WriteToUDP(payload, group); err != nil {
+			if errors.Is(err, net.ErrClosed) || d.isStopping() {
+				return
 			}
-		} else {
-			if _, err := annSend.WriteToUDP(payload, group); err != nil {
-				if errors.Is(err, net.ErrClosed) || d.isStopping() {
-					return
-				}
-				log.Printf("[DISCOVERY:WARN] multicast beacon to %s: %v", group, err)
-			}
-		}
-		// Also send to loopback if available
-		if lo, err := net.InterfaceByName("lo"); err == nil && annSendPConn != nil {
-			_ = annSendPConn.SetMulticastInterface(lo)
-			_, _ = annSend.WriteToUDP(payload, group)
+			log.Printf("[DISCOVERY:WARN] multicast beacon to %s: %v", group, err)
 		}
 	}
 
@@ -1192,7 +1046,6 @@ func (d *Discovery) closeSockets() {
 	d.sockMu.Lock()
 	conns := []*net.UDPConn{d.annSend, d.mcast}
 	d.annSend = nil
-	d.annSendPConn = nil
 	d.mcast = nil
 	d.sockMu.Unlock()
 
@@ -1203,8 +1056,12 @@ func (d *Discovery) closeSockets() {
 	}
 }
 
-// ValidAddr reports whether addr parses as a host:port pair.
+// ValidAddr reports whether addr parses as a host:port pair with a valid port number.
 func ValidAddr(addr string) bool {
-	_, _, err := net.SplitHostPort(addr)
-	return err == nil
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || port == "" {
+		return false
+	}
+	p, err := strconv.Atoi(port)
+	return err == nil && p > 0 && p <= 65535
 }

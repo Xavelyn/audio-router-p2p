@@ -11,7 +11,6 @@ require (
 	github.com/pion/srtp/v2 v2.0.20
 	github.com/prometheus/client_golang v1.24.1
 	golang.org/x/net v0.58.0
-	golang.org/x/sys v0.47.0
 )
 
 require (
@@ -35,5 +34,6 @@ require (
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
