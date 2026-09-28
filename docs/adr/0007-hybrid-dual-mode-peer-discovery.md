@@ -19,8 +19,8 @@ Rigorous architectural analysis of the legacy discovery subsystem revealed four 
 
 2. **Single-Interface Selection Flaw and Virtual Interface Hijacking**:
    - During startup, `setup()` iterated over candidate network interfaces via `candidateInterfaces()` and terminated evaluation at the very first interface reporting `net.FlagUp` and `net.FlagMulticast`.
-   - The selection logic did not exclude loopback adapters, bridge interfaces, or virtualized software interfaces installed by container engines and hypervisors (e.g., `docker0`, `veth*`, `virbr0`, `br-*`, `cni0`).
-   - If a host possessed an active Docker bridge or virtualization adapter enumerated earlier than the physical interface (e.g., `eth0` or `wlan0`), the discovery subsystem bound solely to the virtual bridge. Multicast packets were broadcast exclusively into an isolated host-only bridge network, rendering the node deaf and mute to the external physical LAN.
+   - The selection logic did not exclude loopback adapters, bridge interfaces, or virtualized software interfaces installed by container engines and hypervisors (e.g., `docker0`, `veth*`, `virbr0`, `incusbr0`, `lxdbr0`, `br-*`, `cni0`).
+   - If a host possessed an active Docker bridge, LXD/Incus bridge, or virtualization adapter enumerated earlier than the physical interface (e.g., `eth0` or `wlan0`), the discovery subsystem bound solely to the virtual bridge. Multicast packets were broadcast exclusively into an isolated host-only bridge network, rendering the node deaf and mute to the external physical LAN.
 
 3. **Absence of Reactive Unicast Handshake (Silent 3-Second Discovery Latency)**:
    - When a node successfully received an announcement packet from an adjacent peer, it updated its internal hash map but performed no reactive acknowledgement.
@@ -162,8 +162,9 @@ To collapse discovery convergence from $3000\text{ms}$ down to $<50\text{ms}$:
 3. **Per-Peer Rate Limiting**:
    - To guard against misconfigured peers or packet amplification loops, each peer entry maintains a `lastReplied` timestamp and token counter.
    - Reactive replies to a specific peer are rate-limited to at most one reactive packet every $1000\text{ms}$. Subsequent announcements from the same peer within that window update the cache but do not trigger reactive packet transmission.
-4. **Targeted Delivery**:
+4. **Targeted Delivery & Static/Unicast Seed Peering**:
    - Reactive replies are transmitted directly via unicast to the sender's remote address (`raddr` or advertised `msg.Addr`), bypassing broadcast channels.
+   - For networks where enterprise switches or 802.11 Wi-Fi Access Points enforce strict L2 broadcast/multicast isolation (e.g. UniFi / Aruba / Cisco AP client isolation dropping broadcast and multicast frames across the Wi-Fi bridge to wired Ethernet), the discovery engine supports direct unicast seed peering via `-peers <host:port>[,<host:port>...]` and `StaticPeers`. Unicast seed announcements bypass link-layer broadcast drop policies, immediately eliciting reactive unicast handshakes.
 
 #### 5. Synchronous Initialization and Deterministic Addressing Lifecycle
 

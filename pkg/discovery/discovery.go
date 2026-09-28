@@ -28,7 +28,7 @@ const (
 	maxConcurrentReactiveAnnounces = 32
 )
 
-var virtualIfaceRegex = regexp.MustCompile(`^(docker\d+|veth.*|virbr\d+|br-[a-f0-9]+|br\d+|cni\d+|u?tun\d+|tap\d+|tailscale\d+|wg\d+|vboxnet\d+|vmnet\d+|awdl\d+|llw\d+)`)
+var virtualIfaceRegex = regexp.MustCompile(`^(docker\d+|veth.*|virbr\d+|incusbr\d+|lxdbr\d+|br-[a-f0-9]+|br\d+|cni\d+|u?tun\d+|tap\d+|tailscale\d+|wg\d+|vboxnet\d+|vmnet\d+|awdl\d+|llw\d+)`)
 
 // Peer is a node discovered on the network.
 type Peer struct {
@@ -597,9 +597,14 @@ func (d *Discovery) sendAnnounceNow() {
 		Token:      d.cfg.AuthToken,
 		TS:         time.Now().UnixNano(),
 	}
-	peerAddrs := make([]string, 0, len(d.peers))
+	peerAddrs := make([]string, 0, len(d.peers)+len(d.cfg.StaticPeers))
 	for _, p := range d.peers {
 		peerAddrs = append(peerAddrs, p.Addr)
+	}
+	for _, sp := range d.cfg.StaticPeers {
+		if sp.Addr != "" {
+			peerAddrs = append(peerAddrs, sp.Addr)
+		}
 	}
 	d.mu.RUnlock()
 
@@ -627,30 +632,44 @@ func (d *Discovery) sendAnnounceNow() {
 			}
 		} else {
 			// 1. Multicast egress (per-interface if possible, or directly to group)
-			if annSendPConn != nil && len(candidates) > 0 {
-				for _, ifc := range candidates {
-					_ = annSendPConn.SetMulticastInterface(ifc)
-					_, _ = annSend.WriteToUDP(payload, group)
+			if group != nil {
+				if annSendPConn != nil && len(candidates) > 0 {
+					for _, ifc := range candidates {
+						_ = annSendPConn.SetMulticastInterface(ifc)
+						if _, err := annSend.WriteToUDP(payload, group); err != nil && !d.isStopping() {
+							log.Printf("[DISCOVERY:WARN] multicast to %s on %s: %v", group, ifc.Name, err)
+						}
+					}
+				} else {
+					if _, err := annSend.WriteToUDP(payload, group); err != nil && !d.isStopping() {
+						log.Printf("[DISCOVERY:WARN] multicast to %s: %v", group, err)
+					}
 				}
-			} else if group != nil {
-				_, _ = annSend.WriteToUDP(payload, group)
 			}
 
 			// 2. Directed subnet broadcast egress
 			for _, baddr := range bcastAddrs {
-				_, _ = annSend.WriteToUDP(payload, baddr)
+				if _, err := annSend.WriteToUDP(payload, baddr); err != nil && !d.isStopping() {
+					log.Printf("[DISCOVERY:WARN] subnet broadcast to %s: %v", baddr, err)
+				}
 			}
 
 			// 3. Limited global broadcast fallback
 			if globalBcast != nil {
-				_, _ = annSend.WriteToUDP(payload, globalBcast)
+				if _, err := annSend.WriteToUDP(payload, globalBcast); err != nil && !d.isStopping() {
+					log.Printf("[DISCOVERY:WARN] global broadcast: %v", err)
+				}
 			}
 		}
 	}
 
-	// 4. Known peer unicast refresh
+	// 4. Known peer and seed peer unicast refresh
+	seenUnicast := make(map[string]bool)
 	for _, addr := range peerAddrs {
-		d.sendUnicast(addr, payload)
+		if !seenUnicast[addr] {
+			seenUnicast[addr] = true
+			d.sendUnicast(addr, payload)
+		}
 	}
 }
 
@@ -708,6 +727,7 @@ func (d *Discovery) handleAnnouncement(msg announcement) {
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(msg.Token), []byte(d.cfg.AuthToken)) != 1 {
+		log.Printf("[DISCOVERY:WARN] rejected announcement from node %s: token mismatch", msg.ID)
 		return
 	}
 	if msg.Addr == "" && msg.SyncAddr == "" && msg.StreamAddr == "" {

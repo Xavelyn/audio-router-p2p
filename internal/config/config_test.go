@@ -107,3 +107,25 @@ func TestLoadFromArgs_StaticPeers(t *testing.T) {
 		t.Errorf("expected static peer ID 'peer1', got '%s'", cfg.StaticPeers[0].ID)
 	}
 }
+
+func TestLoadFromArgs_PeersFlag(t *testing.T) {
+	args := []string{
+		"-auth-token", "tok",
+		"-peers", "10.1.10.160:45401, 10.1.10.201",
+	}
+
+	cfg, err := LoadFromArgs(args)
+	if err != nil {
+		t.Fatalf("LoadFromArgs with -peers failed: %v", err)
+	}
+
+	if len(cfg.StaticPeers) != 2 {
+		t.Fatalf("expected 2 static peers, got %d", len(cfg.StaticPeers))
+	}
+	if cfg.StaticPeers[0].Addr != "10.1.10.160:45401" {
+		t.Errorf("expected peer 0 addr 10.1.10.160:45401, got '%s'", cfg.StaticPeers[0].Addr)
+	}
+	if cfg.StaticPeers[1].Addr != "10.1.10.201:45401" {
+		t.Errorf("expected peer 1 addr 10.1.10.201:45401, got '%s'", cfg.StaticPeers[1].Addr)
+	}
+}

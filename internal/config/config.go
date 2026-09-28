@@ -4,7 +4,10 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -83,8 +86,9 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.StringVar(&cfg.RoomName, "room-name", "", "Human-readable name of the room")
 	fs.BoolVar(&cfg.RoomAutoJoin, "room-auto-join", false, "Auto-join room on daemon startup")
 
-	// Static peers (comma-separated JSON array)
+	// Static peers (comma-separated JSON array or comma-separated addresses)
 	staticPeersJSON := fs.String("static-peers", "", "Static peers JSON array (for cross-broadcast domains)")
+	peersFlag := fs.String("peers", "", "Comma-separated list of peer discovery addresses (e.g. 10.1.10.160:45401 or 10.1.10.160) for direct unicast peering")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -93,6 +97,24 @@ func LoadFromArgs(args []string) (*Config, error) {
 	if *staticPeersJSON != "" {
 		if err := json.Unmarshal([]byte(*staticPeersJSON), &cfg.StaticPeers); err != nil {
 			return nil, fmt.Errorf("parse static-peers: %w", err)
+		}
+	}
+
+	if *peersFlag != "" {
+		for _, raw := range strings.Split(*peersFlag, ",") {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				continue
+			}
+			host, port, err := net.SplitHostPort(raw)
+			if err != nil {
+				host = raw
+				port = strconv.Itoa(cfg.DiscoveryPort)
+			}
+			addr := net.JoinHostPort(host, port)
+			cfg.StaticPeers = append(cfg.StaticPeers, StaticPeerConfig{
+				Addr: addr,
+			})
 		}
 	}
 

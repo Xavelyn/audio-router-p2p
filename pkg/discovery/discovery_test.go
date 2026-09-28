@@ -315,6 +315,7 @@ func TestReactiveDiscovery(t *testing.T) {
 func TestVirtualInterfaceFiltering(t *testing.T) {
 	virtualNames := []string{
 		"docker0", "docker1", "veth1234", "veth_abc", "virbr0", "virbr1",
+		"incusbr0", "lxdbr0",
 		"br-1234567890ab", "br0", "br1", "cni0", "tun0", "tun1", "utun0", "utun1",
 		"tap0", "tailscale0", "wg0", "vboxnet0", "vmnet1", "awdl0", "llw0",
 	}
@@ -351,6 +352,55 @@ func TestReactiveRateLimitAndStormMitigation(t *testing.T) {
 			Token: "test-token",
 			TS:    time.Now().UnixNano(),
 		})
+	}
+}
+
+// TestUnicastSeedDiscovery verifies that nodes can discover each other solely via
+// unicast seed addresses when multicast/broadcast is unavailable.
+func TestUnicastSeedDiscovery(t *testing.T) {
+	portA := freeUDPPort(t)
+	portB := freeUDPPort(t)
+
+	cfgA := testConfig("", 0) // No multicast
+	cfgA.DiscoveryPort = portA
+	cfgA.AdvHost = "127.0.0.1"
+
+	dA, err := New(cfgA, "node-seed-A")
+	if err != nil {
+		t.Fatalf("New A: %v", err)
+	}
+	defer dA.Close()
+
+	cfgB := testConfig("", 0) // No multicast
+	cfgB.DiscoveryPort = portB
+	cfgB.AdvHost = "127.0.0.1"
+	// Node B is configured with Node A's discovery address as a unicast seed
+	cfgB.StaticPeers = []config.StaticPeerConfig{
+		{Addr: dA.OwnAddr()},
+	}
+
+	dB, err := New(cfgB, "node-seed-B")
+	if err != nil {
+		t.Fatalf("New B: %v", err)
+	}
+	defer dB.Close()
+
+	go dA.Run()
+	go dB.Run()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(dA.Peers()) > 0 && len(dB.Peers()) > 0 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := dA.Peers(); len(got) != 1 || got[0].ID != "node-seed-B" {
+		t.Fatalf("Node A did not discover Node B via reactive unicast: %+v", got)
+	}
+	if got := dB.Peers(); len(got) != 1 || got[0].ID != "node-seed-A" {
+		t.Fatalf("Node B did not discover Node A via unicast seed: %+v", got)
 	}
 }
 
