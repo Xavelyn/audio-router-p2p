@@ -1,0 +1,7 @@
+❯ ./audio-router-node -auth-token test123
+2026/09/29 00:21:57.160172 [DISCOVERY:BIND] multicast=239.255.0.1:45400 control=10.1.10.201:45401 ifaces=[wlp2s0] bcast_targets=[10.1.10.255:45400]
+2026/09/29 00:21:57.160388 discovery started for node 9ce2bb110b32e3890bf639e064ffe88b (advertised 10.1.10.201:45401)
+2026/09/29 00:21:57.160526 audio UDP transport listening on [::]:45678
+2026/09/29 00:21:57.160857 API listening on https://:8443 (TLS enabled - self-signed certificate)
+^C2026/09/29 00:22:58.238797 Shutting down...
+2026/09/29 00:22:58.239270 Shutdown complete
