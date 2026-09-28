@@ -811,7 +811,7 @@ func (d *Discovery) Run() {
 		d.mlistMu.RUnlock()
 	}
 
-	// 1. Join static seed peers from cfg.StaticPeers
+	// 1. Join static seed peers from cfg.StaticPeers with background retry
 	if len(d.cfg.StaticPeers) > 0 && mlist != nil {
 		var seedAddrs []string
 		for _, sp := range d.cfg.StaticPeers {
@@ -820,12 +820,8 @@ func (d *Discovery) Run() {
 			}
 		}
 		if len(seedAddrs) > 0 {
-			numJoined, err := mlist.Join(seedAddrs)
-			if err != nil {
-				log.Printf("[DISCOVERY:WARN] failed to join static seed peers: %v", err)
-			} else {
-				log.Printf("[DISCOVERY:JOIN] joined %d/%d static seed peers", numJoined, len(seedAddrs))
-			}
+			d.wg.Add(1)
+			go d.seedJoinLoop(seedAddrs)
 		}
 	}
 
@@ -867,6 +863,62 @@ func (d *Discovery) Run() {
 		case <-d.stopCh:
 			return
 		}
+	}
+}
+
+func (d *Discovery) seedJoinLoop(seedAddrs []string) {
+	defer d.wg.Done()
+
+	// Initial immediate attempt
+	d.attemptSeedJoin(seedAddrs)
+
+	retryTicker := time.NewTicker(3 * time.Second)
+	defer retryTicker.Stop()
+
+	for {
+		select {
+		case <-retryTicker.C:
+			d.attemptSeedJoin(seedAddrs)
+		case <-d.stopCh:
+			return
+		}
+	}
+}
+
+func (d *Discovery) attemptSeedJoin(seedAddrs []string) {
+	d.mlistMu.RLock()
+	mlist := d.mlist
+	d.mlistMu.RUnlock()
+	if mlist == nil || d.isStopping() {
+		return
+	}
+
+	// Check which seeds are not yet in our peer list
+	var unjoined []string
+	d.mu.RLock()
+	for _, addr := range seedAddrs {
+		found := false
+		for _, p := range d.peers {
+			if p != nil && p.Addr == addr {
+				found = true
+				break
+			}
+		}
+		if !found {
+			unjoined = append(unjoined, addr)
+		}
+	}
+	d.mu.RUnlock()
+
+	if len(unjoined) == 0 {
+		return
+	}
+
+	numJoined, err := mlist.Join(unjoined)
+	if err != nil {
+		log.Printf("[DISCOVERY:WARN] seed join attempt to %v failed: %v", unjoined, err)
+	} else if numJoined > 0 {
+		log.Printf("[DISCOVERY:JOIN] joined %d/%d seed peers", numJoined, len(unjoined))
 	}
 }
 
