@@ -440,3 +440,44 @@ func TestDiscoveryGracefulShutdown(t *testing.T) {
 		t.Errorf("second Close() returned error: %v", err)
 	}
 }
+
+func TestDiscoveryTelemetryCounters(t *testing.T) {
+	d, err := New(testConfig("239.255.0.1", freeUDPPort(t)), "node-telem-test")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d.Close()
+
+	d.AddPeer(&Peer{
+		ID:         "peer-test-1",
+		Addr:       "127.0.0.1:45400",
+		SyncAddr:   "127.0.0.1:45402",
+		StreamAddr: "127.0.0.1:45678",
+		LastSeen:   time.Now(),
+	})
+
+	d.beaconsSent.Store(42)
+	d.beaconsRecv.Store(55)
+	d.tokenRejections.Store(3)
+	d.seedJoinAttempts.Store(5)
+	d.seedJoinSuccesses.Store(4)
+
+	telem := d.Telemetry()
+	if telem.BeaconsSent != 42 || telem.BeaconsReceived != 55 {
+		t.Errorf("unexpected beacon counts: %+v", telem)
+	}
+	if telem.TokenRejections != 3 {
+		t.Errorf("expected 3 token rejections, got %d", telem.TokenRejections)
+	}
+	if telem.SeedJoinAttempts != 5 || telem.SeedJoinSuccesses != 4 {
+		t.Errorf("unexpected seed join counts: %+v", telem)
+	}
+
+	peers := d.DiscoveredPeers()
+	if len(peers) != 1 || peers[0].ID != "peer-test-1" {
+		t.Errorf("unexpected discovered peers: %+v", peers)
+	}
+	if state := d.PeerState("peer-test-1"); state != "alive" {
+		t.Errorf("expected alive state, got %s", state)
+	}
+}

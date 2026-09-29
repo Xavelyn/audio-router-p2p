@@ -549,3 +549,43 @@ func TestStreamerSetStreamIDAndStats(t *testing.T) {
 		t.Fatal("Stats should report non-empty StreamID")
 	}
 }
+
+func TestStreamLinkStats_AtomicCollection(t *testing.T) {
+	s, err := NewStreamer(nil, []string{"127.0.0.1"}, DefaultStreamConfig(44100, 1), "test-node")
+	if err != nil {
+		t.Fatalf("NewStreamer: %v", err)
+	}
+
+	peerAddr := "192.168.1.100:45400"
+	jb := NewJitterBuffer(256, 44100, 1, 100)
+	defer jb.Close()
+
+	s.peersMu.Lock()
+	p := &RemotePeer{
+		Addr:      peerAddr,
+		PeerID:    "node-remote-1",
+		JitterBuf: jb,
+	}
+	p.packetsSent.Store(120)
+	p.packetsRecv.Store(118)
+	p.packetsLost.Store(2)
+	p.fecRecovered.Store(1)
+	s.peers[peerAddr] = p
+	s.peersMu.Unlock()
+
+	linkStats := s.StreamLinkStats()
+	if len(linkStats) != 1 {
+		t.Fatalf("expected 1 stream link stat, got %d", len(linkStats))
+	}
+
+	ls := linkStats[0]
+	if ls.PeerID != "node-remote-1" {
+		t.Errorf("expected peer ID node-remote-1, got %s", ls.PeerID)
+	}
+	if ls.PacketsSent != 120 || ls.PacketsReceived != 118 || ls.PacketsLost != 2 {
+		t.Errorf("unexpected packet counts: %+v", ls)
+	}
+	if ls.FECRecovered != 1 {
+		t.Errorf("expected 1 fec recovered, got %d", ls.FECRecovered)
+	}
+}

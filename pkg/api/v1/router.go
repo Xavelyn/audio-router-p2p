@@ -14,6 +14,7 @@ import (
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
+	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
 )
 
 // StreamManager provides route streaming operations.
@@ -48,6 +49,13 @@ type V1Server struct {
 	hub       *telemetry.TelemetryHub
 	devReg    *DeviceRegistry
 	startTime time.Time
+
+	aggregator *netTelemetry.Aggregator
+}
+
+// SetAggregator configures the central network telemetry aggregator.
+func (s *V1Server) SetAggregator(agg *netTelemetry.Aggregator) {
+	s.aggregator = agg
 }
 
 // NewV1Server constructs an initialized V1Server.
@@ -179,7 +187,44 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/rooms/", s.AuthMiddleware(s.handleRoomsSubpath))
 
 	// Telemetry & Diagnostics
+	mux.HandleFunc("/api/v1/network/health", s.AuthMiddleware(s.handleNetworkHealth))
 	mux.HandleFunc("/api/v1/telemetry/stream-stats", s.AuthMiddleware(s.handleTelemetryStreamStats))
 	mux.HandleFunc("/api/v1/telemetry/meters", s.AuthMiddleware(s.handleTelemetryMetersSSE))
 	mux.HandleFunc("/api/v1/telemetry/ws", s.handleTelemetryWebSocket)
+}
+
+// handleNetworkHealth handles GET /api/v1/network/health.
+func (s *V1Server) handleNetworkHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	if s.aggregator != nil {
+		snap := s.aggregator.GetHealthSnapshot()
+		s.WriteJSON(w, http.StatusOK, snap)
+		return
+	}
+
+	nodeID := ""
+	if s.discovery != nil {
+		nodeID = s.discovery.NodeID()
+	}
+
+	resp := netTelemetry.NetworkHealthSnapshot{
+		NodeID:        nodeID,
+		Timestamp:     time.Now(),
+		HealthScore:   100.0,
+		HealthGrade:   netTelemetry.GradeExcellent,
+		LatencyMatrix: make(map[string]float64),
+		Peers:         make(map[string]netTelemetry.PeerLinkHealth),
+		Streams:       make(map[string]netTelemetry.StreamLinkStats),
+	}
+	if s.discovery != nil {
+		resp.Cluster = s.discovery.Telemetry()
+	}
+	if s.syncMgr != nil {
+		resp.Sync = s.syncMgr.Telemetry()
+	}
+	s.WriteJSON(w, http.StatusOK, resp)
 }

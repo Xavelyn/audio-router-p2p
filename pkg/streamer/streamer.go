@@ -16,6 +16,7 @@ import (
 
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/audio/dsp"
+	"github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/audio-router-p2p/pkg/transport"
 )
 
@@ -61,6 +62,7 @@ func (d StreamDirection) String() string {
 // RemotePeer represents a remote peer in a stream session.
 type RemotePeer struct {
 	Addr           string
+	PeerID         string
 	StreamID       [16]byte
 	Direction      StreamDirection
 	Negotiator     *StreamNegotiator
@@ -71,6 +73,20 @@ type RemotePeer struct {
 	FECDecoder     *transport.FECDecoder
 	ASRC           *dsp.ASRCResampler
 	asrcOutBuf     []byte
+
+	// Telemetry atomic accumulators for lock-free interrogation
+	packetsSent   atomic.Uint64
+	packetsRecv   atomic.Uint64
+	bytesSent     atomic.Uint64
+	bytesRecv     atomic.Uint64
+	packetsLost   atomic.Uint64
+	fecRecovered  atomic.Uint64
+	lastSeq       atomic.Uint32
+	hasSeq        atomic.Bool
+
+	lastRateCalc  atomic.Int64 // unix nano
+	lastRateBytes atomic.Uint64
+	effectiveKbps atomic.Uint64 // bits representation of float64
 }
 
 // FECConfig configures RFC 5109 1-D XOR Parity Matrix Forward Error Correction.
@@ -412,11 +428,17 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 				if peer.Output != nil {
 					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
 						log.Printf("streamer: local write error: %v", err)
+					} else {
+						peer.packetsSent.Add(1)
+						peer.bytesSent.Add(uint64(packetBytes))
 					}
 				}
 			} else if s.transport != nil {
 				if err := s.transport.Send(peer.Addr, pkt); err != nil && !errors.Is(err, net.ErrClosed) {
 					log.Printf("streamer: send to %s: %v", peer.Addr, err)
+				} else {
+					peer.packetsSent.Add(1)
+					peer.bytesSent.Add(uint64(len(pkt)))
 				}
 			}
 		}
@@ -443,6 +465,9 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 					if !s.isLocalDest(peer.Addr) && s.transport != nil {
 						if err := s.transport.Send(peer.Addr, parityPkt); err != nil && !errors.Is(err, net.ErrClosed) {
 							log.Printf("streamer: send parity to %s: %v", peer.Addr, err)
+						} else {
+							peer.packetsSent.Add(1)
+							peer.bytesSent.Add(uint64(len(parityPkt)))
 						}
 					}
 				}
@@ -599,6 +624,23 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	}
 
 	s.packetsRecv.Add(1)
+	peer.packetsRecv.Add(1)
+	peer.bytesRecv.Add(uint64(len(data)))
+
+	// Sequence gap loss detection
+	seq := hdr.Seq
+	if peer.hasSeq.Load() {
+		last := peer.lastSeq.Load()
+		if seq > last+1 {
+			gap := uint64(seq - last - 1)
+			if gap < 100000 {
+				peer.packetsLost.Add(gap)
+			}
+		}
+	} else {
+		peer.hasSeq.Store(true)
+	}
+	peer.lastSeq.Store(seq)
 
 	// Handle RFC 5109 Parity Packet
 	if (hdr.Flags & transport.FlagFEC) != 0 {
@@ -607,6 +649,7 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		if err == nil && len(reconstructed) > 0 {
 			for _, rec := range reconstructed {
 				s.fecRecovered.Add(1)
+				peer.fecRecovered.Add(1)
 				recData := rec.Data
 				if peer.IngressAdapter != nil {
 					if norm, err := peer.IngressAdapter.Process(recData, int(hdr.SampleRate), int(hdr.Channels)); err == nil {
@@ -627,6 +670,7 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		if len(reconstructed) > 0 {
 			for _, rec := range reconstructed {
 				s.fecRecovered.Add(1)
+				peer.fecRecovered.Add(1)
 				recData := rec.Data
 				if peer.IngressAdapter != nil {
 					if norm, err := peer.IngressAdapter.Process(recData, int(hdr.SampleRate), int(hdr.Channels)); err == nil {
@@ -821,6 +865,103 @@ func (s *Streamer) Stats() StreamerStats {
 		}
 	}
 	return stats
+}
+
+// SetPeerID associates a peer address with an authoritative peer node ID.
+func (s *Streamer) SetPeerID(addr string, peerID string) {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	if p, ok := s.peers[addr]; ok {
+		p.PeerID = peerID
+	}
+}
+
+// StreamLinkStats returns atomic link metrics per peer without stalling audio threads.
+func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
+	s.mu.Lock()
+	streamIDStr := hex.EncodeToString(s.streamID[:])
+	s.mu.Unlock()
+
+	s.peersMu.RLock()
+	peers := make([]*RemotePeer, 0, len(s.peers))
+	for _, p := range s.peers {
+		peers = append(peers, p)
+	}
+	s.peersMu.RUnlock()
+
+	out := make([]telemetry.StreamLinkStats, 0, len(peers))
+	now := time.Now().UnixNano()
+
+	for _, peer := range peers {
+		sent := peer.packetsSent.Load()
+		recv := peer.packetsRecv.Load()
+		lost := peer.packetsLost.Load()
+		fecRec := peer.fecRecovered.Load()
+
+		var lossRatio float64
+		if (recv + lost) > 0 {
+			lossRatio = float64(lost) / float64(recv+lost)
+		}
+
+		// Effective kbps calculation
+		bytesTotal := peer.bytesRecv.Load() + peer.bytesSent.Load()
+		lastTime := peer.lastRateCalc.Load()
+		lastBytes := peer.lastRateBytes.Load()
+		effectiveKbps := math.Float64frombits(peer.effectiveKbps.Load())
+
+		if lastTime > 0 {
+			dt := float64(now-lastTime) / 1e9
+			if dt >= 0.2 && bytesTotal >= lastBytes {
+				effectiveKbps = (float64(bytesTotal-lastBytes) * 8.0) / (dt * 1000.0)
+				peer.effectiveKbps.Store(math.Float64bits(effectiveKbps))
+				peer.lastRateBytes.Store(bytesTotal)
+				peer.lastRateCalc.Store(now)
+			}
+		} else {
+			peer.lastRateCalc.Store(now)
+			peer.lastRateBytes.Store(bytesTotal)
+		}
+
+		var jbDepth int
+		var targetDelayMS float64
+		var underruns, overruns, plcConcealed uint64
+
+		if peer.JitterBuf != nil {
+			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
+				jbDepth, targetDelayMS, underruns, overruns, plcConcealed = jb.AtomicLinkStats()
+			} else {
+				st := peer.JitterBuf.Stats()
+				jbDepth = st.BufferedFrames
+				targetDelayMS = float64(st.TargetDelay.Milliseconds())
+				underruns = st.Underruns
+				overruns = st.Overruns
+				plcConcealed = st.PLC.ConcealedFramesTotal
+			}
+		}
+
+		peerID := peer.PeerID
+		if peerID == "" {
+			peerID = peer.Addr
+		}
+
+		out = append(out, telemetry.StreamLinkStats{
+			StreamID:            streamIDStr,
+			PeerID:              peerID,
+			PacketsSent:         sent,
+			PacketsReceived:     recv,
+			PacketsLost:         lost,
+			LossRatio:           lossRatio,
+			EffectiveKbps:       effectiveKbps,
+			JitterDepthFrames:   jbDepth,
+			JitterTargetDelayMS: targetDelayMS,
+			Underruns:           underruns,
+			Overruns:            overruns,
+			FECRecovered:        fecRec,
+			PLCConcealed:        plcConcealed,
+		})
+	}
+
+	return out
 }
 
 // isLocalDest reports whether hostport resolves to a local IP.

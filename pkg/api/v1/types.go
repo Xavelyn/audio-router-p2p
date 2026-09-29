@@ -2,6 +2,7 @@ package v1
 
 import (
 	"github.com/audio-router-p2p/pkg/router"
+	"github.com/audio-router-p2p/pkg/telemetry"
 )
 
 // ErrorResponse represents standard OpenAPI 3.1 error payload.
@@ -203,3 +204,6 @@ type WSControlMessage struct {
 	SlewMS       float64   `json:"slew_ms,omitempty"`
 	Muted        *bool     `json:"muted,omitempty"`
 }
+
+// NetworkHealthResponse represents the JSON response for GET /api/v1/network/health per ADR 0010.
+type NetworkHealthResponse = telemetry.NetworkHealthSnapshot

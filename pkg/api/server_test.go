@@ -19,7 +19,7 @@ import (
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
-	"github.com/prometheus/client_golang/prometheus"
+	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
 )
 
 type mockStreamManager struct {
@@ -35,6 +35,21 @@ func (m *mockStreamManager) Stats() map[string]streamer.StreamerStats {
 			StreamID:        "abcd1234abcd1234",
 			PacketsSent:     100,
 			PacketsReceived: 95,
+			FEC: streamer.FECStats{
+				PacketsRecoveredTotal: 3,
+			},
+			PLC: streamer.PLCStats{
+				ConcealedFramesTotal: 1,
+			},
+			Peers: map[string]streamer.JitterBufferStats{
+				"192.168.1.50:7001": {
+					BufferedFrames: 2,
+					CapacityFrames: 10,
+					TargetDelay:    20 * time.Millisecond,
+					Underruns:      0,
+					Overruns:       0,
+				},
+			},
 		},
 	}
 }
@@ -234,32 +249,7 @@ func newTestServer(t *testing.T, streams StreamManager) *Server {
 	disc := testDiscovery(t)
 	sm := testSyncMgr(t)
 
-	s := &Server{
-		cfg:      cfg,
-		rt:       rt,
-		disc:     disc,
-		syncMgr:  sm,
-		streams:  streams,
-		mux:      http.NewServeMux(),
-		registry: prometheus.NewRegistry(),
-	}
-	s.reqs = prometheus.NewCounterVec(prometheus.CounterOpts{
-		Name: "audio_router_api_requests_total",
-		Help: "Total number of API requests by method and path.",
-	}, []string{"method", "path"})
-	s.peerCnt = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "audio_router_peers",
-		Help: "Current number of discovered peers.",
-	})
-	s.routesActive = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "audio_router_active_routes",
-		Help: "Current number of active stream routes.",
-	})
-	s.registry.MustRegister(s.reqs, s.peerCnt, s.routesActive)
-	_ = s.Hub()
-	_ = s.V1()
-	s.routes()
-	return s
+	return NewServer(cfg, rt, disc, sm, streams)
 }
 
 func doRequest(t *testing.T, handler http.Handler, method, path string, body interface{}, token string) *httptest.ResponseRecorder {
@@ -717,5 +707,68 @@ func TestConstantTimeCompare(t *testing.T) {
 	}
 	if subtle.ConstantTimeCompare(token, []byte("wrong")) == 1 {
 		t.Error("constant time compare should fail for different")
+	}
+}
+
+func TestServerNetworkHealthAndMetrics(t *testing.T) {
+	msm := &mockStreamManager{}
+	s := newTestServer(t, msm)
+	handler := s.Handler()
+
+	// 1. Unauthenticated request to /api/v1/network/health -> 401
+	w := doRequest(t, handler, http.MethodGet, "/api/v1/network/health", nil, "")
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 unauthorized from /api/v1/network/health, got %d", w.Code)
+	}
+
+	// 2. Authenticated GET /api/v1/network/health -> 200
+	w = doRequest(t, handler, http.MethodGet, "/api/v1/network/health", nil, "test-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /api/v1/network/health, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var snap netTelemetry.NetworkHealthSnapshot
+	if err := json.NewDecoder(w.Body).Decode(&snap); err != nil {
+		t.Fatalf("decode network health snapshot: %v", err)
+	}
+	if snap.HealthScore < 0.0 || snap.HealthScore > 100.0 {
+		t.Errorf("health score out of bounds: %f", snap.HealthScore)
+	}
+	if snap.HealthGrade == "" {
+		t.Errorf("empty health grade")
+	}
+	if snap.Streams == nil {
+		t.Errorf("streams map is nil")
+	}
+	if st, ok := snap.Streams["abcd1234abcd1234"]; !ok {
+		t.Errorf("expected abcd1234abcd1234 in streams, got %+v", snap.Streams)
+	} else if st.PacketsSent != 100 {
+		t.Errorf("packets sent = %d; want 100", st.PacketsSent)
+	}
+
+	// 3. GET /metrics -> Prometheus scraping with ADR 0010 metric families
+	w = doRequest(t, handler, http.MethodGet, "/metrics", nil, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from /metrics, got %d", w.Code)
+	}
+	body := w.Body.String()
+
+	expectedMetrics := []string{
+		"audio_router_network_node_health_score",
+		"audio_router_network_cluster_nodes",
+		"audio_router_network_lan_beacons_total",
+		"audio_router_network_token_rejections_total",
+		"audio_router_network_seed_joins_total",
+		"audio_router_network_clock_offset_microseconds",
+		"audio_router_network_clock_drift_ppm",
+		"audio_router_network_clock_is_master",
+		"audio_router_stream_fec_recovered_packets_total",
+		"audio_router_stream_plc_concealed_frames_total",
+	}
+
+	for _, metricName := range expectedMetrics {
+		if !strings.Contains(body, metricName) {
+			t.Errorf("expected %s in /metrics response, got:\n%s", metricName, body)
+		}
 	}
 }

@@ -182,3 +182,41 @@ func TestSyncRejectsUndiscoveredSources(t *testing.T) {
 		t.Fatalf("reading from undiscovered source: %v", err)
 	}
 }
+
+func TestSyncTelemetry(t *testing.T) {
+	disc := stubPeers{id: "local-node"}
+	cfg := &config.Config{
+		SyncPort:     0,
+		SyncInterval: time.Second,
+		PeerTTL:      time.Second,
+	}
+	m := NewManager(cfg, disc)
+	defer m.Close()
+
+	m.SetMaster(true)
+	if !m.IsMaster() {
+		t.Error("expected IsMaster to be true")
+	}
+
+	m.mu.Lock()
+	m.offsets["peer-1"] = PeerOffset{
+		Offset:     -15 * time.Microsecond,
+		RTT:        1200 * time.Microsecond,
+		DriftPPM:   1.5,
+		LastUpdate: time.Now(),
+	}
+	m.mu.Unlock()
+
+	telem := m.Telemetry()
+	if !telem.IsMaster {
+		t.Error("expected telem.IsMaster true")
+	}
+	if telem.OffsetUS != -15.0 || telem.SyncRTTUS != 1200.0 || telem.DriftPPM != 1.5 {
+		t.Errorf("unexpected sync telemetry: %+v", telem)
+	}
+
+	po := m.PeerOffsets()
+	if len(po) != 1 || po["peer-1"].OffsetUS != -15.0 {
+		t.Errorf("unexpected peer offsets: %+v", po)
+	}
+}

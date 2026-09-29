@@ -7,10 +7,12 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/discovery"
+	"github.com/audio-router-p2p/pkg/telemetry"
 )
 
 // message is the wire format for clock-sync pings/pongs (all times in ns).
@@ -33,6 +35,7 @@ const (
 type PeerOffset struct {
 	Offset     time.Duration `json:"offset"`
 	RTT        time.Duration `json:"rtt"`
+	DriftPPM   float64       `json:"drift_ppm"`
 	LastUpdate time.Time     `json:"lastUpdate"`
 }
 
@@ -56,6 +59,11 @@ type Manager struct {
 	wg      sync.WaitGroup
 	offsets map[string]PeerOffset
 	pending map[uint64]time.Time // nonce -> T1 send time
+
+	packetsSent atomic.Uint64
+	packetsRecv atomic.Uint64
+	packetsLost atomic.Uint64
+	isMaster    atomic.Bool
 }
 
 // NewManager creates a clock-sync manager for the given discovery service.
@@ -193,6 +201,8 @@ func (m *Manager) handle(addr *net.UDPAddr, msg *message) {
 		}
 	case msgResponse:
 		t4 := time.Now().UnixNano()
+		nowTime := time.Now()
+		m.packetsRecv.Add(1)
 		// The response arrived from a concrete UDP source; resolve its
 		// identity from discovery instead of trusting the sender-claimed
 		// msg.ID (which any off-path attacker can set). Do this before m.mu:
@@ -212,10 +222,24 @@ func (m *Manager) handle(addr *net.UDPAddr, msg *message) {
 		// offset = ((t2 - t1) + (t3 - t4)) / 2
 		offset := ((msg.T2 - t1ns) + (msg.T3 - t4)) / 2
 		rtt := t4 - msg.T3 + msg.T2 - t1ns
+
+		driftPPM := 0.0
+		if prev, hasPrev := m.offsets[peerID]; hasPrev {
+			dt := nowTime.Sub(prev.LastUpdate).Seconds()
+			if dt > 0.05 {
+				deltaOffsetSec := (time.Duration(offset) - prev.Offset).Seconds()
+				instantDrift := (deltaOffsetSec / dt) * 1e6
+				driftPPM = 0.8*prev.DriftPPM + 0.2*instantDrift
+			} else {
+				driftPPM = prev.DriftPPM
+			}
+		}
+
 		m.offsets[peerID] = PeerOffset{
 			Offset:     time.Duration(offset),
 			RTT:        time.Duration(rtt),
-			LastUpdate: time.Now(),
+			DriftPPM:   driftPPM,
+			LastUpdate: nowTime,
 		}
 	}
 }
@@ -249,6 +273,7 @@ func (m *Manager) pingPeers() {
 		if err == nil {
 			_, _ = m.conn.WriteToUDP(payload, addr)
 			m.pending[nonce] = time.Unix(0, req.T1)
+			m.packetsSent.Add(1)
 		}
 		m.mu.Unlock()
 	}
@@ -261,6 +286,7 @@ func (m *Manager) sweepPending() {
 	for nonce, sent := range m.pending {
 		if sent.Before(cutoff) {
 			delete(m.pending, nonce)
+			m.packetsLost.Add(1)
 		}
 	}
 	m.mu.Unlock()
@@ -281,6 +307,64 @@ func (m *Manager) Offsets() map[string]PeerOffset {
 	out := make(map[string]PeerOffset, len(m.offsets))
 	for k, v := range m.offsets {
 		out[k] = v
+	}
+	return out
+}
+
+// IsMaster reports whether this node is designated as the clock synchronization master.
+func (m *Manager) IsMaster() bool {
+	return m.isMaster.Load()
+}
+
+// SetMaster designates this node as the clock synchronization master.
+func (m *Manager) SetMaster(v bool) {
+	m.isMaster.Store(v)
+}
+
+// Telemetry returns aggregated clock sync health metrics safely.
+func (m *Manager) Telemetry() telemetry.ClockSyncHealth {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var totalOffsetUS, totalDriftPPM, totalRTTUS float64
+	count := 0
+	for _, po := range m.offsets {
+		totalOffsetUS += float64(po.Offset.Microseconds())
+		totalDriftPPM += po.DriftPPM
+		totalRTTUS += float64(po.RTT.Microseconds())
+		count++
+	}
+
+	var avgOffsetUS, avgDriftPPM, avgRTTUS float64
+	if count > 0 {
+		avgOffsetUS = totalOffsetUS / float64(count)
+		avgDriftPPM = totalDriftPPM / float64(count)
+		avgRTTUS = totalRTTUS / float64(count)
+	}
+
+	return telemetry.ClockSyncHealth{
+		OffsetUS:    avgOffsetUS,
+		DriftPPM:    avgDriftPPM,
+		SyncRTTUS:   avgRTTUS,
+		PacketsSent: m.packetsSent.Load(),
+		PacketsLost: m.packetsLost.Load(),
+		IsMaster:    m.isMaster.Load(),
+	}
+}
+
+// PeerOffsets returns peer sync telemetry formatted for the telemetry aggregator.
+func (m *Manager) PeerOffsets() map[string]telemetry.PeerSyncOffset {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make(map[string]telemetry.PeerSyncOffset, len(m.offsets))
+	for k, v := range m.offsets {
+		out[k] = telemetry.PeerSyncOffset{
+			OffsetUS:   float64(v.Offset.Microseconds()),
+			DriftPPM:   v.DriftPPM,
+			RTTUS:      float64(v.RTT.Microseconds()),
+			LastUpdate: v.LastUpdate,
+		}
 	}
 	return out
 }

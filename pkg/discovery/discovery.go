@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
+	"github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/hashicorp/memberlist"
 )
 
@@ -94,6 +95,12 @@ type Discovery struct {
 	joinMu          sync.Mutex
 	lastJoinAttempt map[string]time.Time
 	joinSem         chan struct{}
+
+	beaconsSent       atomic.Uint64
+	beaconsRecv       atomic.Uint64
+	tokenRejections   atomic.Uint64
+	seedJoinAttempts  atomic.Uint64
+	seedJoinSuccesses atomic.Uint64
 
 	started   atomic.Bool
 	stopCh    chan struct{}
@@ -197,6 +204,116 @@ func (d *Discovery) AddPeer(peer *Peer) {
 	defer d.mu.Unlock()
 	cp := *peer
 	d.peers[peer.ID] = &cp
+}
+
+// Telemetry returns cluster health, discovery, and bootstrap metrics safely for telemetry consumers.
+func (d *Discovery) Telemetry() telemetry.DiscoveryHealth {
+	var active, suspect, dead int
+	d.mlistMu.RLock()
+	mlist := d.mlist
+	d.mlistMu.RUnlock()
+	if mlist != nil {
+		for _, m := range mlist.Members() {
+			switch m.State {
+			case memberlist.StateAlive:
+				active++
+			case memberlist.StateSuspect:
+				suspect++
+			case memberlist.StateDead:
+				dead++
+			}
+		}
+	} else {
+		active = 1 // local node default
+	}
+
+	lanActive := false
+	if d.cfg != nil && d.cfg.MulticastPort > 0 {
+		d.sockMu.RLock()
+		lanActive = d.annSend != nil || d.mcast != nil
+		d.sockMu.RUnlock()
+	}
+
+	seedActive := false
+	if d.cfg != nil && len(d.cfg.StaticPeers) > 0 {
+		seedActive = true
+	}
+
+	return telemetry.DiscoveryHealth{
+		ActiveMembers:     active,
+		SuspectMembers:    suspect,
+		DeadMembers:       dead,
+		LANBeaconActive:   lanActive,
+		BeaconsSent:       d.beaconsSent.Load(),
+		BeaconsReceived:   d.beaconsRecv.Load(),
+		TokenRejections:   d.tokenRejections.Load(),
+		SeedRetryActive:   seedActive,
+		SeedJoinAttempts:  d.seedJoinAttempts.Load(),
+		SeedJoinSuccesses: d.seedJoinSuccesses.Load(),
+	}
+}
+
+// DiscoveredPeers returns an aggregated view of known peers with their SWIM state.
+func (d *Discovery) DiscoveredPeers() []telemetry.DiscoveredPeer {
+	peers := d.Peers()
+	result := make([]telemetry.DiscoveredPeer, len(peers))
+
+	d.mlistMu.RLock()
+	mlist := d.mlist
+	d.mlistMu.RUnlock()
+
+	stateMap := make(map[string]string)
+	if mlist != nil {
+		for _, m := range mlist.Members() {
+			switch m.State {
+			case memberlist.StateAlive:
+				stateMap[m.Name] = "alive"
+			case memberlist.StateSuspect:
+				stateMap[m.Name] = "suspect"
+			case memberlist.StateDead:
+				stateMap[m.Name] = "dead"
+			}
+		}
+	}
+
+	for i, p := range peers {
+		state := stateMap[p.ID]
+		if state == "" {
+			state = "alive"
+		}
+		result[i] = telemetry.DiscoveredPeer{
+			ID:         p.ID,
+			Addr:       p.Addr,
+			SyncAddr:   p.SyncAddr,
+			StreamAddr: p.StreamAddr,
+			LastSeen:   p.LastSeen,
+			SWIMState:  state,
+		}
+	}
+	return result
+}
+
+// PeerState queries the SWIM failure detector state for a given peer ID.
+func (d *Discovery) PeerState(peerID string) string {
+	d.mlistMu.RLock()
+	mlist := d.mlist
+	d.mlistMu.RUnlock()
+	if mlist == nil {
+		return "alive"
+	}
+	for _, m := range mlist.Members() {
+		if m.Name == peerID {
+			switch m.State {
+			case memberlist.StateAlive:
+				return "alive"
+			case memberlist.StateSuspect:
+				return "suspect"
+			case memberlist.StateDead:
+				return "dead"
+			}
+		}
+	}
+	return "alive"
 }
 
 // OwnAddr is this node's advertised discovery control address.
@@ -535,6 +652,7 @@ func (d *Discovery) NotifyAlive(peer *memberlist.Node) error {
 	}
 	token := meta.getAuthToken()
 	if subtle.ConstantTimeCompare([]byte(token), []byte(d.cfg.AuthToken)) != 1 {
+		d.tokenRejections.Add(1)
 		log.Printf("[DISCOVERY:WARN] unauthorized node rejected from %s (%s): token mismatch", peer.Name, peer.Address())
 		return errors.New("auth token mismatch")
 	}
@@ -792,10 +910,12 @@ func (d *Discovery) attemptSeedJoin(seedAddrs []string) {
 		return
 	}
 
+	d.seedJoinAttempts.Add(1)
 	numJoined, err := mlist.Join(unjoined)
 	if err != nil {
 		log.Printf("[DISCOVERY:WARN] seed join attempt to %v failed: %v", unjoined, err)
 	} else if numJoined > 0 {
+		d.seedJoinSuccesses.Add(uint64(numJoined))
 		log.Printf("[DISCOVERY:JOIN] joined %d/%d seed peers", numJoined, len(unjoined))
 	}
 }
@@ -845,7 +965,9 @@ func (d *Discovery) handleBeacon(b beaconMessage, srcAddr *net.UDPAddr) {
 	if b.Magic != beaconMagic || b.ID == "" || b.ID == d.nodeID {
 		return
 	}
+	d.beaconsRecv.Add(1)
 	if subtle.ConstantTimeCompare([]byte(b.Token), []byte(d.cfg.AuthToken)) != 1 {
+		d.tokenRejections.Add(1)
 		log.Printf("[DISCOVERY:WARN] rejected beacon from node %s: token mismatch", b.ID)
 		return
 	}
@@ -954,6 +1076,7 @@ func (d *Discovery) sendBeaconNow() {
 		return
 	}
 
+	sentCount := 0
 	// 1. Multicast beacon egress
 	if group != nil {
 		if _, err := annSend.WriteToUDP(payload, group); err != nil {
@@ -961,6 +1084,8 @@ func (d *Discovery) sendBeaconNow() {
 				return
 			}
 			log.Printf("[DISCOVERY:WARN] multicast beacon to %s: %v", group, err)
+		} else {
+			sentCount++
 		}
 	}
 
@@ -971,6 +1096,8 @@ func (d *Discovery) sendBeaconNow() {
 				return
 			}
 			log.Printf("[DISCOVERY:WARN] subnet broadcast to %s: %v", baddr, err)
+		} else {
+			sentCount++
 		}
 	}
 
@@ -981,7 +1108,13 @@ func (d *Discovery) sendBeaconNow() {
 				return
 			}
 			log.Printf("[DISCOVERY:WARN] global broadcast: %v", err)
+		} else {
+			sentCount++
 		}
+	}
+
+	if sentCount > 0 {
+		d.beaconsSent.Add(1)
 	}
 }
 

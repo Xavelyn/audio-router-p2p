@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/audio-router-p2p/pkg/audio/dsp"
@@ -65,6 +66,13 @@ type JitterBuffer struct {
 	overruns     uint64
 	latePackets  uint64
 	earlyPackets uint64
+
+	// Telemetry atomic accumulators for lock-free interrogation
+	atomicUnderruns    atomic.Uint64
+	atomicOverruns     atomic.Uint64
+	atomicBuffered     atomic.Int32
+	atomicPLCConcealed atomic.Uint64
+	atomicTargetDelay  atomic.Int64 // nanoseconds
 
 	closed bool
 }
@@ -191,6 +199,9 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 		// Overwrite existing frame (overrun)
 		dropped = 1
 		jb.overruns++
+		jb.atomicOverruns.Add(1)
+	} else {
+		jb.atomicBuffered.Add(1)
 	}
 	f.seq = seq
 	f.timestamp = ts
@@ -237,6 +248,7 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 		frame := &jb.frames[idx]
 		if frame.valid && frame.seq == jb.nextSeq {
 			frame.valid = false
+			jb.atomicBuffered.Add(-1)
 			jb.nextSeq++
 			data := frame.data
 			if jb.plc != nil {
@@ -256,7 +268,9 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 		if time.Now().After(expectedPlayout) {
 			if !jb.dtxMode {
 				jb.underruns++
+				jb.atomicUnderruns.Add(1)
 				if jb.plc != nil {
+					jb.atomicPLCConcealed.Add(1)
 					n := jb.plc.Conceal(jb.concealBuf)
 					concealed := append([]byte(nil), jb.concealBuf[:n]...)
 					jb.nextSeq++
@@ -298,7 +312,9 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 		if time.Now().After(expectedPlayout) {
 			if !jb.dtxMode {
 				jb.underruns++
+				jb.atomicUnderruns.Add(1)
 				if jb.plc != nil {
+					jb.atomicPLCConcealed.Add(1)
 					n := jb.plc.Conceal(jb.concealBuf)
 					concealed := append([]byte(nil), jb.concealBuf[:n]...)
 					jb.nextSeq++
@@ -313,6 +329,7 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 	}
 
 	frame.valid = false
+	jb.atomicBuffered.Add(-1)
 	jb.nextSeq++
 	data := frame.data
 	if jb.plc != nil {
@@ -362,6 +379,20 @@ func (jb *JitterBuffer) adaptDelay(arrival, expected time.Time) {
 		newTarget = jb.maxDelay
 	}
 	jb.targetDelay = newTarget
+	jb.atomicTargetDelay.Store(int64(newTarget))
+}
+
+// AtomicLinkStats returns instantaneous jitter buffer metrics without locking the audio thread.
+func (jb *JitterBuffer) AtomicLinkStats() (buffered int, targetDelayMS float64, underruns, overruns, plcConcealed uint64) {
+	b := jb.atomicBuffered.Load()
+	if b < 0 {
+		b = 0
+	}
+	targetNS := jb.atomicTargetDelay.Load()
+	if targetNS == 0 {
+		targetNS = int64(jb.minDelay)
+	}
+	return int(b), float64(targetNS) / 1e6, jb.atomicUnderruns.Load(), jb.atomicOverruns.Load(), jb.atomicPLCConcealed.Load()
 }
 
 // Stats returns current buffer statistics.

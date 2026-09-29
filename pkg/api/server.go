@@ -8,12 +8,14 @@ import (
 	stdSync "sync"
 
 	"github.com/audio-router-p2p/internal/config"
+	"github.com/audio-router-p2p/pkg/api/metrics"
 	"github.com/audio-router-p2p/pkg/api/telemetry"
 	v1 "github.com/audio-router-p2p/pkg/api/v1"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
+	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -71,6 +73,9 @@ type Server struct {
 
 	hub      *telemetry.TelemetryHub
 	v1Server *v1.V1Server
+
+	aggregator       *netTelemetry.Aggregator
+	networkCollector *metrics.NetworkMetricsCollector
 }
 
 // NewServer wires the API together. streams and roomMgr may be nil for read-only mode.
@@ -103,6 +108,20 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	})
 	s.registry.MustRegister(s.reqs, s.peerCnt, s.routesActive)
 
+	// Initialize network telemetry aggregator
+	nodeID := ""
+	if disc != nil {
+		nodeID = disc.NodeID()
+	}
+	s.aggregator = netTelemetry.NewAggregator(netTelemetry.Config{
+		NodeID:    nodeID,
+		Discovery: disc,
+		ClockSync: syncMgr,
+		Streamer:  &streamProviderAdapter{streams: streams},
+	})
+	s.networkCollector = metrics.NewNetworkMetricsCollector(s)
+	s.registry.MustRegister(s.networkCollector)
+
 	if rm != nil {
 		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok && s.rt != nil {
 			rSetter.SetRouter(s.rt)
@@ -115,9 +134,71 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	// Pre-initialize telemetry hub and canonical v1 server
 	_ = s.Hub()
 	_ = s.V1()
+	s.V1().SetAggregator(s.aggregator)
 
 	s.routes()
 	return s
+}
+
+// Aggregator returns the central network telemetry aggregator instance.
+func (s *Server) Aggregator() *netTelemetry.Aggregator {
+	return s.aggregator
+}
+
+// SetAggregator configures an external or custom network telemetry aggregator.
+func (s *Server) SetAggregator(agg *netTelemetry.Aggregator) {
+	s.aggregator = agg
+	if s.v1Server != nil {
+		s.v1Server.SetAggregator(agg)
+	}
+}
+
+// GetHealthSnapshot supplies the latest atomic snapshot to the Prometheus collector.
+func (s *Server) GetHealthSnapshot() *netTelemetry.NetworkHealthSnapshot {
+	if s.aggregator != nil {
+		return s.aggregator.GetHealthSnapshot()
+	}
+	return nil
+}
+
+type streamProviderAdapter struct {
+	streams StreamManager
+}
+
+func (a *streamProviderAdapter) StreamLinkStats() []netTelemetry.StreamLinkStats {
+	if a.streams == nil {
+		return nil
+	}
+	if direct, ok := a.streams.(interface{ StreamLinkStats() []netTelemetry.StreamLinkStats }); ok {
+		return direct.StreamLinkStats()
+	}
+	raw := a.streams.Stats()
+	var out []netTelemetry.StreamLinkStats
+	for streamID, st := range raw {
+		sid := st.StreamID
+		if sid == "" {
+			sid = streamID
+		}
+		for peerAddr, jb := range st.Peers {
+			plcConcealed := jb.PLC.ConcealedFramesTotal
+			if plcConcealed == 0 {
+				plcConcealed = st.PLC.ConcealedFramesTotal
+			}
+			out = append(out, netTelemetry.StreamLinkStats{
+				StreamID:            sid,
+				PeerID:              peerAddr,
+				PacketsSent:         st.PacketsSent,
+				PacketsReceived:     st.PacketsReceived,
+				JitterDepthFrames:   jb.BufferedFrames,
+				JitterTargetDelayMS: float64(jb.TargetDelay.Milliseconds()),
+				Underruns:           jb.Underruns,
+				Overruns:            jb.Overruns,
+				FECRecovered:        st.FEC.PacketsRecoveredTotal,
+				PLCConcealed:        plcConcealed,
+			})
+		}
+	}
+	return out
 }
 
 // Hub returns the telemetry hub instance, lazily allocating if necessary.

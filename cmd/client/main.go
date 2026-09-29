@@ -30,6 +30,7 @@ import (
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
 	syncmgr "github.com/audio-router-p2p/pkg/sync"
+	"github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/audio-router-p2p/pkg/transport"
 )
 
@@ -138,6 +139,11 @@ func main() {
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
 
+	if agg := apiSrv.Aggregator(); agg != nil {
+		agg.Start(context.Background())
+		defer agg.Stop()
+	}
+
 	if cfg.NoTLS {
 		go func() {
 			log.Printf("API listening on http://%s (plaintext HTTP)", cfg.ListenAddr)
@@ -168,6 +174,11 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Printf("HTTP shutdown: %v", err)
 	}
+
+	if agg := apiSrv.Aggregator(); agg != nil {
+		agg.Stop()
+	}
+
 	_ = roomMgr.Close()
 	streams.StopAll()
 	disc.Close()
@@ -325,6 +336,11 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		return err
 	}
+	if sr.PeerID != "" {
+		for _, dest := range destAddrs {
+			st.SetPeerID(dest, sr.PeerID)
+		}
+	}
 	// Save the potentially updated route (with peer binding)
 	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out}
 	log.Printf("route %s: streaming device %d -> %d destinations (peer: %s)", sr.ID, sr.SourceDevice, len(destAddrs), sr.PeerID)
@@ -365,6 +381,19 @@ func (m *streamManager) Stats() map[string]streamer.StreamerStats {
 		}
 	}
 	return res
+}
+
+// StreamLinkStats returns atomic link metrics across all active streams.
+func (m *streamManager) StreamLinkStats() []telemetry.StreamLinkStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []telemetry.StreamLinkStats
+	for _, as := range m.routes {
+		if as.st != nil {
+			out = append(out, as.st.StreamLinkStats()...)
+		}
+	}
+	return out
 }
 
 func (m *streamManager) stopLocked(as *activeStream) {
