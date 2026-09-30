@@ -15,7 +15,7 @@
   import Clock from '@lucide/svelte/icons/clock';
   import Workflow from '@lucide/svelte/icons/workflow';
 
-  export type TabId = 'flow' | 'matrix' | 'meters' | 'devices' | 'rooms' | 'diagnostics';
+  export type TabId = 'flow' | 'meters' | 'devices' | 'rooms' | 'diagnostics';
 
   let { activeTab = $bindable('flow' as TabId) } = $props<{ activeTab: TabId }>();
 
@@ -23,7 +23,6 @@
 
   const tabs: { id: TabId; label: string; icon: any }[] = [
     { id: 'flow', label: 'Audio Flow', icon: Workflow },
-    { id: 'matrix', label: 'Matrix Crossbar', icon: Sliders },
     { id: 'meters', label: 'Live Meters', icon: Activity },
     { id: 'devices', label: 'Audio Devices', icon: Speaker },
     { id: 'rooms', label: 'Mesh Rooms', icon: Network },

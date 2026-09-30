@@ -2,7 +2,6 @@
   import { onMount } from 'svelte';
   import Header, { type TabId } from '$lib/components/layout/Header.svelte';
   import RoomCanvas from '$lib/components/rooms/RoomCanvas.svelte';
-  import MatrixCrossbar from '$lib/components/matrix/MatrixCrossbar.svelte';
   import MeterRack from '$lib/components/meters/MeterRack.svelte';
   import DeviceManager from '$lib/components/devices/DeviceManager.svelte';
   import RoomCoordinator from '$lib/components/rooms/RoomCoordinator.svelte';
@@ -10,6 +9,7 @@
   import { authStore } from '$lib/stores/auth.svelte';
   import { meterStore } from '$lib/stores/meters.svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
+  import { SvelteFlowProvider } from '@xyflow/svelte';
   import AlertCircle from '@lucide/svelte/icons/alert-circle';
   import X from '@lucide/svelte/icons/x';
   import Key from '@lucide/svelte/icons/key';
@@ -56,9 +56,9 @@
   <!-- Active View Viewport -->
   <main class="flex-1 overflow-hidden relative">
     {#if activeTab === 'flow'}
-      <RoomCanvas />
-    {:else if activeTab === 'matrix'}
-      <MatrixCrossbar />
+      <SvelteFlowProvider>
+        <RoomCanvas />
+      </SvelteFlowProvider>
     {:else if activeTab === 'meters'}
       <MeterRack />
     {:else if activeTab === 'devices'}

@@ -19,6 +19,7 @@
     allRooms: RoomSummary[];
     onAddToRoom: (roomId: string) => void;
     onRemoveFromRoom: (roomId: string) => void;
+    onDismiss?: () => void;
   }
 
   let { id, data, selected = false }: { id: string; data: OutputNodeData; selected?: boolean } = $props();
@@ -77,7 +78,7 @@
       </div>
     </div>
 
-    <!-- Direction Badges -->
+    <!-- Direction Badges & Dismiss -->
     <div class="flex items-center gap-1 shrink-0">
       <span class="rounded bg-purple-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-purple-300 border border-purple-500/40">
         OUTPUT
@@ -87,6 +88,20 @@
         : 'bg-zinc-800 text-zinc-300 border border-zinc-700'}">
         {data.device.is_virtual ? 'VIRT' : 'HW'}
       </span>
+      {#if data.onDismiss}
+        <button
+          type="button"
+          onclick={(e) => {
+            e.stopPropagation();
+            data.onDismiss?.();
+          }}
+          class="rounded p-0.5 text-zinc-400 hover:text-red-400 hover:bg-red-500/10 transition-colors ml-0.5 cursor-pointer"
+          title="Remove from canvas"
+          aria-label="Remove from canvas"
+        >
+          <X class="w-3.5 h-3.5" />
+        </button>
+      {/if}
     </div>
   </div>
 
