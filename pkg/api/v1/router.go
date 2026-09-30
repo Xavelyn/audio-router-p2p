@@ -10,6 +10,7 @@ import (
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/api/telemetry"
+	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
@@ -51,11 +52,27 @@ type V1Server struct {
 	startTime time.Time
 
 	aggregator *netTelemetry.Aggregator
+	clusterMgr *cluster.Manager
 }
 
 // SetAggregator configures the central network telemetry aggregator.
 func (s *V1Server) SetAggregator(agg *netTelemetry.Aggregator) {
 	s.aggregator = agg
+}
+
+// SetClusterManager configures the cluster manager.
+func (s *V1Server) SetClusterManager(mgr *cluster.Manager) {
+	s.clusterMgr = mgr
+}
+
+// ClusterManager returns the cluster manager instance.
+func (s *V1Server) ClusterManager() *cluster.Manager {
+	return s.clusterMgr
+}
+
+// UptimeSeconds returns the uptime of the server in seconds.
+func (s *V1Server) UptimeSeconds() float64 {
+	return time.Since(s.startTime).Seconds()
 }
 
 // NewV1Server constructs an initialized V1Server.
@@ -185,6 +202,11 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	// Room Orchestration
 	mux.HandleFunc("/api/v1/rooms", s.AuthMiddleware(s.handleRooms))
 	mux.HandleFunc("/api/v1/rooms/", s.AuthMiddleware(s.handleRoomsSubpath))
+
+	// Cluster Management & Observability (ADR 0011)
+	mux.HandleFunc("/api/v1/cluster/nodes", s.AuthMiddleware(s.handleClusterNodes))
+	mux.HandleFunc("/api/v1/cluster/nodes/", s.AuthMiddleware(s.handleClusterNodesSubpath))
+	mux.HandleFunc("/api/v1/cluster/devices", s.AuthMiddleware(s.handleClusterDevices))
 
 	// Telemetry & Diagnostics
 	mux.HandleFunc("/api/v1/network/health", s.AuthMiddleware(s.handleNetworkHealth))

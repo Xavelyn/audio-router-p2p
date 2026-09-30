@@ -292,6 +292,151 @@ export interface SystemMetrics {
 }
 
 // ============================================================================
+// CLUSTER OBSERVABILITY & NETWORK HEALTH (ADR 0010 & ADR 0011)
+// ============================================================================
+
+export type NodeHealthGrade = 'EXCELLENT' | 'GOOD' | 'FAIR' | 'POOR' | 'CRITICAL';
+
+export interface ClockSyncHealth {
+  offset_us: number;
+  drift_ppm: number;
+  sync_rtt_us: number;
+  packets_sent: number;
+  packets_lost: number;
+  is_master: boolean;
+}
+
+export interface DiscoveryHealth {
+  active_members: number;
+  suspect_members: number;
+  dead_members: number;
+  lan_beacon_active: boolean;
+  beacons_sent: number;
+  beacons_received: number;
+  token_rejections: number;
+  seed_retry_active: boolean;
+  seed_join_attempts: number;
+  seed_join_successes: number;
+}
+
+export interface StreamLinkStats {
+  stream_id: string;
+  peer_id?: string;
+  packets_sent: number;
+  packets_received: number;
+  packets_lost: number;
+  loss_ratio: number;
+  effective_kbps: number;
+  jitter_depth_frames: number;
+  jitter_target_delay_ms: number;
+  underruns: number;
+  overruns: number;
+  fec_recovered: number;
+  plc_concealed: number;
+}
+
+export interface PeerLinkHealth {
+  peer_id: string;
+  address: string;
+  health_score: number;
+  health_grade: NodeHealthGrade | string;
+  swim_state: 'alive' | 'suspect' | 'dead' | string;
+  direct_ping_failed: boolean;
+  rtt_ms: number;
+  last_seen: string;
+  loss_ratio: number;
+  bitrate_kbps: number;
+  streaming?: StreamLinkStats;
+  sync?: ClockSyncHealth;
+}
+
+export interface NetworkHealthResponse {
+  node_id: string;
+  timestamp: string;
+  health_score: number;
+  health_grade: NodeHealthGrade | string;
+  cluster: DiscoveryHealth;
+  sync: ClockSyncHealth;
+  latency_matrix: Record<string, number>;
+  peers: Record<string, PeerLinkHealth>;
+  streams?: Record<string, StreamLinkStats>;
+  local_underruns: number;
+}
+
+export interface AudioDeviceSummary {
+  id: string;
+  device_id?: string;
+  node_id: string;
+  node_name?: string;
+  name: string;
+  direction: 'input' | 'output' | 'duplex' | string;
+  max_input: number;
+  max_output: number;
+  default_sample_rate: number;
+  is_virtual: boolean;
+  volume: number;
+  muted: boolean;
+  supported_layouts?: string[];
+  state?: string;
+}
+
+export type ClusterDeviceSummary = AudioDeviceSummary;
+
+export interface ClusterNodeSummary {
+  id: string;
+  node_id?: string;
+  name: string;
+  api_addr: string;
+  is_local: boolean;
+  swim_state: 'alive' | 'suspect' | 'dead' | string;
+  health_score: number;
+  health_grade: NodeHealthGrade | string;
+  clock_sync: ClockSyncHealth;
+  clock_role?: 'master' | 'slave' | string;
+  clock_offset_us?: number;
+  clock_drift_ppm?: number;
+  devices: AudioDeviceSummary[];
+  active_streams: number;
+  uptime_seconds?: number;
+  last_seen?: string;
+  error_reason?: string;
+  packet_loss_ratio?: number;
+  rtt_ms?: number;
+  bitrate_kbps?: number;
+}
+
+export interface ClusterNodesResponse {
+  cluster_id?: string;
+  total_nodes: number;
+  healthy_nodes: number;
+  degraded_nodes: number;
+  active_nodes?: number;
+  timestamp: string;
+  nodes: ClusterNodeSummary[];
+  nodes_map?: Record<string, ClusterNodeSummary>;
+  latency_matrix?: Record<string, Record<string, number>>;
+}
+
+export interface ClusterDevicesResponse {
+  timestamp: string;
+  devices: AudioDeviceSummary[];
+}
+
+export interface DeviceMutationRequest {
+  volume?: number;
+  muted?: boolean;
+}
+
+export interface DeviceMutationResponse {
+  id?: string;
+  device_id: string;
+  node_id: string;
+  volume: number;
+  muted: boolean;
+  updated_at: string;
+}
+
+// ============================================================================
 // HELPER CONVERSIONS
 // ============================================================================
 

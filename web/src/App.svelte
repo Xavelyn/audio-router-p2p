@@ -9,6 +9,7 @@
   import TelemetryDashboard from '$lib/components/telemetry/TelemetryDashboard.svelte';
   import { authStore } from '$lib/stores/auth.svelte';
   import { meterStore } from '$lib/stores/meters.svelte';
+  import { clusterStore } from '$lib/stores/cluster.svelte';
   import AlertCircle from '@lucide/svelte/icons/alert-circle';
   import X from '@lucide/svelte/icons/x';
   import Key from '@lucide/svelte/icons/key';
@@ -19,6 +20,7 @@
   onMount(() => {
     authStore.checkConnection();
     meterStore.init();
+    clusterStore.startPolling(2500);
   });
 </script>
 

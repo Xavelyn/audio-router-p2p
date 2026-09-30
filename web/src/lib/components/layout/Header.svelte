@@ -1,6 +1,7 @@
 <script lang="ts">
   import { authStore } from '$lib/stores/auth.svelte';
   import { peerStore } from '$lib/stores/peers.svelte';
+  import { clusterStore } from '$lib/stores/cluster.svelte';
   import { matrixStore } from '$lib/stores/matrix.svelte';
   import AuthModal from './AuthModal.svelte';
   import Radio from '@lucide/svelte/icons/radio';
@@ -26,7 +27,7 @@
     { id: 'meters', label: 'Live Meters', icon: Activity },
     { id: 'devices', label: 'Audio Devices', icon: Speaker },
     { id: 'rooms', label: 'Mesh Rooms', icon: Network },
-    { id: 'diagnostics', label: 'Diagnostics', icon: Cpu },
+    { id: 'diagnostics', label: 'Cluster Diagnostics', icon: Cpu },
   ];
 
   function getStatusBadge(status: string) {
@@ -43,6 +44,22 @@
   }
 
   const badge = $derived(getStatusBadge(authStore.connectionStatus));
+
+  const clusterHealthDotColor = $derived.by(() => {
+    const score = clusterStore.clusterHealthScore;
+    if (score >= 90) return 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]';
+    if (score >= 75) return 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]';
+    if (score >= 50) return 'bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.8)]';
+    return 'bg-red-400 shadow-[0_0_8px_rgba(248,113,113,0.8)]';
+  });
+
+  const clusterHealthTextColor = $derived.by(() => {
+    const score = clusterStore.clusterHealthScore;
+    if (score >= 90) return 'text-emerald-400';
+    if (score >= 75) return 'text-cyan-400';
+    if (score >= 50) return 'text-amber-400';
+    return 'text-red-400';
+  });
 </script>
 
 <header class="h-14 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur px-4 flex items-center justify-between select-none shrink-0 z-40">
@@ -95,6 +112,20 @@
 
   <!-- Status Badges & Auth Settings Action -->
   <div class="flex items-center gap-3">
+    <!-- Cluster Observability Status Badge (ADR 0011) -->
+    <button
+      onclick={() => (activeTab = 'diagnostics')}
+      class="flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/80 px-2.5 py-1 text-xs hover:border-cyan-500/50 hover:bg-zinc-800/80 transition-all font-mono"
+      title="Cluster Health: Click to open Cluster Observability Surface"
+    >
+      <span class="h-2 w-2 rounded-full {clusterHealthDotColor}"></span>
+      <span class="text-zinc-200 font-semibold">{clusterStore.nodes.length || 1} {clusterStore.nodes.length === 1 ? 'Node' : 'Nodes'}</span>
+      <span class="text-zinc-500 hidden sm:inline">&bull;</span>
+      <span class="{clusterHealthTextColor} font-bold hidden sm:inline">
+        {clusterStore.clusterHealthScore.toFixed(0)}% Health
+      </span>
+    </button>
+
     <!-- PTP Sync Indicator -->
     <div
       class="hidden md:flex items-center gap-1.5 rounded-md border border-zinc-800/80 bg-zinc-900/50 px-2 py-1 text-[11px] font-mono text-zinc-300"

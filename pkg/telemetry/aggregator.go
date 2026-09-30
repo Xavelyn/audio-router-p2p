@@ -12,6 +12,7 @@ import (
 type DiscoveredPeer struct {
 	ID         string
 	Addr       string
+	APIAddr    string
 	SyncAddr   string
 	StreamAddr string
 	LastSeen   time.Time

@@ -15,6 +15,11 @@ import type {
   UpdateRoomBindingsRequest,
   StreamStats,
   ErrorResponse,
+  NetworkHealthResponse,
+  ClusterNodesResponse,
+  ClusterDevicesResponse,
+  DeviceMutationRequest,
+  DeviceMutationResponse,
 } from './types';
 
 export class ApiError extends Error {
@@ -294,6 +299,37 @@ export class ApiClient {
 
   async getStreamStats(): Promise<Record<string, StreamStats>> {
     return this.request<Record<string, StreamStats>>('/api/v1/telemetry/stream-stats');
+  }
+
+  // ==========================================================================
+  // Cluster Observability & Remote Device Management (ADR 0010 & ADR 0011)
+  // ==========================================================================
+
+  async getNetworkHealth(): Promise<NetworkHealthResponse> {
+    return this.request<NetworkHealthResponse>('/api/v1/network/health');
+  }
+
+  async getClusterNodes(): Promise<ClusterNodesResponse> {
+    return this.request<ClusterNodesResponse>('/api/v1/cluster/nodes');
+  }
+
+  async getClusterDevices(direction?: string): Promise<ClusterDevicesResponse> {
+    const query = direction && direction !== 'all' ? `?direction=${encodeURIComponent(direction)}` : '';
+    return this.request<ClusterDevicesResponse>(`/api/v1/cluster/devices${query}`);
+  }
+
+  async patchClusterDevice(
+    nodeId: string,
+    deviceId: string,
+    req: DeviceMutationRequest
+  ): Promise<DeviceMutationResponse> {
+    return this.request<DeviceMutationResponse>(
+      `/api/v1/cluster/nodes/${encodeURIComponent(nodeId)}/devices/${encodeURIComponent(deviceId)}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(req),
+      }
+    );
   }
 }
 

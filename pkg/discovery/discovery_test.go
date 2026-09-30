@@ -334,6 +334,38 @@ func TestDiscoveryAddPeerMockHelper(t *testing.T) {
 	}
 }
 
+func TestValidAPIAddr(t *testing.T) {
+	valid := []string{
+		"http://127.0.0.1:8443",
+		"https://192.168.1.100:8443",
+		"http://stagebox.local:8080",
+		"https://[::1]:8443",
+		"http://node1:80",
+	}
+	for _, u := range valid {
+		if !ValidAPIAddr(u) {
+			t.Errorf("ValidAPIAddr(%q) = false, want true", u)
+		}
+	}
+
+	invalid := []string{
+		"",
+		"ftp://127.0.0.1:21",
+		"file:///etc/passwd",
+		"http://user:pass@127.0.0.1:8080",
+		"http://",
+		"http://:8080",
+		"http://127.0.0.1:99999",
+		"http://127.0.0.1:0",
+		"not-a-url",
+	}
+	for _, u := range invalid {
+		if ValidAPIAddr(u) {
+			t.Errorf("ValidAPIAddr(%q) = true, want false", u)
+		}
+	}
+}
+
 // TestDiscoveryPrune verifies TTL expiry of peers.
 func TestDiscoveryPrune(t *testing.T) {
 	d, err := New(testConfig("239.255.0.1", freeUDPPort(t)), "self")
@@ -479,5 +511,64 @@ func TestDiscoveryTelemetryCounters(t *testing.T) {
 	}
 	if state := d.PeerState("peer-test-1"); state != "alive" {
 		t.Errorf("expected alive state, got %s", state)
+	}
+}
+
+// TestDiscoveryAPIAddr verifies APIAddr derivation for TLS/plaintext and NodeMeta propagation.
+func TestDiscoveryAPIAddr(t *testing.T) {
+	// TLS enabled (default)
+	cfgTLS := testConfig("239.255.0.1", freeUDPPort(t))
+	cfgTLS.ListenAddr = "10.0.1.10:8443"
+	cfgTLS.AdvHost = "10.0.1.10"
+	cfgTLS.NoTLS = false
+
+	dTLS, err := New(cfgTLS, "node-tls")
+	if err != nil {
+		t.Fatalf("New dTLS: %v", err)
+	}
+	defer dTLS.Close()
+
+	if dTLS.APIAddr() != "https://10.0.1.10:8443" {
+		t.Errorf("dTLS.APIAddr() = %q, want %q", dTLS.APIAddr(), "https://10.0.1.10:8443")
+	}
+
+	metaBytes := dTLS.NodeMeta(0)
+	var meta nodeMetadata
+	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+		t.Fatalf("unmarshal meta: %v", err)
+	}
+	if meta.APIAddr != "https://10.0.1.10:8443" {
+		t.Errorf("meta.APIAddr = %q, want %q", meta.APIAddr, "https://10.0.1.10:8443")
+	}
+
+	// Plaintext HTTP (NoTLS = true)
+	cfgPlain := testConfig("239.255.0.1", freeUDPPort(t))
+	cfgPlain.ListenAddr = ":8080"
+	cfgPlain.AdvHost = "192.168.1.100"
+	cfgPlain.NoTLS = true
+
+	dPlain, err := New(cfgPlain, "node-plain")
+	if err != nil {
+		t.Fatalf("New dPlain: %v", err)
+	}
+	defer dPlain.Close()
+
+	if dPlain.APIAddr() != "http://192.168.1.100:8080" {
+		t.Errorf("dPlain.APIAddr() = %q, want %q", dPlain.APIAddr(), "http://192.168.1.100:8080")
+	}
+
+	// Add peer with APIAddr and check DiscoveredPeers
+	dTLS.AddPeer(&Peer{
+		ID:         "peer-remote-1",
+		Addr:       "10.0.1.11:45401",
+		APIAddr:    "https://10.0.1.11:8443",
+		SyncAddr:   "10.0.1.11:45402",
+		StreamAddr: "10.0.1.11:45678",
+		LastSeen:   time.Now(),
+	})
+
+	peers := dTLS.DiscoveredPeers()
+	if len(peers) != 1 || peers[0].APIAddr != "https://10.0.1.11:8443" {
+		t.Errorf("DiscoveredPeers APIAddr = %q, want %q", peers[0].APIAddr, "https://10.0.1.11:8443")
 	}
 }

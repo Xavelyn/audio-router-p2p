@@ -6,11 +6,13 @@ import (
 	"log"
 	"net/http"
 	stdSync "sync"
+	"time"
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/api/metrics"
 	"github.com/audio-router-p2p/pkg/api/telemetry"
 	v1 "github.com/audio-router-p2p/pkg/api/v1"
+	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
@@ -76,6 +78,8 @@ type Server struct {
 
 	aggregator       *netTelemetry.Aggregator
 	networkCollector *metrics.NetworkMetricsCollector
+
+	clusterMgr *cluster.Manager
 }
 
 // NewServer wires the API together. streams and roomMgr may be nil for read-only mode.
@@ -122,6 +126,25 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	s.networkCollector = metrics.NewNetworkMetricsCollector(s)
 	s.registry.MustRegister(s.networkCollector)
 
+	// Initialize cluster manager (ADR 0011)
+	clusterCfg := cluster.Config{
+		ScrapeInterval: 2 * time.Second,
+		ScrapeTimeout:  1500 * time.Millisecond,
+		MaxWorkers:     8,
+	}
+	if cfg != nil {
+		clusterCfg.AuthToken = cfg.AuthToken
+		clusterCfg.ClusterID = cfg.RoomID
+		if clusterCfg.ClusterID == "" {
+			clusterCfg.ClusterID = cfg.RoomName
+		}
+	}
+	s.clusterMgr = cluster.NewManager(
+		clusterCfg,
+		&localClusterNodeAdapter{s: s},
+		&clusterDiscoveryAdapter{disc: disc},
+	)
+
 	if rm != nil {
 		if rSetter, ok := rm.(interface{ SetRouter(*router.Router) }); ok && s.rt != nil {
 			rSetter.SetRouter(s.rt)
@@ -135,6 +158,7 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 	_ = s.Hub()
 	_ = s.V1()
 	s.V1().SetAggregator(s.aggregator)
+	s.V1().SetClusterManager(s.clusterMgr)
 
 	s.routes()
 	return s
@@ -159,6 +183,163 @@ func (s *Server) GetHealthSnapshot() *netTelemetry.NetworkHealthSnapshot {
 		return s.aggregator.GetHealthSnapshot()
 	}
 	return nil
+}
+
+// ClusterManager returns the cluster telemetry aggregator and device management subsystem.
+func (s *Server) ClusterManager() *cluster.Manager {
+	return s.clusterMgr
+}
+
+// SetClusterManager configures an external or custom cluster manager.
+func (s *Server) SetClusterManager(mgr *cluster.Manager) {
+	s.clusterMgr = mgr
+	if s.v1Server != nil {
+		s.v1Server.SetClusterManager(mgr)
+	}
+}
+
+// Close gracefully shuts down the API server and its background subsystems.
+func (s *Server) Close() error {
+	if s.clusterMgr != nil {
+		_ = s.clusterMgr.Close()
+	}
+	return nil
+}
+
+type localClusterNodeAdapter struct {
+	s *Server
+}
+
+func (a *localClusterNodeAdapter) NodeID() string {
+	if a.s.disc != nil {
+		return a.s.disc.NodeID()
+	}
+	return "local"
+}
+
+func (a *localClusterNodeAdapter) NodeName() string {
+	if a.s.cfg != nil && a.s.cfg.AdvHost != "" {
+		return a.s.cfg.AdvHost
+	}
+	return a.NodeID()
+}
+
+func (a *localClusterNodeAdapter) APIAddr() string {
+	if a.s.disc != nil {
+		return a.s.disc.APIAddr()
+	}
+	return ""
+}
+
+func (a *localClusterNodeAdapter) UptimeSeconds() float64 {
+	return a.s.V1().UptimeSeconds()
+}
+
+func (a *localClusterNodeAdapter) ListDevices(kind string) ([]cluster.AudioDeviceSummary, error) {
+	devs, err := a.s.V1().DeviceRegistry().ListDevices(kind)
+	if err != nil {
+		return nil, err
+	}
+	nodeID := a.NodeID()
+	nodeName := a.NodeName()
+	out := make([]cluster.AudioDeviceSummary, len(devs))
+	for i, d := range devs {
+		direction := "duplex"
+		if d.MaxInput > 0 && d.MaxOutput == 0 {
+			direction = "input"
+		} else if d.MaxOutput > 0 && d.MaxInput == 0 {
+			direction = "output"
+		}
+		out[i] = cluster.AudioDeviceSummary{
+			ID:                d.ID,
+			DeviceID:          d.ID,
+			NodeID:            nodeID,
+			NodeName:          nodeName,
+			Name:              d.Name,
+			Direction:         direction,
+			MaxInput:          d.MaxInput,
+			MaxOutput:         d.MaxOutput,
+			DefaultSampleRate: d.DefaultSampleRate,
+			IsVirtual:         d.IsVirtual,
+			Volume:            d.Volume,
+			Muted:             d.Muted,
+			SupportedLayouts:  d.SupportedLayouts,
+			State:             "active",
+		}
+	}
+	return out, nil
+}
+
+func (a *localClusterNodeAdapter) UpdateDeviceState(id string, vol *float64, muted *bool) (cluster.AudioDeviceSummary, bool) {
+	dev, found := a.s.V1().DeviceRegistry().UpdateDeviceState(id, vol, muted)
+	if !found {
+		return cluster.AudioDeviceSummary{}, false
+	}
+	direction := "duplex"
+	if dev.MaxInput > 0 && dev.MaxOutput == 0 {
+		direction = "input"
+	} else if dev.MaxOutput > 0 && dev.MaxInput == 0 {
+		direction = "output"
+	}
+	return cluster.AudioDeviceSummary{
+		ID:                dev.ID,
+		DeviceID:          dev.ID,
+		NodeID:            a.NodeID(),
+		NodeName:          a.NodeName(),
+		Name:              dev.Name,
+		Direction:         direction,
+		MaxInput:          dev.MaxInput,
+		MaxOutput:         dev.MaxOutput,
+		DefaultSampleRate: dev.DefaultSampleRate,
+		IsVirtual:         dev.IsVirtual,
+		Volume:            dev.Volume,
+		Muted:             dev.Muted,
+		SupportedLayouts:  dev.SupportedLayouts,
+		State:             "active",
+	}, true
+}
+
+func (a *localClusterNodeAdapter) HealthSnapshot() *netTelemetry.NetworkHealthSnapshot {
+	return a.s.GetHealthSnapshot()
+}
+
+func (a *localClusterNodeAdapter) ActiveStreams() int {
+	if a.s.streams != nil {
+		return len(a.s.streams.Stats())
+	}
+	return 0
+}
+
+type clusterDiscoveryAdapter struct {
+	disc *discovery.Discovery
+}
+
+func (a *clusterDiscoveryAdapter) NodeID() string {
+	if a.disc != nil {
+		return a.disc.NodeID()
+	}
+	return "local"
+}
+
+func (a *clusterDiscoveryAdapter) Peers() []discovery.Peer {
+	if a.disc != nil {
+		return a.disc.Peers()
+	}
+	return nil
+}
+
+func (a *clusterDiscoveryAdapter) PeerByID(id string) *discovery.Peer {
+	if a.disc != nil {
+		return a.disc.PeerByID(id)
+	}
+	return nil
+}
+
+func (a *clusterDiscoveryAdapter) PeerState(id string) string {
+	if a.disc != nil {
+		return a.disc.PeerState(id)
+	}
+	return "alive"
 }
 
 type streamProviderAdapter struct {

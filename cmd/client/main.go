@@ -144,6 +144,11 @@ func main() {
 		defer agg.Stop()
 	}
 
+	if cm := apiSrv.ClusterManager(); cm != nil {
+		cm.Start(context.Background())
+		defer cm.Stop()
+	}
+
 	if cfg.NoTLS {
 		go func() {
 			log.Printf("API listening on http://%s (plaintext HTTP)", cfg.ListenAddr)
@@ -178,6 +183,11 @@ func main() {
 	if agg := apiSrv.Aggregator(); agg != nil {
 		agg.Stop()
 	}
+
+	if cm := apiSrv.ClusterManager(); cm != nil {
+		cm.Stop()
+	}
+	_ = apiSrv.Close()
 
 	_ = roomMgr.Close()
 	streams.StopAll()

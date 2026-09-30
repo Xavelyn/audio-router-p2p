@@ -10,8 +10,10 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,9 +39,10 @@ var (
 // Peer is a node discovered on the network.
 type Peer struct {
 	ID         string    `json:"id"`
-	Addr       string    `json:"addr"`       // unicast discovery/control address host:port
-	SyncAddr   string    `json:"syncAddr"`   // clock-sync address host:port
-	StreamAddr string    `json:"streamAddr"` // audio stream address host:port
+	Addr       string    `json:"addr"`                 // unicast discovery/control address host:port
+	APIAddr    string    `json:"apiAddr,omitempty"`    // HTTP/HTTPS control plane base URL
+	SyncAddr   string    `json:"syncAddr"`             // clock-sync address host:port
+	StreamAddr string    `json:"streamAddr"`           // audio stream address host:port
 	LastSeen   time.Time `json:"lastSeen"`
 }
 
@@ -47,6 +50,7 @@ type Peer struct {
 type nodeMetadata struct {
 	ID         string `json:"id"`
 	Addr       string `json:"addr,omitempty"`
+	APIAddr    string `json:"apiAddr,omitempty"`
 	SyncAddr   string `json:"syncAddr"`
 	StreamAddr string `json:"streamAddr"`
 	AuthToken  string `json:"authToken,omitempty"`
@@ -75,12 +79,13 @@ type Discovery struct {
 	cfg    *config.Config
 	nodeID string
 
-	mu        sync.RWMutex
-	peers     map[string]*Peer
-	ownAddr   string
-	ownSync   string
-	ownStream string
-	boundPort int
+	mu         sync.RWMutex
+	peers      map[string]*Peer
+	ownAddr    string
+	ownAPIAddr string
+	ownSync    string
+	ownStream  string
+	boundPort  int
 
 	mlistMu sync.RWMutex
 	mlist   *memberlist.Memberlist
@@ -284,6 +289,7 @@ func (d *Discovery) DiscoveredPeers() []telemetry.DiscoveredPeer {
 		result[i] = telemetry.DiscoveredPeer{
 			ID:         p.ID,
 			Addr:       p.Addr,
+			APIAddr:    p.APIAddr,
 			SyncAddr:   p.SyncAddr,
 			StreamAddr: p.StreamAddr,
 			LastSeen:   p.LastSeen,
@@ -314,6 +320,13 @@ func (d *Discovery) PeerState(peerID string) string {
 		}
 	}
 	return "alive"
+}
+
+// APIAddr returns this node's advertised HTTP/HTTPS control plane base URL.
+func (d *Discovery) APIAddr() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.ownAPIAddr
 }
 
 // OwnAddr is this node's advertised discovery control address.
@@ -477,10 +490,37 @@ func (d *Discovery) setup() error {
 		}
 	}
 
-	// Pre-populate ownSync and ownStream so that NodeMeta() has them available during Memberlist init
+	// Determine APIAddr scheme, host, and port
+	scheme := "https"
+	if d.cfg != nil && d.cfg.NoTLS {
+		scheme = "http"
+	}
+
+	apiHost := advertisedIP
+	apiPort := "8443"
+	if d.cfg != nil && d.cfg.ListenAddr != "" {
+		h, p, err := net.SplitHostPort(d.cfg.ListenAddr)
+		if err == nil {
+			if p != "" {
+				apiPort = p
+			}
+			if h != "" && h != "0.0.0.0" && (d.cfg.AdvHost == "" || d.cfg.AdvHost == "0.0.0.0") {
+				apiHost = h
+			}
+		} else {
+			trimmed := strings.TrimPrefix(d.cfg.ListenAddr, ":")
+			if _, err := strconv.Atoi(trimmed); err == nil {
+				apiPort = trimmed
+			}
+		}
+	}
+	apiAddr := fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(apiHost, apiPort))
+
+	// Pre-populate ownSync, ownStream, and ownAPIAddr so that NodeMeta() has them available during Memberlist init
 	d.mu.Lock()
 	d.ownSync = net.JoinHostPort(advertisedIP, strconv.Itoa(syncPort))
 	d.ownStream = net.JoinHostPort(advertisedIP, streamPort)
+	d.ownAPIAddr = apiAddr
 	d.mu.Unlock()
 
 	// Memberlist configuration based on DefaultLANConfig
@@ -602,6 +642,7 @@ func (d *Discovery) NodeMeta(limit int) []byte {
 	meta := nodeMetadata{
 		ID:         d.nodeID,
 		Addr:       d.ownAddr,
+		APIAddr:    d.ownAPIAddr,
 		SyncAddr:   d.ownSync,
 		StreamAddr: d.ownStream,
 		AuthToken:  d.cfg.AuthToken,
@@ -662,6 +703,9 @@ func (d *Discovery) NotifyAlive(peer *memberlist.Node) error {
 	d.mu.Lock()
 	if p, ok := d.peers[peer.Name]; ok {
 		p.LastSeen = now
+		if meta.APIAddr != "" && ValidAPIAddr(meta.APIAddr) {
+			p.APIAddr = meta.APIAddr
+		}
 	}
 	d.mu.Unlock()
 
@@ -685,18 +729,22 @@ func (d *Discovery) NotifyJoin(node *memberlist.Node) {
 	}
 
 	// Validate endpoint addresses
-	var syncAddr, streamAddr string
+	var syncAddr, streamAddr, apiAddr string
 	if meta.SyncAddr != "" && ValidAddr(meta.SyncAddr) {
 		syncAddr = meta.SyncAddr
 	}
 	if meta.StreamAddr != "" && ValidAddr(meta.StreamAddr) {
 		streamAddr = meta.StreamAddr
 	}
+	if meta.APIAddr != "" && ValidAPIAddr(meta.APIAddr) {
+		apiAddr = meta.APIAddr
+	}
 
 	addr := node.Address()
 	p := &Peer{
 		ID:         peerID,
 		Addr:       addr,
+		APIAddr:    apiAddr,
 		SyncAddr:   syncAddr,
 		StreamAddr: streamAddr,
 		LastSeen:   time.Now(),
@@ -704,7 +752,7 @@ func (d *Discovery) NotifyJoin(node *memberlist.Node) {
 	d.mu.Lock()
 	d.peers[peerID] = p
 	d.mu.Unlock()
-	log.Printf("[MEMBERLIST:JOIN] Node=%s Addr=%s StreamAddr=%s SyncAddr=%s", peerID, addr, streamAddr, syncAddr)
+	log.Printf("[MEMBERLIST:JOIN] Node=%s Addr=%s APIAddr=%s StreamAddr=%s SyncAddr=%s", peerID, addr, meta.APIAddr, streamAddr, syncAddr)
 }
 
 // NotifyLeave is invoked when a peer leaves the cluster or fails failure detection.
@@ -740,6 +788,9 @@ func (d *Discovery) NotifyUpdate(node *memberlist.Node) {
 	d.mu.Lock()
 	if p, ok := d.peers[peerID]; ok {
 		p.Addr = addr
+		if meta.APIAddr != "" && ValidAPIAddr(meta.APIAddr) {
+			p.APIAddr = meta.APIAddr
+		}
 		if meta.SyncAddr != "" && ValidAddr(meta.SyncAddr) {
 			p.SyncAddr = meta.SyncAddr
 		}
@@ -748,23 +799,27 @@ func (d *Discovery) NotifyUpdate(node *memberlist.Node) {
 		}
 		p.LastSeen = now
 	} else {
-		var syncAddr, streamAddr string
+		var syncAddr, streamAddr, apiAddr string
 		if meta.SyncAddr != "" && ValidAddr(meta.SyncAddr) {
 			syncAddr = meta.SyncAddr
 		}
 		if meta.StreamAddr != "" && ValidAddr(meta.StreamAddr) {
 			streamAddr = meta.StreamAddr
 		}
+		if meta.APIAddr != "" && ValidAPIAddr(meta.APIAddr) {
+			apiAddr = meta.APIAddr
+		}
 		d.peers[peerID] = &Peer{
 			ID:         peerID,
 			Addr:       addr,
+			APIAddr:    apiAddr,
 			SyncAddr:   syncAddr,
 			StreamAddr: streamAddr,
 			LastSeen:   now,
 		}
 	}
 	d.mu.Unlock()
-	log.Printf("[MEMBERLIST:UPDATE] Node=%s Addr=%s StreamAddr=%s SyncAddr=%s", peerID, addr, meta.StreamAddr, meta.SyncAddr)
+	log.Printf("[MEMBERLIST:UPDATE] Node=%s Addr=%s APIAddr=%s StreamAddr=%s SyncAddr=%s", peerID, addr, meta.APIAddr, meta.StreamAddr, meta.SyncAddr)
 }
 
 // NotifyConflict is invoked when a node ID conflict is detected.
@@ -1197,4 +1252,37 @@ func ValidAddr(addr string) bool {
 	}
 	p, err := strconv.Atoi(port)
 	return err == nil && p > 0 && p <= 65535
+}
+
+// ValidAPIAddr reports whether apiAddr is a valid http or https URL with a non-empty host.
+// It explicitly denies userinfo (credentials in URL) and non-HTTP schemes to prevent SSRF.
+func ValidAPIAddr(rawURL string) bool {
+	if rawURL == "" {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return false
+	}
+	if u.User != nil || u.Host == "" {
+		return false
+	}
+	host, port, err := net.SplitHostPort(u.Host)
+	if err != nil {
+		host = u.Host
+		port = ""
+	}
+	if host == "" {
+		return false
+	}
+	if port != "" {
+		p, err := strconv.Atoi(port)
+		if err != nil || p <= 0 || p > 65535 {
+			return false
+		}
+	}
+	return true
 }
