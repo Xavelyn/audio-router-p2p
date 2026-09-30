@@ -18,18 +18,22 @@ const blocksPerBuffer = 256
 var paInitCount atomic.Int32
 
 func initPortAudio() error {
-	if paInitCount.Add(1) == 1 {
-		if err := portaudio.Initialize(); err != nil {
-			paInitCount.Add(-1)
-			return err
+	return withSuppressedStderrErr(func() error {
+		if paInitCount.Add(1) == 1 {
+			if err := portaudio.Initialize(); err != nil {
+				paInitCount.Add(-1)
+				return err
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func termPortAudio() {
 	if paInitCount.Add(-1) == 0 {
-		_ = portaudio.Terminate()
+		suppressStderr(func() {
+			_ = portaudio.Terminate()
+		})
 	}
 }
 
@@ -43,22 +47,24 @@ type portaudioInput struct {
 }
 
 func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
-	if deviceID < 0 {
-		return portaudio.DefaultInputDevice()
-	}
-	devs, err := portaudio.Devices()
-	if err != nil {
-		return nil, err
-	}
-	for _, d := range devs {
-		if d.Index == deviceID {
-			if d.MaxInputChannels < 1 {
-				return nil, fmt.Errorf("device %q has no input channels", d.Name)
-			}
-			return d, nil
+	return withSuppressedStderr(func() (*portaudio.DeviceInfo, error) {
+		if deviceID < 0 {
+			return portaudio.DefaultInputDevice()
 		}
-	}
-	return nil, fmt.Errorf("input device %d not found", deviceID)
+		devs, err := portaudio.Devices()
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range devs {
+			if d.Index == deviceID {
+				if d.MaxInputChannels < 1 {
+					return nil, fmt.Errorf("device %q has no input channels", d.Name)
+				}
+				return d, nil
+			}
+		}
+		return nil, fmt.Errorf("input device %d not found", deviceID)
+	})
 }
 
 // OpenInput returns an AudioStream for the given device ID. With useEmulator it
@@ -74,43 +80,39 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 	if channels < 1 {
 		return nil, fmt.Errorf("invalid channel count %d", channels)
 	}
-	if paInitCount.Add(1) == 1 {
-		if err := portaudio.Initialize(); err != nil {
-			paInitCount.Add(-1)
-			return nil, err
-		}
+	if err := initPortAudio(); err != nil {
+		return nil, err
 	}
 	dev, err := resolveInputDevice(deviceID)
 	if err != nil {
-		if paInitCount.Add(-1) == 0 {
-			portaudio.Terminate()
-		}
+		termPortAudio()
 		return nil, err
 	}
 	if channels > dev.MaxInputChannels {
 		channels = dev.MaxInputChannels
 	}
 	buf := make([]int16, blocksPerBuffer*channels)
-	st, err := portaudio.OpenStream(portaudio.StreamParameters{
-		Input: portaudio.StreamDeviceParameters{
-			Device:   dev,
-			Channels: channels,
-			Latency:  dev.DefaultLowInputLatency,
-		},
-		SampleRate:      float64(sampleRate),
-		FramesPerBuffer: blocksPerBuffer,
-	}, &buf)
+	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
+		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
+			Input: portaudio.StreamDeviceParameters{
+				Device:   dev,
+				Channels: channels,
+				Latency:  dev.DefaultLowInputLatency,
+			},
+			SampleRate:      float64(sampleRate),
+			FramesPerBuffer: blocksPerBuffer,
+		}, &buf)
+		if oErr != nil {
+			return nil, oErr
+		}
+		if sErr := s.Start(); sErr != nil {
+			s.Close()
+			return nil, sErr
+		}
+		return s, nil
+	})
 	if err != nil {
-		if paInitCount.Add(-1) == 0 {
-			portaudio.Terminate()
-		}
-		return nil, err
-	}
-	if err := st.Start(); err != nil {
-		st.Close()
-		if paInitCount.Add(-1) == 0 {
-			portaudio.Terminate()
-		}
+		termPortAudio()
 		return nil, err
 	}
 	return &portaudioInput{stream: st, buf: buf}, nil
@@ -152,10 +154,11 @@ func (p *portaudioInput) Close() error {
 	}
 	p.closed = true
 	_ = p.stream.Stop()
-	err := p.stream.Close()
-	if paInitCount.Add(-1) == 0 {
-		portaudio.Terminate()
-	}
+	var err error
+	suppressStderr(func() {
+		err = p.stream.Close()
+	})
+	termPortAudio()
 	return err
 }
 
@@ -173,22 +176,24 @@ type portaudioOutput struct {
 }
 
 func resolveOutputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
-	if deviceID < 0 {
-		return portaudio.DefaultOutputDevice()
-	}
-	devs, err := portaudio.Devices()
-	if err != nil {
-		return nil, err
-	}
-	for _, d := range devs {
-		if d.Index == deviceID {
-			if d.MaxOutputChannels < 1 {
-				return nil, fmt.Errorf("device %q has no output channels", d.Name)
-			}
-			return d, nil
+	return withSuppressedStderr(func() (*portaudio.DeviceInfo, error) {
+		if deviceID < 0 {
+			return portaudio.DefaultOutputDevice()
 		}
-	}
-	return nil, fmt.Errorf("output device %d not found", deviceID)
+		devs, err := portaudio.Devices()
+		if err != nil {
+			return nil, err
+		}
+		for _, d := range devs {
+			if d.Index == deviceID {
+				if d.MaxOutputChannels < 1 {
+					return nil, fmt.Errorf("device %q has no output channels", d.Name)
+				}
+				return d, nil
+			}
+		}
+		return nil, fmt.Errorf("output device %d not found", deviceID)
+	})
 }
 
 // OpenOutput returns an AudioStream for the given device ID. With useEmulator
@@ -200,43 +205,39 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 	if sampleRate <= 0 || channels < 1 {
 		return nil, fmt.Errorf("invalid sample rate %d / channels %d", sampleRate, channels)
 	}
-	if paInitCount.Add(1) == 1 {
-		if err := portaudio.Initialize(); err != nil {
-			paInitCount.Add(-1)
-			return nil, err
-		}
+	if err := initPortAudio(); err != nil {
+		return nil, err
 	}
 	dev, err := resolveOutputDevice(deviceID)
 	if err != nil {
-		if paInitCount.Add(-1) == 0 {
-			portaudio.Terminate()
-		}
+		termPortAudio()
 		return nil, err
 	}
 	if channels > dev.MaxOutputChannels {
 		channels = dev.MaxOutputChannels
 	}
 	buf := make([]int16, blocksPerBuffer*channels)
-	st, err := portaudio.OpenStream(portaudio.StreamParameters{
-		Output: portaudio.StreamDeviceParameters{
-			Device:   dev,
-			Channels: channels,
-			Latency:  dev.DefaultLowOutputLatency,
-		},
-		SampleRate:      float64(sampleRate),
-		FramesPerBuffer: blocksPerBuffer,
-	}, &buf)
+	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
+		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
+			Output: portaudio.StreamDeviceParameters{
+				Device:   dev,
+				Channels: channels,
+				Latency:  dev.DefaultLowOutputLatency,
+			},
+			SampleRate:      float64(sampleRate),
+			FramesPerBuffer: blocksPerBuffer,
+		}, &buf)
+		if oErr != nil {
+			return nil, oErr
+		}
+		if sErr := s.Start(); sErr != nil {
+			s.Close()
+			return nil, sErr
+		}
+		return s, nil
+	})
 	if err != nil {
-		if paInitCount.Add(-1) == 0 {
-			portaudio.Terminate()
-		}
-		return nil, err
-	}
-	if err := st.Start(); err != nil {
-		st.Close()
-		if paInitCount.Add(-1) == 0 {
-			portaudio.Terminate()
-		}
+		termPortAudio()
 		return nil, err
 	}
 	return &portaudioOutput{
@@ -285,9 +286,10 @@ func (o *portaudioOutput) Close() error {
 	}
 	o.closed = true
 	_ = o.stream.Abort()
-	err := o.stream.Close()
-	if paInitCount.Add(-1) == 0 {
-		portaudio.Terminate()
-	}
+	var err error
+	suppressStderr(func() {
+		err = o.stream.Close()
+	})
+	termPortAudio()
 	return err
 }
