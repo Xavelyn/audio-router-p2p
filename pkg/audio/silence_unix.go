@@ -1,31 +1,12 @@
-//go:build linux
+//go:build unix
 
 package audio
-
-/*
-#cgo LDFLAGS: -lasound
-#include <alsa/asoundlib.h>
-
-static void quiet_alsa_error_handler(const char *file, int line, const char *function, int err, const char *fmt, ...) {
-    // Suppress ALSA library error outputs to stderr
-}
-
-static void silence_alsa() {
-    snd_lib_error_set_handler(quiet_alsa_error_handler);
-}
-*/
-import "C"
 
 import (
 	"os"
 	"sync"
 	"syscall"
 )
-
-func init() {
-	// Silence ALSA internal error logging permanently
-	C.silence_alsa()
-}
 
 var (
 	silenceMu    sync.Mutex
@@ -37,7 +18,7 @@ var (
 // suppressStderr executes fn while temporarily redirecting OS stderr (fd 2) to /dev/null.
 // This silences C/C++ library probe spam from ALSA and JACK (e.g. jack server not running,
 // unknown PCM phoneline, modem) during PortAudio initialization, device enumeration, and termination.
-// Reentrant and concurrent-safe.
+// Reentrant and concurrent-safe across goroutines.
 func suppressStderr(fn func()) {
 	silenceMu.Lock()
 	if silenceDepth == 0 {
