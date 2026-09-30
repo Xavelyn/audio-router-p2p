@@ -20,6 +20,7 @@ var (
 type AudioDeviceSummary struct {
 	ID                string   `json:"id"`
 	DeviceID          string   `json:"device_id,omitempty"`
+	URN               string   `json:"urn,omitempty"`
 	NodeID            string   `json:"node_id"`
 	NodeName          string   `json:"node_name,omitempty"`
 	Name              string   `json:"name"`

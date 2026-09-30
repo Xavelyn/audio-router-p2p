@@ -284,6 +284,12 @@
                         <span class="rounded bg-blue-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-blue-400 border border-blue-500/20">
                           INPUT
                         </span>
+
+                        {#if dev.status === 'quarantined'}
+                          <span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40 animate-pulse">
+                            GHOST (OFFLINE)
+                          </span>
+                        {/if}
                       </div>
 
                       <span class="rounded bg-zinc-950/80 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800">
@@ -390,6 +396,12 @@
                         <span class="rounded bg-purple-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-purple-400 border border-purple-500/20">
                           OUTPUT
                         </span>
+
+                        {#if dev.status === 'quarantined'}
+                          <span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40 animate-pulse">
+                            GHOST (OFFLINE)
+                          </span>
+                        {/if}
                       </div>
 
                       <span class="rounded bg-zinc-950/80 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800">

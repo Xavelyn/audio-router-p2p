@@ -17,6 +17,22 @@ const blocksPerBuffer = 256
 
 var paInitCount atomic.Int32
 
+func initPortAudio() error {
+	if paInitCount.Add(1) == 1 {
+		if err := portaudio.Initialize(); err != nil {
+			paInitCount.Add(-1)
+			return err
+		}
+	}
+	return nil
+}
+
+func termPortAudio() {
+	if paInitCount.Add(-1) == 0 {
+		_ = portaudio.Terminate()
+	}
+}
+
 // portaudioInput wraps a blocking PortAudio input stream and exposes it as a
 // byte-oriented AudioStream (little-endian int16 PCM).
 type portaudioInput struct {

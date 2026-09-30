@@ -47,7 +47,9 @@
 <div
   class="relative w-72 rounded-xl border bg-zinc-900/95 backdrop-blur-md p-3.5 shadow-2xl transition-all select-none {selected
     ? 'border-cyan-400 ring-2 ring-cyan-500/30 shadow-cyan-500/20'
-    : 'border-zinc-800 hover:border-zinc-700 shadow-black/60'}"
+    : data.device.status === 'quarantined'
+      ? 'border-amber-500/60 ring-1 ring-amber-500/30'
+      : 'border-zinc-800 hover:border-zinc-700 shadow-black/60'}"
 >
   <!-- Svelte Flow Source Handle (Left-to-Right audio signal flow) -->
   <Handle
@@ -80,6 +82,11 @@
 
     <!-- Direction Badges & Dismiss -->
     <div class="flex items-center gap-1 shrink-0">
+      {#if data.device.status === 'quarantined'}
+        <span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-amber-300 border border-amber-500/40 animate-pulse" title="Device disconnected: Pacing zero silence">
+          GHOST
+        </span>
+      {/if}
       <span class="rounded bg-cyan-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-cyan-300 border border-cyan-500/40">
         INPUT
       </span>

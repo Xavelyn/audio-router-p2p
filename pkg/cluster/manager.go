@@ -547,6 +547,7 @@ func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterN
 	var rawDevices []struct {
 		ID                string   `json:"id"`
 		DeviceID          string   `json:"device_id"`
+		URN               string   `json:"urn"`
 		Name              string   `json:"name"`
 		Direction         string   `json:"direction"`
 		MaxInput          int      `json:"max_input"`
@@ -568,7 +569,10 @@ func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterN
 
 	peerDevices := make([]AudioDeviceSummary, len(rawDevices))
 	for i, d := range rawDevices {
-		devID := d.ID
+		devID := d.URN
+		if devID == "" {
+			devID = d.ID
+		}
 		if devID == "" {
 			devID = d.DeviceID
 		}
@@ -592,6 +596,7 @@ func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterN
 		peerDevices[i] = AudioDeviceSummary{
 			ID:                devID,
 			DeviceID:          devID,
+			URN:               devID,
 			NodeID:            peer.ID,
 			NodeName:          peer.ID,
 			Name:              d.Name,
@@ -741,7 +746,13 @@ func (m *Manager) MutateRemoteDevice(ctx context.Context, nodeID string, deviceI
 		return nil, fmt.Errorf("%w: node %s is dead or circuit breaker is open", ErrRemoteNodeUnavailable, nodeID)
 	}
 
-	targetURL := strings.TrimRight(peer.APIAddr, "/") + "/api/v1/devices/" + url.PathEscape(deviceID)
+	localDevID := deviceID
+	prefix := fmt.Sprintf("urn:audio:node:%s:dev:", nodeID)
+	if strings.HasPrefix(localDevID, prefix) {
+		localDevID = strings.TrimPrefix(localDevID, prefix)
+	}
+
+	targetURL := strings.TrimRight(peer.APIAddr, "/") + "/api/v1/devices/" + url.PathEscape(localDevID)
 	bodyBytes, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidParameter, err)

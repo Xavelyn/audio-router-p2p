@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/audio-router-p2p/pkg/audio"
+	"github.com/audio-router-p2p/pkg/audio/urn"
 )
 
 // DeviceState tracks runtime volume and mute settings for an audio device.
@@ -26,8 +28,8 @@ type VirtualDeviceEntry struct {
 // DeviceRegistry abstracts physical sound cards and in-memory virtual loopback interfaces.
 type DeviceRegistry struct {
 	mu           sync.RWMutex
-	virtualDevs  map[string]*VirtualDeviceEntry
-	deviceStates map[string]*DeviceState
+	virtualDevs  map[string]*VirtualDeviceEntry // Keyed by canonical URN
+	deviceStates map[string]*DeviceState        // Keyed by canonical URN
 	nextVirtID   int
 }
 
@@ -69,8 +71,15 @@ func (reg *DeviceRegistry) ListDevices(kind string) ([]AudioDevice, error) {
 		phys, err := audio.ListDevices()
 		if err == nil {
 			for _, d := range phys {
-				idStr := strconv.Itoa(d.ID)
-				state := reg.deviceStates[idStr]
+				urnKey := d.URN
+				if urnKey == "" {
+					urnKey = d.ID
+				}
+				state := reg.deviceStates[urnKey]
+				if state == nil && d.LegacyID != "" {
+					state = reg.deviceStates[d.LegacyID]
+				}
+
 				vol := 1.0
 				muted := false
 				if state != nil {
@@ -82,13 +91,22 @@ func (reg *DeviceRegistry) ListDevices(kind string) ([]AudioDevice, error) {
 					maxCh = d.MaxOutput
 				}
 
+				status := d.Status
+				if status == "" {
+					status = "active"
+				}
+
 				dev := AudioDevice{
-					ID:                idStr,
+					ID:                urnKey,
+					URN:               urnKey,
+					LegacyID:          d.LegacyID,
 					Name:              d.Name,
 					MaxInput:          d.MaxInput,
 					MaxOutput:         d.MaxOutput,
 					DefaultSampleRate: d.DefaultSampleRate,
 					IsVirtual:         false,
+					State:             status,
+					Status:            status,
 					Volume:            vol,
 					Muted:             muted,
 					SupportedLayouts:  GetSupportedLayouts(maxCh),
@@ -110,7 +128,10 @@ func (reg *DeviceRegistry) ListDevices(kind string) ([]AudioDevice, error) {
 	if kind == "all" || kind == "virtual" || kind == "input" || kind == "output" {
 		for _, vd := range reg.virtualDevs {
 			d := vd.Device
-			state := reg.deviceStates[d.ID]
+			state := reg.deviceStates[d.URN]
+			if state == nil && d.LegacyID != "" {
+				state = reg.deviceStates[d.LegacyID]
+			}
 			if state != nil {
 				d.Volume = state.Volume
 				d.Muted = state.Muted
@@ -131,30 +152,59 @@ func (reg *DeviceRegistry) ListDevices(kind string) ([]AudioDevice, error) {
 	return result, nil
 }
 
-// GetDevice retrieves device metadata by ID.
+// GetDevice retrieves device metadata by canonical URN or legacy alias.
 func (reg *DeviceRegistry) GetDevice(id string) (AudioDevice, bool) {
 	reg.mu.RLock()
 	defer reg.mu.RUnlock()
 
-	// Check virtual devices
+	id = strings.TrimSpace(id)
+	if unescaped, err := url.PathUnescape(id); err == nil && unescaped != "" {
+		id = unescaped
+	}
+
+	// 1. Check virtual devices by URN or legacy ID
 	if vd, ok := reg.virtualDevs[id]; ok {
 		d := vd.Device
-		if state := reg.deviceStates[id]; state != nil {
+		if state := reg.deviceStates[d.URN]; state != nil {
 			d.Volume = state.Volume
 			d.Muted = state.Muted
 		}
 		return d, true
 	}
+	for _, vd := range reg.virtualDevs {
+		if vd.Device.URN == id || vd.Device.LegacyID == id || vd.Device.ID == id {
+			d := vd.Device
+			if state := reg.deviceStates[d.URN]; state != nil {
+				d.Volume = state.Volume
+				d.Muted = state.Muted
+			}
+			return d, true
+		}
+	}
 
-	// Check physical devices
+	// 2. Check physical devices
 	phys, err := audio.ListDevices()
 	if err == nil {
 		for _, d := range phys {
-			idStr := strconv.Itoa(d.ID)
-			if idStr == id {
+			urnKey := d.URN
+			if urnKey == "" {
+				urnKey = d.ID
+			}
+			if urnKey == id ||
+				d.ID == id ||
+				d.LegacyID == id ||
+				strconv.Itoa(d.RuntimeID) == id ||
+				fmt.Sprintf("hw:%d", d.RuntimeID) == id ||
+				fmt.Sprintf("hw:%d,0", d.RuntimeID) == id ||
+				urn.Slugify(d.Name) == id {
+
 				vol := 1.0
 				muted := false
-				if state := reg.deviceStates[idStr]; state != nil {
+				state := reg.deviceStates[urnKey]
+				if state == nil && d.LegacyID != "" {
+					state = reg.deviceStates[d.LegacyID]
+				}
+				if state != nil {
 					vol = state.Volume
 					muted = state.Muted
 				}
@@ -162,13 +212,22 @@ func (reg *DeviceRegistry) GetDevice(id string) (AudioDevice, bool) {
 				if d.MaxOutput > maxCh {
 					maxCh = d.MaxOutput
 				}
+				status := d.Status
+				if status == "" {
+					status = "active"
+				}
+
 				return AudioDevice{
-					ID:                idStr,
+					ID:                urnKey,
+					URN:               urnKey,
+					LegacyID:          d.LegacyID,
 					Name:              d.Name,
 					MaxInput:          d.MaxInput,
 					MaxOutput:         d.MaxOutput,
 					DefaultSampleRate: d.DefaultSampleRate,
 					IsVirtual:         false,
+					State:             status,
+					Status:            status,
 					Volume:            vol,
 					Muted:             muted,
 					SupportedLayouts:  GetSupportedLayouts(maxCh),
@@ -182,13 +241,24 @@ func (reg *DeviceRegistry) GetDevice(id string) (AudioDevice, bool) {
 
 // UpdateDeviceState modifies volume and/or muted state for a device.
 func (reg *DeviceRegistry) UpdateDeviceState(id string, vol *float64, muted *bool) (AudioDevice, bool) {
+	// First resolve the device to obtain its canonical URN
+	dev, found := reg.GetDevice(id)
+	if !found {
+		return AudioDevice{}, false
+	}
+
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 
-	state, ok := reg.deviceStates[id]
+	targetURN := dev.URN
+	if targetURN == "" {
+		targetURN = dev.ID
+	}
+
+	state, ok := reg.deviceStates[targetURN]
 	if !ok {
 		state = &DeviceState{Volume: 1.0, Muted: false}
-		reg.deviceStates[id] = state
+		reg.deviceStates[targetURN] = state
 	}
 	if vol != nil {
 		state.Volume = *vol
@@ -197,18 +267,28 @@ func (reg *DeviceRegistry) UpdateDeviceState(id string, vol *float64, muted *boo
 		state.Muted = *muted
 	}
 
-	reg.mu.Unlock()
-	dev, found := reg.GetDevice(id)
-	reg.mu.Lock()
-	return dev, found
+	// Keep legacy alias in sync for backward compatibility
+	if dev.LegacyID != "" {
+		reg.deviceStates[dev.LegacyID] = state
+	}
+
+	dev.Volume = state.Volume
+	dev.Muted = state.Muted
+	return dev, true
 }
 
-// CreateVirtualDevice provisions an in-memory loopback device.
+// CreateVirtualDevice provisions an in-memory loopback device with deterministic canonical URN.
 func (reg *DeviceRegistry) CreateVirtualDevice(req CreateVirtualDeviceRequest) (AudioDevice, error) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 
-	virtID := fmt.Sprintf("virt-%d", reg.nextVirtID)
+	slug := urn.Slugify(req.Name)
+	virtURN := urn.NewVirtual(slug)
+	if _, exists := reg.virtualDevs[virtURN]; exists {
+		virtURN = fmt.Sprintf("%s-%d", virtURN, reg.nextVirtID)
+	}
+
+	legacyID := fmt.Sprintf("virt-%d", reg.nextVirtID)
 	reg.nextVirtID++
 
 	maxIn := 0
@@ -226,39 +306,67 @@ func (reg *DeviceRegistry) CreateVirtualDevice(req CreateVirtualDeviceRequest) (
 	}
 
 	dev := AudioDevice{
-		ID:                virtID,
+		ID:                virtURN,
+		URN:               virtURN,
+		LegacyID:          legacyID,
 		Name:              req.Name,
 		MaxInput:          maxIn,
 		MaxOutput:         maxOut,
 		DefaultSampleRate: float64(req.SampleRate),
 		IsVirtual:         true,
+		State:             "active",
+		Status:            "active",
 		Volume:            1.0,
 		Muted:             false,
 		SupportedLayouts:  GetSupportedLayouts(req.Channels),
 	}
 
 	vDev := audio.NewVirtualAudioDevice()
-	reg.virtualDevs[virtID] = &VirtualDeviceEntry{
+	reg.virtualDevs[virtURN] = &VirtualDeviceEntry{
 		Device: dev,
 		Dev:    vDev,
 	}
-	reg.deviceStates[virtID] = &DeviceState{Volume: 1.0, Muted: false}
+	state := &DeviceState{Volume: 1.0, Muted: false}
+	reg.deviceStates[virtURN] = state
+	if legacyID != "" {
+		reg.deviceStates[legacyID] = state
+	}
 
 	return dev, nil
 }
 
-// DeleteVirtualDevice removes and closes an in-memory loopback device.
+// DeleteVirtualDevice removes and closes an in-memory loopback device by URN or legacy ID.
 func (reg *DeviceRegistry) DeleteVirtualDevice(id string) bool {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 
+	id = strings.TrimSpace(id)
+	if unescaped, err := url.PathUnescape(id); err == nil && unescaped != "" {
+		id = unescaped
+	}
+
 	entry, ok := reg.virtualDevs[id]
+	if !ok {
+		// Search by LegacyID or internal ID
+		for _, vd := range reg.virtualDevs {
+			if vd.Device.LegacyID == id || vd.Device.URN == id || vd.Device.ID == id {
+				entry = vd
+				ok = true
+				break
+			}
+		}
+	}
+
 	if !ok {
 		return false
 	}
+
 	entry.Dev.Close()
-	delete(reg.virtualDevs, id)
-	delete(reg.deviceStates, id)
+	delete(reg.virtualDevs, entry.Device.URN)
+	delete(reg.deviceStates, entry.Device.URN)
+	if entry.Device.LegacyID != "" {
+		delete(reg.deviceStates, entry.Device.LegacyID)
+	}
 	return true
 }
 
@@ -286,6 +394,10 @@ func (s *V1Server) handleDevicesSubpath(w http.ResponseWriter, r *http.Request) 
 	if sub == "" {
 		s.handleDevices(w, r)
 		return
+	}
+
+	if unescaped, err := url.PathUnescape(sub); err == nil && unescaped != "" {
+		sub = unescaped
 	}
 
 	// Route 1: POST /api/v1/devices/virtual
@@ -316,6 +428,9 @@ func (s *V1Server) handleDevicesSubpath(w http.ResponseWriter, r *http.Request) 
 	// Route 2: DELETE /api/v1/devices/virtual/{deviceId}
 	if strings.HasPrefix(sub, "virtual/") {
 		virtID := strings.TrimPrefix(sub, "virtual/")
+		if unescaped, err := url.PathUnescape(virtID); err == nil && unescaped != "" {
+			virtID = unescaped
+		}
 		if r.Method != http.MethodDelete {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return

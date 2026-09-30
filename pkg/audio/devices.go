@@ -1,12 +1,17 @@
 package audio
 
-// Device describes an audio input/output device.
+// Device describes an audio input/output device with persistent canonical identification.
 type Device struct {
-	ID                int
+	ID                string // Canonical URN (Primary)
+	URN               string // Explicit canonical URN
+	LegacyID          string // Ephemeral PortAudio index or "0"
 	Name              string
 	MaxInput          int
 	MaxOutput         int
 	DefaultSampleRate float64
+	IsVirtual         bool
+	Status            string // "active", "quarantined", "disconnected"
+	RuntimeID         int    // Internal PortAudio index
 }
 
 // BufferedStream is implemented by streams that expose the number of bytes

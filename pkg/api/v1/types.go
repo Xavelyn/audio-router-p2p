@@ -48,11 +48,15 @@ type ClockSyncStatus struct {
 // AudioDevice describes physical sound cards or virtual loopback devices.
 type AudioDevice struct {
 	ID                string   `json:"id"`
+	URN               string   `json:"urn,omitempty"`
+	LegacyID          string   `json:"legacy_id,omitempty"`
 	Name              string   `json:"name"`
 	MaxInput          int      `json:"max_input"`
 	MaxOutput         int      `json:"max_output"`
 	DefaultSampleRate float64  `json:"default_sample_rate"`
 	IsVirtual         bool     `json:"is_virtual"`
+	State             string   `json:"state,omitempty"`
+	Status            string   `json:"status,omitempty"`
 	Volume            float64  `json:"volume"`
 	Muted             bool     `json:"muted"`
 	SupportedLayouts  []string `json:"supported_layouts,omitempty"`

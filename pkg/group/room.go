@@ -10,11 +10,13 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
+	"github.com/audio-router-p2p/pkg/audio/urn"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
@@ -580,7 +582,15 @@ func (r *Room) recompileRoutesLocked() {
 	desired := make(map[string]router.MatrixRoute)
 	for _, inDev := range r.inputs {
 		for _, outDev := range r.outputs {
-			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, inDev, outDev)
+			inKey := inDev
+			if strings.Contains(inDev, ":") {
+				inKey = urn.Checksum(inDev)
+			}
+			outKey := outDev
+			if strings.Contains(outDev, ":") {
+				outKey = urn.Checksum(outDev)
+			}
+			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, inKey, outKey)
 
 			inGain := 1.0
 			if g, ok := r.inputGains[inDev]; ok {

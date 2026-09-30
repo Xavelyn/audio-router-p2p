@@ -67,11 +67,14 @@ export type ChannelLayout = 'mono' | 'stereo' | 'quad' | '5.1' | '7.1' | 'custom
 
 export interface AudioDevice {
   id: string;
+  urn?: string;
+  legacy_id?: string;
   name: string;
   max_input: number;
   max_output: number;
   default_sample_rate: number;
   is_virtual: boolean;
+  status?: 'active' | 'quarantined' | 'disconnected' | string;
   volume?: number;
   muted?: boolean;
   supported_layouts?: ChannelLayout[];
@@ -365,6 +368,8 @@ export interface NetworkHealthResponse {
 
 export interface AudioDeviceSummary {
   id: string;
+  urn?: string;
+  legacy_id?: string;
   device_id?: string;
   node_id: string;
   node_name?: string;
@@ -378,6 +383,7 @@ export interface AudioDeviceSummary {
   muted: boolean;
   supported_layouts?: string[];
   state?: string;
+  status?: string;
 }
 
 export type ClusterDeviceSummary = AudioDeviceSummary;

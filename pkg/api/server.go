@@ -250,9 +250,14 @@ func (a *localClusterNodeAdapter) ListDevices(kind string) ([]cluster.AudioDevic
 		} else if d.MaxOutput > 0 && d.MaxInput == 0 {
 			direction = "output"
 		}
+		devURN := d.URN
+		if devURN == "" {
+			devURN = d.ID
+		}
 		out[i] = cluster.AudioDeviceSummary{
-			ID:                d.ID,
-			DeviceID:          d.ID,
+			ID:                devURN,
+			DeviceID:          devURN,
+			URN:               devURN,
 			NodeID:            nodeID,
 			NodeName:          nodeName,
 			Name:              d.Name,
@@ -281,9 +286,14 @@ func (a *localClusterNodeAdapter) UpdateDeviceState(id string, vol *float64, mut
 	} else if dev.MaxOutput > 0 && dev.MaxInput == 0 {
 		direction = "output"
 	}
+	devURN := dev.URN
+	if devURN == "" {
+		devURN = dev.ID
+	}
 	return cluster.AudioDeviceSummary{
-		ID:                dev.ID,
-		DeviceID:          dev.ID,
+		ID:                devURN,
+		DeviceID:          devURN,
+		URN:               devURN,
 		NodeID:            a.NodeID(),
 		NodeName:          a.NodeName(),
 		Name:              dev.Name,
@@ -350,7 +360,9 @@ func (a *streamProviderAdapter) StreamLinkStats() []netTelemetry.StreamLinkStats
 	if a.streams == nil {
 		return nil
 	}
-	if direct, ok := a.streams.(interface{ StreamLinkStats() []netTelemetry.StreamLinkStats }); ok {
+	if direct, ok := a.streams.(interface {
+		StreamLinkStats() []netTelemetry.StreamLinkStats
+	}); ok {
 		return direct.StreamLinkStats()
 	}
 	raw := a.streams.Stats()
@@ -548,7 +560,9 @@ func (a *v1RoomManagerAdapter) SetInputGain(roomID, deviceID string, gain float6
 	if rm == nil {
 		return fmt.Errorf("room manager not configured")
 	}
-	if gSetter, ok := rm.(interface{ SetInputGain(string, string, float64) error }); ok {
+	if gSetter, ok := rm.(interface {
+		SetInputGain(string, string, float64) error
+	}); ok {
 		return gSetter.SetInputGain(roomID, deviceID, gain)
 	}
 	return nil
@@ -559,7 +573,9 @@ func (a *v1RoomManagerAdapter) SetOutputGain(roomID, deviceID string, gain float
 	if rm == nil {
 		return fmt.Errorf("room manager not configured")
 	}
-	if gSetter, ok := rm.(interface{ SetOutputGain(string, string, float64) error }); ok {
+	if gSetter, ok := rm.(interface {
+		SetOutputGain(string, string, float64) error
+	}); ok {
 		return gSetter.SetOutputGain(roomID, deviceID, gain)
 	}
 	return nil
