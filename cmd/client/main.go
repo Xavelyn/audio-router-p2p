@@ -24,6 +24,7 @@ import (
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/api"
+	apiTelemetry "github.com/audio-router-p2p/pkg/api/telemetry"
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/group"
@@ -32,6 +33,7 @@ import (
 	syncmgr "github.com/audio-router-p2p/pkg/sync"
 	"github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/audio-router-p2p/pkg/transport"
+	"strconv"
 )
 
 func main() {
@@ -137,6 +139,7 @@ func main() {
 
 	// HTTP API.
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
+	streams.SetHub(apiSrv.Hub())
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
 
 	if agg := apiSrv.Aggregator(); agg != nil {
@@ -256,6 +259,8 @@ type streamManager struct {
 	trans    streamer.Transport
 	localIPs []string
 	disc     *discovery.Discovery
+	resolver *audio.DeviceResolver
+	hub      *apiTelemetry.TelemetryHub
 
 	mu     sync.Mutex
 	routes map[string]*activeStream
@@ -269,7 +274,20 @@ type activeStream struct {
 }
 
 func newStreamManager(cfg *config.Config, trans streamer.Transport, localIPs []string, disc *discovery.Discovery) *streamManager {
-	return &streamManager{cfg: cfg, trans: trans, localIPs: localIPs, disc: disc, routes: make(map[string]*activeStream)}
+	return &streamManager{
+		cfg:      cfg,
+		trans:    trans,
+		localIPs: localIPs,
+		disc:     disc,
+		resolver: audio.GlobalResolver(),
+		routes:   make(map[string]*activeStream),
+	}
+}
+
+func (m *streamManager) SetHub(hub *apiTelemetry.TelemetryHub) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.hub = hub
 }
 
 // StartRoute opens the source device and begins streaming per the route.
@@ -289,9 +307,14 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		delete(m.routes, sr.ID)
 	}
 
-	in, err := audio.OpenInput(sr.SourceDevice, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+	srcRef := sr.SourceDeviceURN
+	if srcRef == "" {
+		srcRef = strconv.Itoa(sr.SourceDevice)
+	}
+
+	in, err := m.resolver.OpenInput(srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
 	if err != nil {
-		return fmt.Errorf("open input device %d: %w", sr.SourceDevice, err)
+		return fmt.Errorf("open input device %s: %w", srcRef, err)
 	}
 
 	var out audio.AudioStream
@@ -321,11 +344,14 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 
 	for _, d := range destAddrs {
 		if destIsLocal(d, m.localIPs) {
-			outDev := sr.DestDevice
-			out, err = audio.OpenOutput(outDev, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+			dstRef := sr.DestDeviceURN
+			if dstRef == "" {
+				dstRef = strconv.Itoa(sr.DestDevice)
+			}
+			out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
 			if err != nil {
 				_ = in.Close()
-				return fmt.Errorf("open local output device %d: %w", outDev, err)
+				return fmt.Errorf("open local output device %s: %w", dstRef, err)
 			}
 			break
 		}
@@ -351,9 +377,15 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			st.SetPeerID(dest, sr.PeerID)
 		}
 	}
+
+	if m.hub != nil {
+		tap := m.hub.RegisterTap(sr.ID, sr.Channels)
+		st.SetAudioTap(tap)
+	}
+
 	// Save the potentially updated route (with peer binding)
 	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out}
-	log.Printf("route %s: streaming device %d -> %d destinations (peer: %s)", sr.ID, sr.SourceDevice, len(destAddrs), sr.PeerID)
+	log.Printf("route %s: streaming device %s -> %d destinations (peer: %s)", sr.ID, srcRef, len(destAddrs), sr.PeerID)
 	return nil
 }
 
@@ -407,6 +439,9 @@ func (m *streamManager) StreamLinkStats() []telemetry.StreamLinkStats {
 }
 
 func (m *streamManager) stopLocked(as *activeStream) {
+	if m.hub != nil {
+		m.hub.UnregisterTap(as.route.ID)
+	}
 	as.st.Stop()
 	done := make(chan struct{})
 	go func() {

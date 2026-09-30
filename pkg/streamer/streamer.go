@@ -41,6 +41,12 @@ var _ Transport = (*transport.DTLSTransport)(nil)
 // StreamDirection indicates the direction of a stream.
 type StreamDirection int
 
+// AudioTap records audio sample blocks and DTX state for real-time telemetry and metering.
+type AudioTap interface {
+	RecordBlock(pcm []byte, channels int)
+	SetDTXState(state string)
+}
+
 const (
 	DirSendOnly StreamDirection = iota
 	DirRecvOnly
@@ -142,6 +148,8 @@ type Streamer struct {
 	// DSP and DTX
 	dtx               *dsp.DTXController
 	packetsSuppressed atomic.Uint64
+	audioTap          AudioTap
+	audioTapMu        sync.RWMutex
 
 	// Send path
 	sendSeq        atomic.Uint32
@@ -184,6 +192,13 @@ func (s *Streamer) SetStreamID(id [16]byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.streamID = id
+}
+
+// SetAudioTap attaches an audio telemetry tap for real-time RMS/peak metering.
+func (s *Streamer) SetAudioTap(tap AudioTap) {
+	s.audioTapMu.Lock()
+	defer s.audioTapMu.Unlock()
+	s.audioTap = tap
 }
 
 func (s *Streamer) packetBytes() int {
@@ -397,6 +412,15 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 
 		// Step DTX finite state machine and analyze signal energy
 		shouldSend, isSID, _ := s.dtx.ProcessFrame(packetBuf[:packetBytes], s.config.Channels)
+
+		s.audioTapMu.RLock()
+		tap := s.audioTap
+		s.audioTapMu.RUnlock()
+		if tap != nil {
+			tap.RecordBlock(packetBuf[:packetBytes], s.config.Channels)
+			tap.SetDTXState(s.dtx.State().String())
+		}
+
 		if !shouldSend {
 			s.packetsSuppressed.Add(1)
 			continue

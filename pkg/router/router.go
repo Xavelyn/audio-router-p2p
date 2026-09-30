@@ -14,12 +14,14 @@ import (
 
 // StreamRoute describes how audio from one source device is delivered.
 type StreamRoute struct {
-	ID           string   `json:"id"`
-	SourceDevice int      `json:"sourceDevice"`
-	DestDevice   int      `json:"destDevice,omitempty"`
-	Destinations []string `json:"destinations"`
-	SampleRate   int      `json:"sampleRate,omitempty"`
-	Channels     int      `json:"channels,omitempty"`
+	ID              string   `json:"id"`
+	SourceDevice    int      `json:"sourceDevice"`
+	SourceDeviceURN string   `json:"sourceDeviceUrn,omitempty"`
+	DestDevice      int      `json:"destDevice,omitempty"`
+	DestDeviceURN   string   `json:"destDeviceUrn,omitempty"`
+	Destinations    []string `json:"destinations"`
+	SampleRate      int      `json:"sampleRate,omitempty"`
+	Channels        int      `json:"channels,omitempty"`
 
 	// Peer binding and negotiated format
 	PeerID        string `json:"peerId,omitempty"`        // Bound peer ID (empty = any/unicast)
@@ -341,12 +343,14 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		dests = []string{"127.0.0.1:45678"}
 	}
 	return StreamRoute{
-		ID:           mr.ID,
-		SourceDevice: srcDev,
-		DestDevice:   dstDev,
-		Destinations: dests,
-		SampleRate:   48000,
-		Channels:     mr.InChannels,
-		PeerID:       mr.Destination.NodeID,
+		ID:              mr.ID,
+		SourceDevice:    srcDev,
+		SourceDeviceURN: mr.Source.DeviceID,
+		DestDevice:      dstDev,
+		DestDeviceURN:   mr.Destination.DeviceID,
+		Destinations:    dests,
+		SampleRate:      48000,
+		Channels:        mr.InChannels,
+		PeerID:          mr.Destination.NodeID,
 	}
 }

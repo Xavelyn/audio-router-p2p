@@ -34,6 +34,19 @@ func NewDeviceResolver() *DeviceResolver {
 	return r
 }
 
+var (
+	globalResolver     *DeviceResolver
+	globalResolverOnce sync.Once
+)
+
+// GlobalResolver returns the singleton device resolver for the local daemon.
+func GlobalResolver() *DeviceResolver {
+	globalResolverOnce.Do(func() {
+		globalResolver = NewDeviceResolver()
+	})
+	return globalResolver
+}
+
 // Register registers or updates a device and registers legacy aliases.
 func (r *DeviceResolver) Register(dev Device) {
 	r.mu.Lock()

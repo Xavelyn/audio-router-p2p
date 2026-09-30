@@ -31,8 +31,25 @@
   );
 
   // Meter levels from meterStore
-  const leftMeter = $derived(meterStore.activeChannelMeters[0] ?? { rmsDb: -96, peakDb: -96, clipped: false });
-  const rightMeter = $derived(meterStore.activeChannelMeters[1] ?? { rmsDb: -96, peakDb: -96, clipped: false });
+  const deviceStream = $derived.by(() => {
+    for (const [sId, st] of Object.entries(meterStore.streams)) {
+      if (sId.includes(data.device.id) || (data.device.legacy_id && sId.includes(data.device.legacy_id))) {
+        return st;
+      }
+    }
+    return null;
+  });
+
+  const leftMeter = $derived(
+    deviceStream?.channels[0] ??
+      (data.assignedRooms.length > 0 ? meterStore.activeChannelMeters[0] : null) ??
+      { rmsDb: -96, peakDb: -96, clipped: false }
+  );
+  const rightMeter = $derived(
+    deviceStream?.channels[1] ??
+      (data.assignedRooms.length > 0 ? meterStore.activeChannelMeters[1] : null) ??
+      { rmsDb: -96, peakDb: -96, clipped: false }
+  );
 
   function dbToPercent(db: number): number {
     if (db <= -60) return 0;
@@ -123,8 +140,14 @@
   <div class="mt-2.5 rounded-md bg-zinc-950/80 p-2 border border-zinc-800/80">
     <div class="flex items-center justify-between text-[9px] font-mono mb-1">
       <span class="text-zinc-400 uppercase tracking-wider font-semibold">Signal Level</span>
-      <span class="text-cyan-400">
-        {leftMeter.peakDb > -60 ? `${leftMeter.peakDb.toFixed(1)} dB` : '-inf dB'}
+      <span class={data.assignedRooms.length === 0 ? 'text-zinc-500' : 'text-cyan-400'}>
+        {#if data.assignedRooms.length === 0}
+          unrouted (-inf)
+        {:else if leftMeter.peakDb > -60}
+          {leftMeter.peakDb.toFixed(1)} dB
+        {:else}
+          -inf dB
+        {/if}
       </span>
     </div>
     <!-- Dual Bar Meter L / R -->
