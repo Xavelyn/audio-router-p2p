@@ -4,6 +4,7 @@ package audio
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -124,7 +125,7 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 	if p.closed {
 		return 0, io.EOF
 	}
-	if err := p.stream.Read(); err != nil {
+	if err := p.stream.Read(); err != nil && !errors.Is(err, portaudio.InputOverflowed) {
 		return 0, err
 	}
 	// dst must be able to hold one buffer; otherwise the excess frames are
@@ -266,7 +267,7 @@ func (o *portaudioOutput) Write(p []byte) (int, error) {
 		for i := range o.buf {
 			o.buf[i] = int16(binary.LittleEndian.Uint16(data[base+i*2:]))
 		}
-		if err := o.stream.Write(); err != nil {
+		if err := o.stream.Write(); err != nil && !errors.Is(err, portaudio.OutputUnderflowed) {
 			o.spill = append(o.spill[:0], data[off:end]...)
 			return off, err
 		}

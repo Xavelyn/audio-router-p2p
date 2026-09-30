@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -451,7 +452,9 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			if s.isLocalDest(peer.Addr) {
 				if peer.Output != nil {
 					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
-						log.Printf("streamer: local write error: %v", err)
+						if !strings.Contains(err.Error(), "underflow") {
+							log.Printf("streamer: local write error: %v", err)
+						}
 					} else {
 						peer.packetsSent.Add(1)
 						peer.bytesSent.Add(uint64(packetBytes))

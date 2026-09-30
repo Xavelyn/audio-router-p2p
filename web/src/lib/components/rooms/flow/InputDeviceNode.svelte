@@ -33,7 +33,11 @@
   // Meter levels from meterStore
   const deviceStream = $derived.by(() => {
     for (const [sId, st] of Object.entries(meterStore.streams)) {
-      if (sId.includes(data.device.id) || (data.device.legacy_id && sId.includes(data.device.legacy_id))) {
+      if (
+        sId.includes(data.device.id) ||
+        (data.device.legacy_id && sId.includes(data.device.legacy_id)) ||
+        data.assignedRooms.some((r) => sId.includes(r.id))
+      ) {
         return st;
       }
     }
