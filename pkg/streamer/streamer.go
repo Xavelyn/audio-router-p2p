@@ -82,14 +82,14 @@ type RemotePeer struct {
 	asrcOutBuf     []byte
 
 	// Telemetry atomic accumulators for lock-free interrogation
-	packetsSent   atomic.Uint64
-	packetsRecv   atomic.Uint64
-	bytesSent     atomic.Uint64
-	bytesRecv     atomic.Uint64
-	packetsLost   atomic.Uint64
-	fecRecovered  atomic.Uint64
-	lastSeq       atomic.Uint32
-	hasSeq        atomic.Bool
+	packetsSent  atomic.Uint64
+	packetsRecv  atomic.Uint64
+	bytesSent    atomic.Uint64
+	bytesRecv    atomic.Uint64
+	packetsLost  atomic.Uint64
+	fecRecovered atomic.Uint64
+	lastSeq      atomic.Uint32
+	hasSeq       atomic.Bool
 
 	lastRateCalc  atomic.Int64 // unix nano
 	lastRateBytes atomic.Uint64
@@ -155,18 +155,18 @@ type Streamer struct {
 	audioTapMu        sync.RWMutex
 
 	// Send path
-	sendSeq        atomic.Uint32
-	fecEncoder     *transport.FECEncoder
-	fecEncoderMu   sync.Mutex
-	fecParitySent  atomic.Uint64
+	sendSeq       atomic.Uint32
+	fecEncoder    *transport.FECEncoder
+	fecEncoderMu  sync.Mutex
+	fecParitySent atomic.Uint64
 
 	// Receive path
-	recvWG         sync.WaitGroup
-	peers          map[string]*RemotePeer // keyed by peer address
-	peersMu        sync.RWMutex
-	packetsRecv    atomic.Uint64
-	fecParityRecv  atomic.Uint64
-	fecRecovered   atomic.Uint64
+	recvWG        sync.WaitGroup
+	peers         map[string]*RemotePeer // keyed by peer address
+	peersMu       sync.RWMutex
+	packetsRecv   atomic.Uint64
+	fecParityRecv atomic.Uint64
+	fecRecovered  atomic.Uint64
 
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.
@@ -443,6 +443,40 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			tap.SetDTXState(currentState.String())
 		}
 
+		// Always play live audio to local outputs (avoid robotic DTX silence gating on local routes)
+		s.peersMu.RLock()
+		localWritten := false
+		hasPeers := len(s.peers) > 0
+		for _, peer := range s.peers {
+			if s.isLocalDest(peer.Addr) && peer.Output != nil {
+				if !localWritten {
+					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
+						if !strings.Contains(err.Error(), "underflow") {
+							log.Printf("[AUDIO:IO] streamer local write error on route: %v", err)
+						}
+					} else {
+						peer.packetsSent.Add(1)
+						peer.bytesSent.Add(uint64(packetBytes))
+					}
+					localWritten = true
+				}
+			} else if s.isLocalDest(peer.Addr) && peer.Output == nil {
+				warnCount := atomic.AddUint64(&s.localOutputWarnCount, 1)
+				if warnCount <= 3 || warnCount%100 == 0 {
+					log.Printf("[STREAM:MGR] WARN: peer %s is local but peer.Output is nil and transport is nil; dropping audio block (dropCount=%d)", peer.Addr, warnCount)
+				}
+			}
+		}
+		s.peersMu.RUnlock()
+
+		if !localWritten && s.output != nil && !hasPeers {
+			if _, err := s.output.Write(packetBuf[:packetBytes]); err != nil {
+				if !strings.Contains(err.Error(), "underflow") {
+					log.Printf("[AUDIO:IO] streamer direct local write error on route: %v", err)
+				}
+			}
+		}
+
 		if !shouldSend {
 			s.packetsSuppressed.Add(1)
 			continue
@@ -469,44 +503,17 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		pkt := transport.Marshal(hdr, packetBuf[:packetBytes])
 
 		s.peersMu.RLock()
-		localWritten := false
-		hasPeers := len(s.peers) > 0
 		for _, peer := range s.peers {
-			if s.isLocalDest(peer.Addr) && peer.Output != nil {
-				if !localWritten {
-					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
-						if !strings.Contains(err.Error(), "underflow") {
-							log.Printf("[AUDIO:IO] streamer local write error on route: %v", err)
-						}
-					} else {
-						peer.packetsSent.Add(1)
-						peer.bytesSent.Add(uint64(packetBytes))
-					}
-					localWritten = true
-				}
-			} else if s.transport != nil {
+			if (!s.isLocalDest(peer.Addr) || peer.Output == nil) && s.transport != nil {
 				if err := s.transport.Send(peer.Addr, pkt); err != nil && !errors.Is(err, net.ErrClosed) {
 					log.Printf("streamer: send to %s: %v", peer.Addr, err)
 				} else {
 					peer.packetsSent.Add(1)
 					peer.bytesSent.Add(uint64(len(pkt)))
 				}
-			} else if s.isLocalDest(peer.Addr) && peer.Output == nil {
-				warnCount := atomic.AddUint64(&s.localOutputWarnCount, 1)
-				if warnCount <= 3 || warnCount%100 == 0 {
-					log.Printf("[STREAM:MGR] WARN: peer %s is local but peer.Output is nil and transport is nil; dropping audio block (dropCount=%d)", peer.Addr, warnCount)
-				}
 			}
 		}
 		s.peersMu.RUnlock()
-
-		if !localWritten && s.output != nil && !hasPeers {
-			if _, err := s.output.Write(packetBuf[:packetBytes]); err != nil {
-				if !strings.Contains(err.Error(), "underflow") {
-					log.Printf("[AUDIO:IO] streamer direct local write error on route: %v", err)
-				}
-			}
-		}
 
 		// Send RFC 5109 parity packet if group completed
 		if s.fecEncoder != nil && !isSID {

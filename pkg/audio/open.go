@@ -40,14 +40,24 @@ func termPortAudio() {
 	}
 }
 
+// portAudioStreamReader abstracts the blocking read and lifecycle from a PortAudio stream.
+type portAudioStreamReader interface {
+	Read() error
+	Stop() error
+	Close() error
+}
+
 // portaudioInput wraps a blocking PortAudio input stream and exposes it as a
 // byte-oriented AudioStream (little-endian int16 PCM).
 type portaudioInput struct {
 	mu           sync.Mutex
-	stream       *portaudio.Stream
+	stream       portAudioStreamReader
 	buf          []int16
+	rawBuf       []byte
+	spill        []byte
 	closed       bool
 	lastOverflow atomic.Int64
+	isRealPA     bool
 }
 
 func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
@@ -95,14 +105,21 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 	if channels > dev.MaxInputChannels {
 		channels = dev.MaxInputChannels
 	}
-	log.Printf("[AUDIO:IO] Opening PortAudio input: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, dev.DefaultLowInputLatency)
+	latency := dev.DefaultLowInputLatency
+	if dev.DefaultHighInputLatency > latency {
+		latency = dev.DefaultHighInputLatency
+	}
+	if latency < 40*time.Millisecond {
+		latency = 40 * time.Millisecond
+	}
+	log.Printf("[AUDIO:IO] Opening PortAudio input: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
 	buf := make([]int16, blocksPerBuffer*channels)
 	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
 		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
 			Input: portaudio.StreamDeviceParameters{
 				Device:   dev,
 				Channels: channels,
-				Latency:  dev.DefaultLowInputLatency,
+				Latency:  latency,
 			},
 			SampleRate:      float64(sampleRate),
 			FramesPerBuffer: blocksPerBuffer,
@@ -122,15 +139,42 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 		return nil, err
 	}
 	log.Printf("[AUDIO:IO] PortAudio input online: device=%q channels=%d sampleRate=%d", dev.Name, channels, sampleRate)
-	return &portaudioInput{stream: st, buf: buf}, nil
+	return &portaudioInput{
+		stream:   st,
+		buf:      buf,
+		rawBuf:   make([]byte, len(buf)*2),
+		spill:    make([]byte, 0, len(buf)*2),
+		isRealPA: true,
+	}, nil
+}
+
+// NewPortaudioInputForTest instantiates a portaudioInput with a custom stream reader for unit testing.
+func NewPortaudioInputForTest(stream portAudioStreamReader, buf []int16) AudioStream {
+	return &portaudioInput{
+		stream:   stream,
+		buf:      buf,
+		rawBuf:   make([]byte, len(buf)*2),
+		spill:    make([]byte, 0, len(buf)*2),
+		isRealPA: false,
+	}
 }
 
 func (p *portaudioInput) Read(dst []byte) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	// 1. Drain any remaining spillover bytes from a previous read first
+	if len(p.spill) > 0 {
+		n := copy(dst, p.spill)
+		p.spill = p.spill[n:]
+		return n, nil
+	}
+
 	if p.closed {
 		return 0, io.EOF
 	}
+
+	// 2. Read next buffer from hardware / stream reader
 	if err := p.stream.Read(); err != nil {
 		if errors.Is(err, portaudio.InputOverflowed) {
 			now := time.Now().UnixNano()
@@ -143,19 +187,20 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 			return 0, err
 		}
 	}
-	// dst must be able to hold one buffer; otherwise the excess frames are
-	// dropped (they have already been consumed from the audio device).
+
+	// 3. Serialize int16 buffer to little-endian bytes without extra allocations
 	need := len(p.buf) * 2
-	if len(dst) >= need {
-		for i, s := range p.buf {
-			binary.LittleEndian.PutUint16(dst[i*2:], uint16(s))
-		}
-		return need, nil
+	if len(p.rawBuf) < need {
+		p.rawBuf = make([]byte, need)
 	}
-	n := 0
-	for i := 0; i < len(p.buf) && n+2 <= len(dst); i++ {
-		binary.LittleEndian.PutUint16(dst[n:], uint16(p.buf[i]))
-		n += 2
+	for i, s := range p.buf {
+		binary.LittleEndian.PutUint16(p.rawBuf[i*2:], uint16(s))
+	}
+
+	// 4. Fill dst with as many bytes as possible and preserve the remainder in spill
+	n := copy(dst, p.rawBuf[:need])
+	if n < need {
+		p.spill = append(p.spill[:0], p.rawBuf[n:need]...)
 	}
 	return n, nil
 }
@@ -169,12 +214,16 @@ func (p *portaudioInput) Close() error {
 		return nil
 	}
 	p.closed = true
-	_ = p.stream.Stop()
 	var err error
-	suppressStderr(func() {
-		err = p.stream.Close()
-	})
-	termPortAudio()
+	if p.stream != nil {
+		_ = p.stream.Stop()
+		suppressStderr(func() {
+			err = p.stream.Close()
+		})
+	}
+	if p.isRealPA {
+		termPortAudio()
+	}
 	return err
 }
 
@@ -233,14 +282,21 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 	if channels > dev.MaxOutputChannels {
 		channels = dev.MaxOutputChannels
 	}
-	log.Printf("[AUDIO:IO] Opening PortAudio output: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, dev.DefaultLowOutputLatency)
+	latency := dev.DefaultLowOutputLatency
+	if dev.DefaultHighOutputLatency > latency {
+		latency = dev.DefaultHighOutputLatency
+	}
+	if latency < 40*time.Millisecond {
+		latency = 40 * time.Millisecond
+	}
+	log.Printf("[AUDIO:IO] Opening PortAudio output: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
 	buf := make([]int16, blocksPerBuffer*channels)
 	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
 		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
 			Output: portaudio.StreamDeviceParameters{
 				Device:   dev,
 				Channels: channels,
-				Latency:  dev.DefaultLowOutputLatency,
+				Latency:  latency,
 			},
 			SampleRate:      float64(sampleRate),
 			FramesPerBuffer: blocksPerBuffer,
