@@ -5,7 +5,8 @@ package audio
 import (
 	"os"
 	"sync"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -26,9 +27,9 @@ func suppressStderr(fn func()) {
 		devNullFile, err = os.OpenFile(os.DevNull, os.O_WRONLY, 0)
 		if err == nil {
 			stderrFd := int(os.Stderr.Fd())
-			savedStderr, err = syscall.Dup(stderrFd)
+			savedStderr, err = unix.Dup(stderrFd)
 			if err == nil {
-				_ = syscall.Dup2(int(devNullFile.Fd()), stderrFd)
+				_ = unix.Dup2(int(devNullFile.Fd()), stderrFd)
 			}
 		}
 	}
@@ -41,8 +42,8 @@ func suppressStderr(fn func()) {
 		if silenceDepth == 0 {
 			if savedStderr != 0 {
 				stderrFd := int(os.Stderr.Fd())
-				_ = syscall.Dup2(savedStderr, stderrFd)
-				_ = syscall.Close(savedStderr)
+				_ = unix.Dup2(savedStderr, stderrFd)
+				_ = unix.Close(savedStderr)
 				savedStderr = 0
 			}
 			if devNullFile != nil {
