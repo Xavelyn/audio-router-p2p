@@ -138,6 +138,8 @@ type Streamer struct {
 	streamID    [16]byte
 	localNodeID string
 
+	localOutputWarnCount uint64
+
 	mu       sync.Mutex
 	started  bool
 	output   audio.AudioStream
@@ -379,6 +381,9 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 	packetBytes := s.packetBytes()
 	packetBuf := make([]byte, packetBytes)
 	offset := 0
+	var frameCount uint64
+	lastDTXState := dsp.DTXStateActive
+	streamIDShort := hex.EncodeToString(s.streamID[:4])
 
 	for {
 		select {
@@ -388,10 +393,12 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		}
 		n, err := input.Read(packetBuf[offset:])
 		if err == io.EOF {
+			log.Printf("[AUDIO:DEV] input.Read returned EOF for stream %s; sendLoop terminating", streamIDShort)
 			s.stopOnce.Do(func() { close(s.stopCh) })
 			return
 		}
 		if err != nil {
+			log.Printf("[AUDIO:DEV] ERROR: input.Read error on stream %s: %v; sendLoop terminating", streamIDShort, err)
 			s.errCh <- err
 			s.stopOnce.Do(func() { close(s.stopCh) })
 			return
@@ -410,16 +417,30 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		}
 
 		offset = 0
+		frameCount++
 
 		// Step DTX finite state machine and analyze signal energy
-		shouldSend, isSID, _ := s.dtx.ProcessFrame(packetBuf[:packetBytes], s.config.Channels)
+		shouldSend, isSID, metrics := s.dtx.ProcessFrame(packetBuf[:packetBytes], s.config.Channels)
+		currentState := s.dtx.State()
+
+		// Throttled Level Diagnostics: 1 Hz heartbeat (~50 frames @ 20ms) and on DTX transitions
+		clipped := metrics.Peak >= 32767 || metrics.Peak <= -32768
+		if frameCount%50 == 0 {
+			log.Printf("[AUDIO:LEVEL] stream=%s frame=%d RMS=%.2f dBFS Peak=%.2f dBFS DTX=%s clipped=%t",
+				streamIDShort, frameCount, metrics.RMSdBFS, metrics.PeakdBFS, currentState.String(), clipped)
+		}
+		if currentState != lastDTXState {
+			log.Printf("[AUDIO:LEVEL] stream=%s DTX transition %s -> %s (RMS=%.2f dBFS, Peak=%.2f dBFS)",
+				streamIDShort, lastDTXState.String(), currentState.String(), metrics.RMSdBFS, metrics.PeakdBFS)
+			lastDTXState = currentState
+		}
 
 		s.audioTapMu.RLock()
 		tap := s.audioTap
 		s.audioTapMu.RUnlock()
 		if tap != nil {
 			tap.RecordBlock(packetBuf[:packetBytes], s.config.Channels)
-			tap.SetDTXState(s.dtx.State().String())
+			tap.SetDTXState(currentState.String())
 		}
 
 		if !shouldSend {
@@ -448,17 +469,20 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		pkt := transport.Marshal(hdr, packetBuf[:packetBytes])
 
 		s.peersMu.RLock()
+		localWritten := false
+		hasPeers := len(s.peers) > 0
 		for _, peer := range s.peers {
-			if s.isLocalDest(peer.Addr) {
-				if peer.Output != nil {
+			if s.isLocalDest(peer.Addr) && peer.Output != nil {
+				if !localWritten {
 					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
 						if !strings.Contains(err.Error(), "underflow") {
-							log.Printf("streamer: local write error: %v", err)
+							log.Printf("[AUDIO:IO] streamer local write error on route: %v", err)
 						}
 					} else {
 						peer.packetsSent.Add(1)
 						peer.bytesSent.Add(uint64(packetBytes))
 					}
+					localWritten = true
 				}
 			} else if s.transport != nil {
 				if err := s.transport.Send(peer.Addr, pkt); err != nil && !errors.Is(err, net.ErrClosed) {
@@ -467,9 +491,22 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 					peer.packetsSent.Add(1)
 					peer.bytesSent.Add(uint64(len(pkt)))
 				}
+			} else if s.isLocalDest(peer.Addr) && peer.Output == nil {
+				warnCount := atomic.AddUint64(&s.localOutputWarnCount, 1)
+				if warnCount <= 3 || warnCount%100 == 0 {
+					log.Printf("[STREAM:MGR] WARN: peer %s is local but peer.Output is nil and transport is nil; dropping audio block (dropCount=%d)", peer.Addr, warnCount)
+				}
 			}
 		}
 		s.peersMu.RUnlock()
+
+		if !localWritten && s.output != nil && !hasPeers {
+			if _, err := s.output.Write(packetBuf[:packetBytes]); err != nil {
+				if !strings.Contains(err.Error(), "underflow") {
+					log.Printf("[AUDIO:IO] streamer direct local write error on route: %v", err)
+				}
+			}
+		}
 
 		// Send RFC 5109 parity packet if group completed
 		if s.fecEncoder != nil && !isSID {
@@ -489,7 +526,7 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 				parityPkt := transport.Marshal(parityHdr, parityPayload)
 				s.peersMu.RLock()
 				for _, peer := range s.peers {
-					if !s.isLocalDest(peer.Addr) && s.transport != nil {
+					if (!s.isLocalDest(peer.Addr) || peer.Output == nil) && s.transport != nil {
 						if err := s.transport.Send(peer.Addr, parityPkt); err != nil && !errors.Is(err, net.ErrClosed) {
 							log.Printf("streamer: send parity to %s: %v", peer.Addr, err)
 						} else {
@@ -993,9 +1030,23 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 
 // isLocalDest reports whether hostport resolves to a local IP.
 func (s *Streamer) isLocalDest(hostport string) bool {
-	ip, err := parseIP(hostport)
+	if hostport == "local" || hostport == "localhost" {
+		return true
+	}
+	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
-		return false
+		host = hostport
+	}
+	if host == "local" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		var parseErr error
+		ip, parseErr = parseIP(hostport)
+		if parseErr != nil {
+			return false
+		}
 	}
 	for _, l := range s.localIPs {
 		if l.Equal(ip) {

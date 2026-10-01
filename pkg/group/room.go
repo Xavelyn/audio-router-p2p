@@ -354,13 +354,16 @@ func (r *Room) AddInput(args ...string) error {
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
+	log.Printf("[ROOM:ROUTE] AddInput called: room=%s devID=%q", r.id, devID)
 	for _, id := range r.inputs {
 		if id == devID {
+			log.Printf("[ROOM:ROUTE] devID=%q already bound to room=%s", devID, r.id)
 			return nil
 		}
 	}
 	r.inputs = append(r.inputs, devID)
 	r.recompileRoutesLocked()
+	log.Printf("[ROOM:ROUTE] AddInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
 	return nil
 }
 
@@ -381,6 +384,7 @@ func (r *Room) RemoveInput(args ...string) error {
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
+	log.Printf("[ROOM:ROUTE] RemoveInput called: room=%s devID=%q", r.id, devID)
 	idx := -1
 	for i, id := range r.inputs {
 		if id == devID {
@@ -392,6 +396,7 @@ func (r *Room) RemoveInput(args ...string) error {
 		r.inputs = append(r.inputs[:idx], r.inputs[idx+1:]...)
 		delete(r.inputGains, devID)
 		r.recompileRoutesLocked()
+		log.Printf("[ROOM:ROUTE] RemoveInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
 	}
 	return nil
 }
@@ -413,13 +418,16 @@ func (r *Room) AddOutput(args ...string) error {
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
+	log.Printf("[ROOM:ROUTE] AddOutput called: room=%s devID=%q", r.id, devID)
 	for _, id := range r.outputs {
 		if id == devID {
+			log.Printf("[ROOM:ROUTE] devID=%q already bound to room=%s", devID, r.id)
 			return nil
 		}
 	}
 	r.outputs = append(r.outputs, devID)
 	r.recompileRoutesLocked()
+	log.Printf("[ROOM:ROUTE] AddOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
 	return nil
 }
 
@@ -440,6 +448,7 @@ func (r *Room) RemoveOutput(args ...string) error {
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
+	log.Printf("[ROOM:ROUTE] RemoveOutput called: room=%s devID=%q", r.id, devID)
 	idx := -1
 	for i, id := range r.outputs {
 		if id == devID {
@@ -451,6 +460,7 @@ func (r *Room) RemoveOutput(args ...string) error {
 		r.outputs = append(r.outputs[:idx], r.outputs[idx+1:]...)
 		delete(r.outputGains, devID)
 		r.recompileRoutesLocked()
+		log.Printf("[ROOM:ROUTE] RemoveOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
 	}
 	return nil
 }
@@ -579,6 +589,8 @@ func (r *Room) recompileRoutesLocked() {
 		return
 	}
 
+	log.Printf("[ROOM:ROUTE] Recompiling routes for room=%s (inputs=%v, outputs=%v)", r.id, r.inputs, r.outputs)
+
 	desired := make(map[string]router.MatrixRoute)
 	for _, inDev := range r.inputs {
 		for _, outDev := range r.outputs {
@@ -609,6 +621,8 @@ func (r *Room) recompileRoutesLocked() {
 
 			coeffs := []float64{totalGain, 0.0, 0.0, totalGain}
 
+			log.Printf("[ROOM:ROUTE] Synthesized intra-room route=%s in=%s out=%s gain=%.2f", routeID, inDev, outDev, totalGain)
+
 			desired[routeID] = router.MatrixRoute{
 				ID:   routeID,
 				Name: fmt.Sprintf("room-%s-%s-%s", r.id, inDev, outDev),
@@ -637,21 +651,34 @@ func (r *Room) recompileRoutesLocked() {
 	// Remove routes no longer wanted
 	for oldID := range r.compiledRoutes {
 		if _, stillWanted := desired[oldID]; !stillWanted {
+			log.Printf("[ROOM:ROUTE] Stopping obsolete route=%s", oldID)
 			if r.streamMgr != nil {
-				_ = r.streamMgr.StopRoute(oldID)
+				if err := r.streamMgr.StopRoute(oldID); err != nil {
+					log.Printf("[ROOM:ROUTE] ERROR stopping stream route %s: %v", oldID, err)
+				}
 			}
-			_ = r.router.DeleteMatrix(oldID)
+			if err := r.router.DeleteMatrix(oldID); err != nil {
+				log.Printf("[ROOM:ROUTE] ERROR deleting matrix route %s: %v", oldID, err)
+			}
 			delete(r.compiledRoutes, oldID)
 		}
 	}
 
 	// Add or update desired routes
 	for routeID, mr := range desired {
-		_ = r.router.AddMatrix(mr)
+		if err := r.router.AddMatrix(mr); err != nil {
+			log.Printf("[ROOM:ROUTE] ERROR adding matrix route %s: %v", routeID, err)
+		}
 		r.compiledRoutes[routeID] = struct{}{}
 		if r.streamMgr != nil {
 			sr := router.MatrixRouteToStreamRoute(mr)
-			_ = r.streamMgr.StartRoute(sr)
+			log.Printf("[ROOM:ROUTE] Starting stream route=%s (srcURN=%s dstURN=%s dests=%v)",
+				sr.ID, sr.SourceDeviceURN, sr.DestDeviceURN, sr.Destinations)
+			if err := r.streamMgr.StartRoute(sr); err != nil {
+				log.Printf("[ROOM:ROUTE] CRITICAL: failed to start stream route %s: %v", routeID, err)
+			} else {
+				log.Printf("[ROOM:ROUTE] SUCCESS: stream route %s started", routeID)
+			}
 		}
 	}
 }

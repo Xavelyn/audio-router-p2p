@@ -228,13 +228,22 @@ func collectLocalIPs(trans streamer.Transport, disc *discovery.Discovery) []stri
 }
 
 func destIsLocal(hostport string, localIPs []string) bool {
+	if hostport == "local" || hostport == "localhost" {
+		return true
+	}
 	host, _, err := net.SplitHostPort(hostport)
 	if err != nil {
 		host = hostport
 	}
+	if host == "local" || host == "localhost" {
+		return true
+	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return false
+	}
+	if ip.IsLoopback() {
+		return true
 	}
 	for _, l := range localIPs {
 		if l == ip.String() || l == host {
@@ -288,6 +297,14 @@ func (m *streamManager) SetHub(hub *apiTelemetry.TelemetryHub) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.hub = hub
+	log.Printf("[STREAM:MGR] TelemetryHub attached; binding taps retroactively...")
+	for id, as := range m.routes {
+		if as.st != nil {
+			tap := m.hub.RegisterTap(id, as.route.Channels)
+			as.st.SetAudioTap(tap)
+			log.Printf("[STREAM:MGR] [AUDIO:METER] retroactively attached tap to route=%s (%d channels)", id, as.route.Channels)
+		}
+	}
 }
 
 // StartRoute opens the source device and begins streaming per the route.
@@ -302,7 +319,11 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	if sr.Channels < 1 {
 		sr.Channels = 1
 	}
+	log.Printf("[STREAM:MGR] StartRoute called: routeID=%s srcURN=%q dstURN=%q peerID=%q dests=%v sr=%d ch=%d",
+		sr.ID, sr.SourceDeviceURN, sr.DestDeviceURN, sr.PeerID, sr.Destinations, sr.SampleRate, sr.Channels)
+
 	if old, ok := m.routes[sr.ID]; ok {
+		log.Printf("[STREAM:MGR] Stopping pre-existing stream for route=%s", sr.ID)
 		m.stopLocked(old)
 		delete(m.routes, sr.ID)
 	}
@@ -314,6 +335,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 
 	in, err := m.resolver.OpenInput(srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
 	if err != nil {
+		log.Printf("[STREAM:MGR] ERROR opening input device %s: %v", srcRef, err)
 		return fmt.Errorf("open input device %s: %w", srcRef, err)
 	}
 
@@ -321,7 +343,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	destAddrs := sr.Destinations
 
 	// If route has a peer ID, try to bind to that peer
-	if sr.PeerID != "" {
+	if sr.PeerID != "" && sr.PeerID != "local" {
 		if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
 			// Use peer's stream address if available
 			if !contains(destAddrs, peer.StreamAddr) {
@@ -342,20 +364,38 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 	}
 
+	hasLocalDest := false
+	if sr.PeerID == "local" || sr.PeerID == "" {
+		if sr.DestDeviceURN != "" || sr.DestDevice >= 0 {
+			hasLocalDest = true
+		}
+	}
 	for _, d := range destAddrs {
 		if destIsLocal(d, m.localIPs) {
-			dstRef := sr.DestDeviceURN
-			if dstRef == "" {
-				dstRef = strconv.Itoa(sr.DestDevice)
-			}
-			out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
-			if err != nil {
-				_ = in.Close()
-				return fmt.Errorf("open local output device %s: %w", dstRef, err)
-			}
+			hasLocalDest = true
 			break
 		}
 	}
+
+	if hasLocalDest && (sr.DestDeviceURN != "" || sr.DestDevice >= 0) {
+		dstRef := sr.DestDeviceURN
+		if dstRef == "" {
+			dstRef = strconv.Itoa(sr.DestDevice)
+		}
+		log.Printf("[STREAM:MGR] Opening local output device ref=%q for route=%s", dstRef, sr.ID)
+		out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+		if err != nil {
+			_ = in.Close()
+			log.Printf("[STREAM:MGR] ERROR opening local output device %s: %v", dstRef, err)
+			return fmt.Errorf("open local output device %s: %w", dstRef, err)
+		}
+		log.Printf("[STREAM:MGR] Successfully opened local output device ref=%q for route=%s", dstRef, sr.ID)
+
+		if len(destAddrs) == 0 {
+			destAddrs = []string{"127.0.0.1:45678"}
+		}
+	}
+
 	streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
 	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, m.disc.NodeID())
 	if err != nil {
@@ -363,6 +403,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		if out != nil {
 			_ = out.Close()
 		}
+		log.Printf("[STREAM:MGR] ERROR creating Streamer for route=%s: %v", sr.ID, err)
 		return err
 	}
 	if err := st.Start(in, destAddrs, out); err != nil {
@@ -370,6 +411,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		if out != nil {
 			_ = out.Close()
 		}
+		log.Printf("[STREAM:MGR] ERROR starting Streamer for route=%s: %v", sr.ID, err)
 		return err
 	}
 	if sr.PeerID != "" {
@@ -381,11 +423,15 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	if m.hub != nil {
 		tap := m.hub.RegisterTap(sr.ID, sr.Channels)
 		st.SetAudioTap(tap)
+		log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to route=%s (%d channels)", sr.ID, sr.Channels)
+	} else {
+		log.Printf("[STREAM:MGR] [AUDIO:METER] WARN: hub is nil when starting route=%s; tap will be bound retroactively once hub attaches", sr.ID)
 	}
 
 	// Save the potentially updated route (with peer binding)
 	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out}
-	log.Printf("route %s: streaming device %s -> %d destinations (peer: %s)", sr.ID, srcRef, len(destAddrs), sr.PeerID)
+	log.Printf("[STREAM:MGR] route %s: streaming device %s -> %d destinations (peer: %s, hasLocalOut: %t)",
+		sr.ID, srcRef, len(destAddrs), sr.PeerID, out != nil)
 	return nil
 }
 

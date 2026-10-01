@@ -30,11 +30,22 @@
     data.allRooms.filter((r) => !data.sourceRooms.some((source) => source.id === r.id))
   );
 
+  const deviceChecksum = $derived.by(() => {
+    const raw = data.device.urn || data.device.id || '';
+    if (raw.includes(':')) {
+      const parts = raw.split(':');
+      return parts[parts.length - 1];
+    }
+    return '';
+  });
+
   // Meter levels from meterStore
   const deviceStream = $derived.by(() => {
     for (const [sId, st] of Object.entries(meterStore.streams)) {
       if (
         sId.includes(data.device.id) ||
+        (data.device.urn && sId.includes(data.device.urn)) ||
+        (deviceChecksum && sId.includes(deviceChecksum)) ||
         (data.device.legacy_id && sId.includes(data.device.legacy_id)) ||
         data.sourceRooms.some((r) => sId.includes(r.id))
       ) {

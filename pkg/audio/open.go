@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gordonklaus/portaudio"
 )
@@ -41,10 +43,11 @@ func termPortAudio() {
 // portaudioInput wraps a blocking PortAudio input stream and exposes it as a
 // byte-oriented AudioStream (little-endian int16 PCM).
 type portaudioInput struct {
-	mu     sync.Mutex
-	stream *portaudio.Stream
-	buf    []int16
-	closed bool
+	mu           sync.Mutex
+	stream       *portaudio.Stream
+	buf          []int16
+	closed       bool
+	lastOverflow atomic.Int64
 }
 
 func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
@@ -92,6 +95,7 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 	if channels > dev.MaxInputChannels {
 		channels = dev.MaxInputChannels
 	}
+	log.Printf("[AUDIO:IO] Opening PortAudio input: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, dev.DefaultLowInputLatency)
 	buf := make([]int16, blocksPerBuffer*channels)
 	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
 		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
@@ -113,9 +117,11 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 		return s, nil
 	})
 	if err != nil {
+		log.Printf("[AUDIO:IO] ERROR opening PortAudio input device %q: %v", dev.Name, err)
 		termPortAudio()
 		return nil, err
 	}
+	log.Printf("[AUDIO:IO] PortAudio input online: device=%q channels=%d sampleRate=%d", dev.Name, channels, sampleRate)
 	return &portaudioInput{stream: st, buf: buf}, nil
 }
 
@@ -125,8 +131,17 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 	if p.closed {
 		return 0, io.EOF
 	}
-	if err := p.stream.Read(); err != nil && !errors.Is(err, portaudio.InputOverflowed) {
-		return 0, err
+	if err := p.stream.Read(); err != nil {
+		if errors.Is(err, portaudio.InputOverflowed) {
+			now := time.Now().UnixNano()
+			last := p.lastOverflow.Load()
+			if now-last > int64(time.Second) && p.lastOverflow.CompareAndSwap(last, now) {
+				log.Printf("[AUDIO:IO] Input buffer overflowed (XRun)")
+			}
+		} else {
+			log.Printf("[AUDIO:IO] Input stream read error: %v", err)
+			return 0, err
+		}
 	}
 	// dst must be able to hold one buffer; otherwise the excess frames are
 	// dropped (they have already been consumed from the audio device).
@@ -167,13 +182,14 @@ func (p *portaudioInput) Close() error {
 // byte-oriented AudioStream. Complete buffer-sized writes are played back in
 // real time; smaller writes are parked until a full buffer accumulates.
 type portaudioOutput struct {
-	mu         sync.Mutex
-	stream     *portaudio.Stream
-	buf        []int16
-	frameSize  int
-	blockBytes int
-	spill      []byte
-	closed     bool
+	mu            sync.Mutex
+	stream        *portaudio.Stream
+	buf           []int16
+	frameSize     int
+	blockBytes    int
+	spill         []byte
+	closed        bool
+	lastUnderflow atomic.Int64
 }
 
 func resolveOutputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
@@ -217,6 +233,7 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 	if channels > dev.MaxOutputChannels {
 		channels = dev.MaxOutputChannels
 	}
+	log.Printf("[AUDIO:IO] Opening PortAudio output: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, dev.DefaultLowOutputLatency)
 	buf := make([]int16, blocksPerBuffer*channels)
 	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
 		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
@@ -238,9 +255,11 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 		return s, nil
 	})
 	if err != nil {
+		log.Printf("[AUDIO:IO] ERROR opening PortAudio output device %q: %v", dev.Name, err)
 		termPortAudio()
 		return nil, err
 	}
+	log.Printf("[AUDIO:IO] PortAudio output online: device=%q channels=%d sampleRate=%d", dev.Name, channels, sampleRate)
 	return &portaudioOutput{
 		stream:     st,
 		buf:        buf,
@@ -267,9 +286,18 @@ func (o *portaudioOutput) Write(p []byte) (int, error) {
 		for i := range o.buf {
 			o.buf[i] = int16(binary.LittleEndian.Uint16(data[base+i*2:]))
 		}
-		if err := o.stream.Write(); err != nil && !errors.Is(err, portaudio.OutputUnderflowed) {
-			o.spill = append(o.spill[:0], data[off:end]...)
-			return off, err
+		if err := o.stream.Write(); err != nil {
+			if errors.Is(err, portaudio.OutputUnderflowed) {
+				now := time.Now().UnixNano()
+				last := o.lastUnderflow.Load()
+				if now-last > int64(time.Second) && o.lastUnderflow.CompareAndSwap(last, now) {
+					log.Printf("[AUDIO:IO] Output buffer underflowed (XRun)")
+				}
+			} else {
+				log.Printf("[AUDIO:IO] Output stream write error: %v", err)
+				o.spill = append(o.spill[:0], data[off:end]...)
+				return off, err
+			}
 		}
 		off += o.blockBytes
 	}

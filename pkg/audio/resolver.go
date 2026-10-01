@@ -2,6 +2,7 @@ package audio
 
 import (
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -71,6 +72,7 @@ func (r *DeviceResolver) registerLocked(dev Device) {
 	}
 
 	r.devices[dev.URN] = dev
+	log.Printf("[AUDIO:DEV] Registered device URN=%q name=%q runtimeID=%d legacyID=%q status=%s", dev.URN, dev.Name, dev.RuntimeID, dev.LegacyID, dev.Status)
 
 	// 1. PortAudio index aliases
 	if dev.LegacyID != "" {
@@ -222,15 +224,42 @@ func (r *DeviceResolver) IsQuarantined(ref string) bool {
 // OpenInput resolves the device identifier and opens an input stream.
 // If the device is quarantined, disconnected, or fails to open, a GhostAudioStream is returned.
 func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
+	log.Printf("[AUDIO:DEV] OpenInput called: ref=%q sampleRate=%d channels=%d emulator=%t", ref, sampleRate, channels, useEmulator)
 	dev, found := r.Resolve(ref)
-	if !found || dev.Status == "quarantined" || dev.Status == "disconnected" {
+	if !found {
+		if useEmulator {
+			devID := 0
+			if id, err := strconv.Atoi(ref); err == nil {
+				devID = id
+			}
+			log.Printf("[AUDIO:DEV] WARN: device ref=%q not in resolver catalog, opening emulator input stream directly (runtimeID=%d)", ref, devID)
+			return OpenInput(devID, sampleRate, channels, true)
+		}
+		log.Printf("[AUDIO:DEV] WARN: device ref=%q not found in resolver catalog. Falling back to GhostAudioStream (silent)", ref)
 		r.Quarantine(ref)
 		ghost := NewGhostAudioStream(sampleRate, channels)
 		return ghost, nil
 	}
 
+	if dev.Status == "quarantined" || dev.Status == "disconnected" {
+		log.Printf("[AUDIO:DEV] WARN: device URN=%q status is %q. Returning GhostAudioStream (silent)", dev.URN, dev.Status)
+		r.Quarantine(ref)
+		ghost := NewGhostAudioStream(sampleRate, channels)
+		return ghost, nil
+	}
+
+	r.mu.RLock()
+	if existing, ok := r.streams[dev.URN]; ok && existing != nil {
+		r.mu.RUnlock()
+		log.Printf("[AUDIO:DEV] SUCCESS: reusing active input stream for URN=%q runtimeID=%d", dev.URN, dev.RuntimeID)
+		return existing, nil
+	}
+	r.mu.RUnlock()
+
+	log.Printf("[AUDIO:DEV] Resolved input ref=%q to device URN=%q runtimeID=%d (Name=%q)", ref, dev.URN, dev.RuntimeID, dev.Name)
 	st, err := OpenInput(dev.RuntimeID, sampleRate, channels, useEmulator)
 	if err != nil {
+		log.Printf("[AUDIO:DEV] ERROR: failed to open hardware input URN=%q runtimeID=%d: %v. Quarantining and substituting GhostAudioStream", dev.URN, dev.RuntimeID, err)
 		r.Quarantine(dev.URN)
 		ghost := NewGhostAudioStream(sampleRate, channels)
 		return ghost, nil
@@ -243,21 +272,49 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 	r.streams[dev.URN] = st
 	r.mu.Unlock()
 
+	log.Printf("[AUDIO:DEV] SUCCESS: hardware input stream online for URN=%q runtimeID=%d", dev.URN, dev.RuntimeID)
 	return st, nil
 }
 
 // OpenOutput resolves the device identifier and opens an output stream.
 // If the device is quarantined, disconnected, or fails to open, a GhostAudioStream is returned.
 func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
+	log.Printf("[AUDIO:DEV] OpenOutput called: ref=%q sampleRate=%d channels=%d emulator=%t", ref, sampleRate, channels, useEmulator)
 	dev, found := r.Resolve(ref)
-	if !found || dev.Status == "quarantined" || dev.Status == "disconnected" {
+	if !found {
+		if useEmulator {
+			devID := 1
+			if id, err := strconv.Atoi(ref); err == nil {
+				devID = id
+			}
+			log.Printf("[AUDIO:DEV] WARN: device ref=%q not in resolver catalog, opening emulator output stream directly (runtimeID=%d)", ref, devID)
+			return OpenOutput(devID, sampleRate, channels, true)
+		}
+		log.Printf("[AUDIO:DEV] WARN: device ref=%q not found in resolver catalog. Falling back to GhostAudioStream (silent)", ref)
 		r.Quarantine(ref)
 		ghost := NewGhostAudioStream(sampleRate, channels)
 		return ghost, nil
 	}
 
+	if dev.Status == "quarantined" || dev.Status == "disconnected" {
+		log.Printf("[AUDIO:DEV] WARN: device URN=%q status is %q. Returning GhostAudioStream (silent)", dev.URN, dev.Status)
+		r.Quarantine(ref)
+		ghost := NewGhostAudioStream(sampleRate, channels)
+		return ghost, nil
+	}
+
+	r.mu.RLock()
+	if existing, ok := r.streams[dev.URN]; ok && existing != nil {
+		r.mu.RUnlock()
+		log.Printf("[AUDIO:DEV] SUCCESS: reusing active output stream for URN=%q runtimeID=%d", dev.URN, dev.RuntimeID)
+		return existing, nil
+	}
+	r.mu.RUnlock()
+
+	log.Printf("[AUDIO:DEV] Resolved output ref=%q to device URN=%q runtimeID=%d (Name=%q)", ref, dev.URN, dev.RuntimeID, dev.Name)
 	st, err := OpenOutput(dev.RuntimeID, sampleRate, channels, useEmulator)
 	if err != nil {
+		log.Printf("[AUDIO:DEV] ERROR: failed to open hardware output URN=%q runtimeID=%d: %v. Quarantining and substituting GhostAudioStream", dev.URN, dev.RuntimeID, err)
 		r.Quarantine(dev.URN)
 		ghost := NewGhostAudioStream(sampleRate, channels)
 		return ghost, nil
@@ -270,6 +327,7 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 	r.streams[dev.URN] = st
 	r.mu.Unlock()
 
+	log.Printf("[AUDIO:DEV] SUCCESS: hardware output stream online for URN=%q runtimeID=%d", dev.URN, dev.RuntimeID)
 	return st, nil
 }
 
