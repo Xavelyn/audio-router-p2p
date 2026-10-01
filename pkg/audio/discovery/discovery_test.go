@@ -137,6 +137,62 @@ func TestDiscoverWithRoots_Tiers(t *testing.T) {
 	}
 }
 
+func TestDiscoverWithRoots_SplitSubdevices(t *testing.T) {
+	tmpDir := t.TempDir()
+	sysRoot := filepath.Join(tmpDir, "sys", "class", "sound")
+	procRoot := filepath.Join(tmpDir, "proc", "asound")
+
+	if err := os.MkdirAll(sysRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(procRoot, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Setup Creative Sound Blaster Play! 3: USB Audio (041e:3232, serial 0000005Z)
+	// Subdevice 0 is Playback only (pcmC0D0p)
+	// Subdevice 1 is Capture only (pcmC0D1c)
+	usbDir := filepath.Join(tmpDir, "sys", "devices", "pci0000:00", "0000:00:14.0", "usb1", "1-1")
+	usbIfaceDir := filepath.Join(usbDir, "1-1:1.0", "sound", "card0")
+	if err := os.MkdirAll(usbIfaceDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.WriteFile(filepath.Join(usbDir, "idVendor"), []byte("041e\n"), 0644)
+	_ = os.WriteFile(filepath.Join(usbDir, "idProduct"), []byte("3232\n"), 0644)
+	_ = os.WriteFile(filepath.Join(usbDir, "serial"), []byte("0000005Z\n"), 0644)
+
+	card0Link := filepath.Join(sysRoot, "card0")
+	if err := os.Symlink(usbIfaceDir, card0Link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(usbDir, "1-1:1.0"), filepath.Join(usbIfaceDir, "device")); err != nil {
+		t.Fatal(err)
+	}
+	// PCM device 0 is Playback only
+	_ = os.WriteFile(filepath.Join(sysRoot, "pcmC0D0p"), []byte(""), 0644)
+	// PCM device 1 is Capture only
+	_ = os.WriteFile(filepath.Join(sysRoot, "pcmC0D1c"), []byte(""), 0644)
+
+	devs, err := DiscoverWithRoots(sysRoot, procRoot)
+	if err != nil {
+		t.Fatalf("DiscoverWithRoots failed: %v", err)
+	}
+
+	if len(devs) != 2 {
+		t.Fatalf("expected 2 endpoints for split subdevices, got %d", len(devs))
+	}
+
+	d0 := devs[0]
+	if d0.URN != "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=0" || !d0.CanPlayback || d0.CanCapture {
+		t.Errorf("subdevice 0 should be playback only: URN=%s CanPlay=%v CanCap=%v", d0.URN, d0.CanPlayback, d0.CanCapture)
+	}
+
+	d1 := devs[1]
+	if d1.URN != "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=1" || d1.CanPlayback || !d1.CanCapture {
+		t.Errorf("subdevice 1 should be capture only: URN=%s CanPlay=%v CanCap=%v", d1.URN, d1.CanPlayback, d1.CanCapture)
+	}
+}
+
 func TestDiscoverWithRoots_MissingDirectory(t *testing.T) {
 	devs, err := DiscoverWithRoots("/non/existent/sys", "/non/existent/proc")
 	if err == nil {

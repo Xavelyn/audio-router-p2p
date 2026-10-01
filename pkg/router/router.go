@@ -292,18 +292,33 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 		outChans[i] = i
 	}
 	idMatrix := NewIdentityGainMatrix(ch)
+
+	srcDevID := sr.SourceDeviceURN
+	if srcDevID == "" {
+		srcDevID = fmt.Sprintf("%d", sr.SourceDevice)
+	}
+
+	dstDevID := sr.DestDeviceURN
+	if dstDevID == "" {
+		if sr.DestDevice >= 0 {
+			dstDevID = fmt.Sprintf("%d", sr.DestDevice)
+		} else {
+			dstDevID = "0"
+		}
+	}
+
 	return MatrixRoute{
 		ID:   sr.ID,
 		Name: sr.ID,
 		Source: MatrixEndpoint{
 			NodeID:   srcNode,
-			DeviceID: fmt.Sprintf("%d", sr.SourceDevice),
+			DeviceID: srcDevID,
 			Layout:   LayoutStereo,
 			Channels: inChans,
 		},
 		Destination: MatrixEndpoint{
 			NodeID:   dstNode,
-			DeviceID: "0",
+			DeviceID: dstDevID,
 			Layout:   LayoutStereo,
 			Channels: outChans,
 		},

@@ -1,9 +1,12 @@
 package group
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -99,6 +102,18 @@ type managedRoom struct {
 	joined   bool
 }
 
+// PersistedRoom is the file-backed format for serializing audio room state.
+type PersistedRoom struct {
+	ID          string             `json:"id"`
+	Name        string             `json:"name"`
+	Leader      string             `json:"leader"`
+	Inputs      []string           `json:"inputs"`
+	Outputs     []string           `json:"outputs"`
+	Synced      bool               `json:"synced"`
+	InputGains  map[string]float64 `json:"input_gains,omitempty"`
+	OutputGains map[string]float64 `json:"output_gains,omitempty"`
+}
+
 // DefaultRoomManager coordinates room lifecycles, discovery presence, deterministic
 // leader election, and group audio streaming matching api.RoomManager.
 type DefaultRoomManager struct {
@@ -111,8 +126,9 @@ type DefaultRoomManager struct {
 	streamMgr   StreamManager
 	devProvider DeviceProvider
 
-	rooms  map[string]*managedRoom
-	closed bool
+	roomsFile string
+	rooms     map[string]*managedRoom
+	closed    bool
 
 	// OnLeaderChange is an optional notification hook for testing or external monitoring.
 	OnLeaderChange func(roomID string, newLeader string)
@@ -139,12 +155,21 @@ func NewDefaultRoomManager(
 		dp = NewDefaultDeviceProvider(48000, 2, useEmu)
 	}
 
+	roomsFile := ""
+	if cfg != nil {
+		roomsFile = cfg.RoomsFile
+		if roomsFile == "" {
+			roomsFile = "rooms.json"
+		}
+	}
+
 	return &DefaultRoomManager{
 		cfg:         cfg,
 		disc:        disc,
 		syncMgr:     syncMgr,
 		trans:       trans,
 		devProvider: dp,
+		roomsFile:   roomsFile,
 		rooms:       make(map[string]*managedRoom),
 	}
 }
@@ -229,9 +254,9 @@ func (m *DefaultRoomManager) roomInfoLocked(r *Room) api.RoomInfo {
 // CreateRoom registers a new room. If id is empty, a random ID is generated.
 func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if m.closed {
+		m.mu.Unlock()
 		return api.RoomInfo{}, errors.New("room manager is closed")
 	}
 
@@ -240,7 +265,9 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 	}
 
 	if mr, ok := m.rooms[id]; ok {
-		return m.roomInfoLocked(mr.room), nil
+		info := m.roomInfoLocked(mr.room)
+		m.mu.Unlock()
+		return info, nil
 	}
 
 	localPeerID := ""
@@ -274,8 +301,33 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 		room: room,
 	}
 	m.rooms[id] = mr
+	info := m.roomInfoLocked(room)
+	m.mu.Unlock()
 
-	return m.roomInfoLocked(room), nil
+	_ = m.Save()
+	return info, nil
+}
+
+// DeleteRoom removes a room, tears down any active stream, cleans up routes, and persists.
+func (m *DefaultRoomManager) DeleteRoom(id string) error {
+	m.mu.Lock()
+	mr, ok := m.rooms[id]
+	if !ok {
+		m.mu.Unlock()
+		return fmt.Errorf("room %s not found", id)
+	}
+	gs := mr.streamer
+	mr.streamer = nil
+	mr.joined = false
+	delete(m.rooms, id)
+	m.mu.Unlock()
+
+	if gs != nil {
+		gs.Stop()
+	}
+	_ = mr.room.Leave()
+	_ = m.Save()
+	return nil
 }
 
 // AddInput binds an audio input device to a room and re-synthesizes intra-room routes.
@@ -286,7 +338,11 @@ func (m *DefaultRoomManager) AddInput(roomID, deviceID string) error {
 	if !ok {
 		return fmt.Errorf("room %s not found", roomID)
 	}
-	return mr.room.AddInput(deviceID)
+	if err := mr.room.AddInput(deviceID); err != nil {
+		return err
+	}
+	_ = m.Save()
+	return nil
 }
 
 // RemoveInput unbinds an audio input device from a room and cleans up routes.
@@ -297,7 +353,11 @@ func (m *DefaultRoomManager) RemoveInput(roomID, deviceID string) error {
 	if !ok {
 		return fmt.Errorf("room %s not found", roomID)
 	}
-	return mr.room.RemoveInput(deviceID)
+	if err := mr.room.RemoveInput(deviceID); err != nil {
+		return err
+	}
+	_ = m.Save()
+	return nil
 }
 
 // AddOutput binds an audio output device to a room and re-synthesizes intra-room routes.
@@ -308,7 +368,11 @@ func (m *DefaultRoomManager) AddOutput(roomID, deviceID string) error {
 	if !ok {
 		return fmt.Errorf("room %s not found", roomID)
 	}
-	return mr.room.AddOutput(deviceID)
+	if err := mr.room.AddOutput(deviceID); err != nil {
+		return err
+	}
+	_ = m.Save()
+	return nil
 }
 
 // RemoveOutput unbinds an audio output device from a room and cleans up routes.
@@ -319,7 +383,11 @@ func (m *DefaultRoomManager) RemoveOutput(roomID, deviceID string) error {
 	if !ok {
 		return fmt.Errorf("room %s not found", roomID)
 	}
-	return mr.room.RemoveOutput(deviceID)
+	if err := mr.room.RemoveOutput(deviceID); err != nil {
+		return err
+	}
+	_ = m.Save()
+	return nil
 }
 
 // SetRoomSync configures the distributed synchronization flag for a room.
@@ -330,7 +398,11 @@ func (m *DefaultRoomManager) SetRoomSync(roomID string, synced bool) error {
 	if !ok {
 		return fmt.Errorf("room %s not found", roomID)
 	}
-	return mr.room.SetRoomSync(synced)
+	if err := mr.room.SetRoomSync(synced); err != nil {
+		return err
+	}
+	_ = m.Save()
+	return nil
 }
 
 // SetRoomBindings updates inputs, outputs, and sync state for a room in a single atomic transaction.
@@ -341,7 +413,11 @@ func (m *DefaultRoomManager) SetRoomBindings(roomID string, inputs, outputs []st
 	if !ok {
 		return fmt.Errorf("room %s not found", roomID)
 	}
-	return mr.room.SetRoomBindings(inputs, outputs, synced)
+	if err := mr.room.SetRoomBindings(inputs, outputs, synced); err != nil {
+		return err
+	}
+	_ = m.Save()
+	return nil
 }
 
 // SetInputGain updates trim gain for an input device in a room.
@@ -353,6 +429,7 @@ func (m *DefaultRoomManager) SetInputGain(roomID, deviceID string, gain float64)
 		return fmt.Errorf("room %s not found", roomID)
 	}
 	mr.room.SetInputGain(deviceID, gain)
+	_ = m.Save()
 	return nil
 }
 
@@ -365,6 +442,7 @@ func (m *DefaultRoomManager) SetOutputGain(roomID, deviceID string, gain float64
 		return fmt.Errorf("room %s not found", roomID)
 	}
 	mr.room.SetOutputGain(deviceID, gain)
+	_ = m.Save()
 	return nil
 }
 
@@ -483,6 +561,7 @@ func (m *DefaultRoomManager) Close() error {
 	for _, r := range roomsToLeave {
 		_ = r.Leave()
 	}
+	_ = m.Save()
 	return nil
 }
 
@@ -518,4 +597,166 @@ func (m *DefaultRoomManager) GetStreamer(id string) (*GroupStreamer, bool) {
 		return nil, false
 	}
 	return mr.streamer, true
+}
+
+// SetRoomsFile sets the backing file path for room configuration persistence.
+func (m *DefaultRoomManager) SetRoomsFile(path string) {
+	m.mu.Lock()
+	m.roomsFile = path
+	m.mu.Unlock()
+}
+
+// Load loads persisted rooms from disk and reconstructs their configurations and bindings.
+func (m *DefaultRoomManager) Load(filePath ...string) error {
+	path := ""
+	if len(filePath) > 0 && filePath[0] != "" {
+		path = filePath[0]
+	}
+
+	m.mu.Lock()
+	if path != "" {
+		m.roomsFile = path
+	}
+	file := m.roomsFile
+	m.mu.Unlock()
+
+	if file == "" {
+		return nil
+	}
+
+	data, err := os.ReadFile(file)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("reading %s: %w", file, err)
+	}
+	if len(data) == 0 {
+		return nil
+	}
+
+	var persisted map[string]PersistedRoom
+	if err := json.Unmarshal(data, &persisted); err != nil {
+		return fmt.Errorf("parsing %s: %w", file, err)
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	localPeerID := ""
+	if m.disc != nil {
+		localPeerID = m.disc.NodeID()
+	}
+
+	for id, pr := range persisted {
+		if _, exists := m.rooms[id]; exists {
+			continue
+		}
+
+		room := NewRoom(RoomConfig{
+			ID:            RoomID(id),
+			Name:          pr.Name,
+			LocalPeerID:   localPeerID,
+			Config:        m.cfg,
+			Discovery:     m.disc,
+			SyncManager:   m.syncMgr,
+			Transport:     m.trans,
+			Router:        m.router,
+			StreamManager: m.streamMgr,
+		})
+
+		roomID := room.ID()
+		room.SetCallbacks(
+			nil,
+			nil,
+			func(newLeader string) {
+				m.handleLeaderChange(roomID, newLeader)
+			},
+			nil,
+		)
+
+		if pr.Leader != "" {
+			room.SetLeader(pr.Leader)
+		}
+		for dev, gain := range pr.InputGains {
+			room.SetInputGain(dev, gain)
+		}
+		for dev, gain := range pr.OutputGains {
+			room.SetOutputGain(dev, gain)
+		}
+		room.SetBindings(pr.Inputs, pr.Outputs, pr.Synced)
+
+		m.rooms[id] = &managedRoom{
+			room: room,
+		}
+		log.Printf("[ROOM:PERSIST] Restored room %s (%q) inputs=%v outputs=%v synced=%v", id, pr.Name, pr.Inputs, pr.Outputs, pr.Synced)
+	}
+	return nil
+}
+
+func (m *DefaultRoomManager) getSnapshot() (string, map[string]PersistedRoom) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.roomsFile == "" {
+		return "", nil
+	}
+	snapshot := make(map[string]PersistedRoom, len(m.rooms))
+	for id, mr := range m.rooms {
+		r := mr.room
+		snapshot[id] = PersistedRoom{
+			ID:          string(r.ID()),
+			Name:        r.Name(),
+			Leader:      r.Leader(),
+			Inputs:      r.Inputs(),
+			Outputs:     r.Outputs(),
+			Synced:      r.Synced(),
+			InputGains:  r.InputGains(),
+			OutputGains: r.OutputGains(),
+		}
+	}
+	return m.roomsFile, snapshot
+}
+
+// Save persists the current room configuration snapshot to disk atomically.
+func (m *DefaultRoomManager) Save() error {
+	file, snapshot := m.getSnapshot()
+	if file == "" || snapshot == nil {
+		return nil
+	}
+	dir := filepath.Dir(file)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+	}
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(file, data)
+}
+
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	tmp, err := os.CreateTemp(dir, ".rooms-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }

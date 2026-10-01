@@ -82,8 +82,18 @@ export class FlowLayoutStore {
         this.sidebarOpen = !parsed.sidebarCollapsed;
       }
 
+      const MOCK_DEVICE_IDS = new Set([
+        'hw:0',
+        'hw:1',
+        'virt:loop-main',
+        'hw:scarlett18i20',
+        'hw:iem-rig-01',
+        'hw:dante-vsc',
+        'hw:program-return',
+      ]);
+
       if (Array.isArray(parsed.stagedDeviceIds)) {
-        this.enabledDevices = new Set(parsed.stagedDeviceIds);
+        this.enabledDevices = new Set(parsed.stagedDeviceIds.filter((id) => !MOCK_DEVICE_IDS.has(id)));
       }
 
       if (Array.isArray(parsed.collapsedNodes)) {
@@ -93,6 +103,20 @@ export class FlowLayoutStore {
       if (parsed.nodePositions && typeof parsed.nodePositions === 'object') {
         const nextPos = new Map<string, { x: number; y: number }>();
         for (const [key, val] of Object.entries(parsed.nodePositions)) {
+          if (
+            key.includes('hw:0') ||
+            key.includes('hw:1') ||
+            key.includes('virt:loop-main') ||
+            key.includes('scarlett18i20') ||
+            key.includes('iem-rig-01') ||
+            key.includes('dante-vsc') ||
+            key.includes('program-return') ||
+            key === 'room-main-broadcast' ||
+            key === 'room-in-ear-monitors' ||
+            key === 'room-control-booth'
+          ) {
+            continue;
+          }
           if (val && typeof val.x === 'number' && typeof val.y === 'number' && !isNaN(val.x) && !isNaN(val.y)) {
             nextPos.set(key, { x: Math.round(val.x), y: Math.round(val.y) });
           }

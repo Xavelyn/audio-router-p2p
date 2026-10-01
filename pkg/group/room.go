@@ -154,6 +154,11 @@ func NewRoom(cfg RoomConfig) *Room {
 	return r
 }
 
+// SetLeader updates the current room leader peer ID.
+func (r *Room) SetLeader(leader string) {
+	r.leader.Store(leader)
+}
+
 func generateRoomID() string {
 	b := make([]byte, 8)
 	rand.Read(b)

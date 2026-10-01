@@ -64,6 +64,16 @@ func (m *mockV1RoomManager) LeaveRoom(id string) error {
 	return nil
 }
 
+func (m *mockV1RoomManager) DeleteRoom(id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.rooms[id]; !ok {
+		return errors.New("room not found")
+	}
+	delete(m.rooms, id)
+	return nil
+}
+
 func (m *mockV1RoomManager) AddInput(roomID, deviceID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

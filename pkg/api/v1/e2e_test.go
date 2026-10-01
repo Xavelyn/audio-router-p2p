@@ -71,6 +71,14 @@ func (m *mockE2ERoomManager) LeaveRoom(id string) error {
 	return nil
 }
 
+func (m *mockE2ERoomManager) DeleteRoom(id string) error {
+	if _, ok := m.rooms[id]; !ok {
+		return fmt.Errorf("room not found: %s", id)
+	}
+	delete(m.rooms, id)
+	return nil
+}
+
 func (m *mockE2ERoomManager) AddInput(roomID, deviceID string) error {
 	if r, ok := m.rooms[roomID]; ok {
 		r.Inputs = append(r.Inputs, deviceID)

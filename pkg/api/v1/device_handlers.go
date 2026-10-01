@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -148,6 +149,13 @@ func (reg *DeviceRegistry) ListDevices(kind string) ([]AudioDevice, error) {
 
 	if result == nil {
 		result = []AudioDevice{}
+	} else {
+		sort.Slice(result, func(i, j int) bool {
+			if result[i].IsVirtual != result[j].IsVirtual {
+				return !result[i].IsVirtual
+			}
+			return result[i].ID < result[j].ID
+		})
 	}
 	return result, nil
 }

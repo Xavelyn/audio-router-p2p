@@ -118,6 +118,9 @@ func main() {
 	roomMgr := group.NewDefaultRoomManager(cfg, disc, sm, trans)
 	roomMgr.SetRouter(rt)
 	roomMgr.SetStreamManager(streams)
+	if err := roomMgr.Load(cfg.RoomsFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("load rooms from %s: %v", cfg.RoomsFile, err)
+	}
 	if cfg.RoomAutoJoin || cfg.RoomID != "" {
 		roomID := cfg.RoomID
 		if roomID == "" {

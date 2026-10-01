@@ -37,7 +37,7 @@
           {#if authStore.connectionStatus === 'unauthorized'}
             Authentication required to modify audio crossbar and provision devices.
           {:else}
-            {authStore.lastError || 'Unable to connect to audio router daemon at ' + authStore.activeDaemonUrl}. Running in local simulation mode.
+            {authStore.lastError || 'Unable to connect to audio router daemon at ' + authStore.activeDaemonUrl}.
           {/if}
         </span>
       </div>

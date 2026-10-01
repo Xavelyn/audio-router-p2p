@@ -233,12 +233,14 @@
           <div class="mt-2 text-2xl font-mono font-bold text-emerald-400 flex items-center gap-1.5">
             {#if clusterStore.localNode?.clock_sync?.is_master || clusterStore.localNode?.clock_role === 'master'}
               <span>PTP MASTER</span>
-            {:else}
+            {:else if clusterStore.localNode}
               <span>LOCKED</span>
+            {:else}
+              <span class="text-zinc-500 text-lg">STANDALONE</span>
             {/if}
           </div>
           <div class="mt-1 text-[10px] font-mono text-zinc-400">
-            Offset: {((clusterStore.localNode?.clock_sync?.offset_us ?? clusterStore.localNode?.clock_offset_us) ?? 0).toFixed(2)} &mu;s
+            Offset: {clusterStore.localNode ? ((clusterStore.localNode.clock_sync?.offset_us ?? clusterStore.localNode.clock_offset_us) ?? 0).toFixed(2) + ' μs' : '—'}
           </div>
         </div>
 
@@ -252,7 +254,7 @@
             {discHealth?.active_members ?? clusterStore.nodes.length} <span class="text-xs text-zinc-500 font-normal">Active</span>
           </div>
           <div class="mt-1 text-[10px] font-mono text-zinc-400">
-            {discHealth?.beacons_received ?? 2840} beacons rx
+            {discHealth?.beacons_received ?? 0} beacons rx
           </div>
         </div>
 
@@ -288,7 +290,12 @@
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {#each clusterStore.nodes as node}
+          {#if clusterStore.nodes.length === 0}
+            <div class="col-span-full rounded-xl border border-dashed border-zinc-800 p-8 text-center text-xs font-mono text-zinc-500">
+              No cluster nodes discovered. Connect to a gateway node to view topology.
+            </div>
+          {:else}
+            {#each clusterStore.nodes as node}
             {@const isSelected = activeNode?.id === node.id || activeNode?.node_id === node.node_id}
             {@const swim = getSwimBadge(node.swim_state)}
             {@const healthStyles = getHealthColor(node.health_score)}
@@ -402,6 +409,7 @@
               </div>
             </div>
           {/each}
+          {/if}
         </div>
       </div>
 
@@ -580,19 +588,19 @@
               <div class="space-y-2 text-xs font-mono">
                 <div class="flex justify-between">
                   <span class="text-zinc-400">FEC Recovered:</span>
-                  <span class="text-emerald-400 font-bold">{fec?.packets_recovered_total ?? 14} pkts</span>
+                  <span class="text-emerald-400 font-bold">{fec?.packets_recovered_total ?? 0} pkts</span>
                 </div>
                 <div class="flex justify-between">
                   <span class="text-zinc-400">PLC Concealed:</span>
-                  <span class="text-amber-400 font-bold">{plc?.concealed_frames_total ?? 4} frames</span>
+                  <span class="text-amber-400 font-bold">{plc?.concealed_frames_total ?? 0} frames</span>
                 </div>
                 <div class="flex justify-between">
                   <span class="text-zinc-400">ASRC Drift:</span>
-                  <span class="text-cyan-400 font-bold">{asrc?.drift_ppm ? asrc.drift_ppm.toFixed(2) : '-1.82'} PPM</span>
+                  <span class="text-cyan-400 font-bold">{asrc?.drift_ppm !== undefined ? asrc.drift_ppm.toFixed(2) : '0.00'} PPM</span>
                 </div>
                 <div class="flex justify-between">
                   <span class="text-zinc-400">Resample Ratio:</span>
-                  <span class="text-zinc-200 font-bold">{asrc?.resample_ratio ? asrc.resample_ratio.toFixed(7) : '0.9999982'}</span>
+                  <span class="text-zinc-200 font-bold">{asrc?.resample_ratio !== undefined ? asrc.resample_ratio.toFixed(7) : '1.0000000'}</span>
                 </div>
               </div>
             </div>
@@ -634,7 +642,7 @@
                   </div>
                   <div class="flex justify-between">
                     <span class="text-zinc-400">Effective Bitrate:</span>
-                    <span class="text-cyan-400 font-bold">{activeNode.bitrate_kbps ? `${activeNode.bitrate_kbps} kbps` : '1536 kbps'}</span>
+                    <span class="text-cyan-400 font-bold">{activeNode.bitrate_kbps ? `${activeNode.bitrate_kbps} kbps` : '—'}</span>
                   </div>
                 {/if}
                 <div class="flex justify-between">

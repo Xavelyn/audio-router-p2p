@@ -47,6 +47,7 @@ type RoomInfo struct {
 type RoomManager interface {
 	ListRooms() []RoomInfo
 	CreateRoom(id, name string) (RoomInfo, error)
+	DeleteRoom(id string) error
 	JoinRoom(id string) error
 	LeaveRoom(id string) error
 	AddInput(roomID, deviceID string) error
@@ -489,6 +490,14 @@ func (a *v1RoomManagerAdapter) CreateRoom(id, name string) (v1.RoomInfo, error) 
 		InputGains:  r.InputGains,
 		OutputGains: r.OutputGains,
 	}, nil
+}
+
+func (a *v1RoomManagerAdapter) DeleteRoom(id string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.DeleteRoom(id)
 }
 
 func (a *v1RoomManagerAdapter) JoinRoom(id string) error {

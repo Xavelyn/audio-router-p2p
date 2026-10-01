@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,7 +88,9 @@ func (r *DeviceResolver) registerLocked(dev Device) {
 		if len(matches) >= 3 && matches[2] != "" {
 			dIdx = matches[2]
 		}
-		r.aliases[fmt.Sprintf("hw:%s", cIdx)] = dev.URN
+		if dIdx == "0" {
+			r.aliases[fmt.Sprintf("hw:%s", cIdx)] = dev.URN
+		}
 		r.aliases[fmt.Sprintf("hw:%s,%s", cIdx, dIdx)] = dev.URN
 	}
 
@@ -136,11 +139,7 @@ func (r *DeviceResolver) Refresh() error {
 	return nil
 }
 
-// Resolve looks up a device by canonical URN or legacy alias.
-func (r *DeviceResolver) Resolve(ref string) (Device, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-
+func (r *DeviceResolver) resolveLocked(ref string) (Device, bool) {
 	ref = strings.TrimSpace(ref)
 
 	// Direct URN match
@@ -166,6 +165,45 @@ func (r *DeviceResolver) Resolve(ref string) (Device, bool) {
 	}
 
 	return Device{}, false
+}
+
+// Resolve looks up a device by canonical URN or legacy alias.
+func (r *DeviceResolver) Resolve(ref string) (Device, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.resolveLocked(ref)
+}
+
+// ResolveInput resolves a device reference specifically ensuring it can capture audio.
+// If the resolved device has 0 input channels, it checks for a capture-capable sibling.
+func (r *DeviceResolver) ResolveInput(ref string) (Device, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ref = strings.TrimSpace(ref)
+	dev, found := r.resolveLocked(ref)
+	if !found || dev.MaxInput == 0 {
+		if sibling, ok := r.findSiblingDeviceLocked(ref, true); ok {
+			return sibling, true
+		}
+	}
+	return dev, found
+}
+
+// ResolveOutput resolves a device reference specifically ensuring it can play audio.
+// If the resolved device has 0 output channels, it checks for a playback-capable sibling.
+func (r *DeviceResolver) ResolveOutput(ref string) (Device, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	ref = strings.TrimSpace(ref)
+	dev, found := r.resolveLocked(ref)
+	if !found || dev.MaxOutput == 0 {
+		if sibling, ok := r.findSiblingDeviceLocked(ref, false); ok {
+			return sibling, true
+		}
+	}
+	return dev, found
 }
 
 // Quarantine marks a device as disconnected/quarantined.
@@ -221,11 +259,42 @@ func (r *DeviceResolver) IsQuarantined(ref string) bool {
 	return r.quarantined[devURN]
 }
 
+func (r *DeviceResolver) findSiblingDeviceLocked(ref string, wantInput bool) (Device, bool) {
+	idx := strings.LastIndex(ref, ":d=")
+	if idx == -1 {
+		return Device{}, false
+	}
+	base := ref[:idx]
+	for _, dev := range r.devices {
+		if strings.HasPrefix(dev.URN, base+":d=") {
+			if wantInput && dev.MaxInput > 0 {
+				return dev, true
+			}
+			if !wantInput && dev.MaxOutput > 0 {
+				return dev, true
+			}
+		}
+	}
+	return Device{}, false
+}
+
 // OpenInput resolves the device identifier and opens an input stream.
 // If the device is quarantined, disconnected, or fails to open, a GhostAudioStream is returned.
 func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
 	log.Printf("[AUDIO:DEV] OpenInput called: ref=%q sampleRate=%d channels=%d emulator=%t", ref, sampleRate, channels, useEmulator)
 	dev, found := r.Resolve(ref)
+	if !found || dev.MaxInput == 0 {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(ref, true); ok {
+			if !strings.Contains(ref, ":d=") {
+				r.aliases[ref] = sibling.URN
+			}
+			dev = sibling
+			found = true
+			log.Printf("[AUDIO:DEV] Sibling auto-migration: ref=%q has no input channels, migrating to capture sibling URN=%q (runtimeID=%d)", ref, sibling.URN, sibling.RuntimeID)
+		}
+		r.mu.Unlock()
+	}
 	if !found {
 		if useEmulator {
 			devID := 0
@@ -281,6 +350,18 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
 	log.Printf("[AUDIO:DEV] OpenOutput called: ref=%q sampleRate=%d channels=%d emulator=%t", ref, sampleRate, channels, useEmulator)
 	dev, found := r.Resolve(ref)
+	if !found || dev.MaxOutput == 0 {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(ref, false); ok {
+			if !strings.Contains(ref, ":d=") {
+				r.aliases[ref] = sibling.URN
+			}
+			dev = sibling
+			found = true
+			log.Printf("[AUDIO:DEV] Sibling auto-migration: ref=%q has no output channels, migrating to playback sibling URN=%q (runtimeID=%d)", ref, sibling.URN, sibling.RuntimeID)
+		}
+		r.mu.Unlock()
+	}
 	if !found {
 		if useEmulator {
 			devID := 1
@@ -365,5 +446,14 @@ func (r *DeviceResolver) ListDevices() []Device {
 		}
 		out = append(out, d)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].IsVirtual != out[j].IsVirtual {
+			return !out[i].IsVirtual
+		}
+		if out[i].RuntimeID != out[j].RuntimeID {
+			return out[i].RuntimeID < out[j].RuntimeID
+		}
+		return out[i].URN < out[j].URN
+	})
 	return out
 }

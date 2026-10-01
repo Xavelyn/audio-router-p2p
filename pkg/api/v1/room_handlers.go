@@ -86,8 +86,8 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				s.WriteError(w, http.StatusNotFound, "ERR_NOT_FOUND", "room not found")
 				return
 			}
-			if err := s.roomMgr.LeaveRoom(roomID); err != nil {
-				s.WriteError(w, http.StatusNotFound, "ERR_NOT_FOUND", err.Error())
+			if err := s.roomMgr.DeleteRoom(roomID); err != nil {
+				s.WriteError(w, http.StatusInternalServerError, "ERR_DELETE_FAILED", err.Error())
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)

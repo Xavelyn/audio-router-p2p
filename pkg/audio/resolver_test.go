@@ -124,3 +124,80 @@ func TestDeviceResolver_AlsaNameRegex(t *testing.T) {
 		t.Fatalf("failed to resolve by hw:1,0: %+v", d2)
 	}
 }
+
+func TestDeviceResolver_SiblingSubdeviceMigration(t *testing.T) {
+	resolver := NewDeviceResolver()
+
+	// Creative Sound Blaster Play! 3:
+	// Subdevice 0: Playback ONLY (d=0)
+	// Subdevice 1: Capture ONLY (d=1)
+	spkURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=0"
+	micURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=1"
+
+	spkDev := Device{
+		ID:        spkURN,
+		URN:       spkURN,
+		LegacyID:  "0",
+		RuntimeID: 0,
+		Name:      "Sound Blaster Play! 3 (hw:1,0)",
+		MaxInput:  0,
+		MaxOutput: 2,
+	}
+	micDev := Device{
+		ID:        micURN,
+		URN:       micURN,
+		LegacyID:  "1",
+		RuntimeID: 1,
+		Name:      "Sound Blaster Play! 3 (hw:1,1)",
+		MaxInput:  2,
+		MaxOutput: 0,
+	}
+
+	resolver.Register(spkDev)
+	resolver.Register(micDev)
+
+	// If a user or legacy room configuration requested spkURN (d=0) as an INPUT:
+	// Resolver OpenInput should auto-migrate to micURN (d=1)
+	inStream, err := resolver.OpenInput(spkURN, 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenInput error: %v", err)
+	}
+	if inStream == nil {
+		t.Fatal("expected valid input stream")
+	}
+	_ = inStream.Close()
+
+	// ResolveInput should resolve to micURN
+	migratedIn, okIn := resolver.ResolveInput(spkURN)
+	if !okIn || migratedIn.URN != micURN {
+		t.Errorf("expected ResolveInput migration to micURN (%s), got %+v", micURN, migratedIn)
+	}
+
+	// Conversely, if micURN (d=1) is requested as an OUTPUT:
+	// Resolver OpenOutput should auto-migrate to spkURN (d=0)
+	outStream, err := resolver.OpenOutput(micURN, 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenOutput error: %v", err)
+	}
+	if outStream == nil {
+		t.Fatal("expected valid output stream")
+	}
+	_ = outStream.Close()
+
+	// ResolveOutput should resolve to spkURN
+	migratedOut, okOut := resolver.ResolveOutput(micURN)
+	if !okOut || migratedOut.URN != spkURN {
+		t.Errorf("expected ResolveOutput migration to spkURN (%s), got %+v", spkURN, migratedOut)
+	}
+
+	// Verify that standard Resolve() was NOT corrupted in aliases:
+	// spkURN must still resolve to spkURN, micURN must still resolve to micURN.
+	dSpk, okSpk := resolver.Resolve(spkURN)
+	if !okSpk || dSpk.URN != spkURN {
+		t.Errorf("canonical Resolve(%s) corrupted: got %s", spkURN, dSpk.URN)
+	}
+	dMic, okMic := resolver.Resolve(micURN)
+	if !okMic || dMic.URN != micURN {
+		t.Errorf("canonical Resolve(%s) corrupted: got %s", micURN, dMic.URN)
+	}
+}

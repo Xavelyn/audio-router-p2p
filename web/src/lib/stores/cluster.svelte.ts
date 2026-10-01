@@ -15,7 +15,7 @@ class ClusterStore {
   latencyMatrix = $state<Record<string, Record<string, number>>>({});
   networkHealth = $state<NetworkHealthResponse | null>(null);
 
-  clusterId = $state<string>('mesh-studio-cluster');
+  clusterId = $state<string>('');
   totalNodes = $state<number>(0);
   healthyNodes = $state<number>(0);
   degradedNodes = $state<number>(0);
@@ -60,7 +60,7 @@ class ClusterStore {
     if (this.networkHealth && typeof this.networkHealth.health_score === 'number') {
       return this.networkHealth.health_score;
     }
-    if (this.nodes.length === 0) return 100;
+    if (this.nodes.length === 0) return 0;
     const sum = this.nodes.reduce((acc, n) => acc + (n.health_score ?? 100), 0);
     return Math.round((sum / this.nodes.length) * 10) / 10;
   });
@@ -167,328 +167,28 @@ class ClusterStore {
         }
       }
 
-      // If cluster endpoints returned empty or failed, load fallback realistic data
-      if (!gotNodes || this.nodes.length === 0) {
-        this.applyFallbackClusterData();
+      if (!gotNodes) {
+        this.nodes = [];
+        this.devices = [];
+        this.totalNodes = 0;
+        this.healthyNodes = 0;
+        this.degradedNodes = 0;
+        this.activeNodes = 0;
       }
 
       this.error = null;
       this.lastUpdated = new Date();
     } catch (err: any) {
       this.error = err.message || 'Failed to poll cluster';
-      if (this.nodes.length === 0) {
-        this.applyFallbackClusterData();
-      }
+      this.nodes = [];
+      this.devices = [];
+      this.totalNodes = 0;
+      this.healthyNodes = 0;
+      this.degradedNodes = 0;
+      this.activeNodes = 0;
     } finally {
       this.isLoading = false;
     }
-  }
-
-  // Fallback realistic cluster data for resilient UI development & offline simulation
-  private applyFallbackClusterData() {
-    const localId = 'node-foh-master-01';
-    const peer1Id = 'node-stagebox-left';
-    const peer2Id = 'node-broadcast-truck';
-
-    const mockNodes: ClusterNodeSummary[] = [
-      {
-        id: localId,
-        node_id: localId,
-        name: 'FOH Master Console (Local)',
-        api_addr: 'https://10.0.1.10:8080',
-        is_local: true,
-        swim_state: 'alive',
-        health_score: 98.5,
-        health_grade: 'EXCELLENT',
-        clock_role: 'master',
-        clock_offset_us: 0.0,
-        clock_drift_ppm: 0.05,
-        clock_sync: {
-          offset_us: 0.0,
-          drift_ppm: 0.05,
-          sync_rtt_us: 0.0,
-          packets_sent: 2480,
-          packets_lost: 0,
-          is_master: true,
-        },
-        active_streams: 4,
-        packet_loss_ratio: 0.0001,
-        rtt_ms: 0.0,
-        bitrate_kbps: 3072,
-        uptime_seconds: 148200,
-        last_seen: new Date().toISOString(),
-        devices: [
-          {
-            id: 'hw:0',
-            device_id: 'hw:0',
-            node_id: localId,
-            node_name: 'FOH Master Console (Local)',
-            name: 'ALSA Default Soundcard (PCM 24-bit/48kHz)',
-            direction: 'duplex',
-            max_input: 2,
-            max_output: 2,
-            default_sample_rate: 48000,
-            is_virtual: false,
-            volume: 1.0,
-            muted: false,
-            supported_layouts: ['stereo'],
-            state: 'active',
-          },
-          {
-            id: 'virt:loop-main',
-            device_id: 'virt:loop-main',
-            node_id: localId,
-            node_name: 'FOH Master Console (Local)',
-            name: 'Virtual DAW Loopback Bus A',
-            direction: 'duplex',
-            max_input: 2,
-            max_output: 2,
-            default_sample_rate: 48000,
-            is_virtual: true,
-            volume: 0.95,
-            muted: false,
-            supported_layouts: ['stereo'],
-            state: 'active',
-          },
-        ],
-      },
-      {
-        id: peer1Id,
-        node_id: peer1Id,
-        name: 'Stagebox A (Left Wing)',
-        api_addr: 'https://10.0.1.11:8080',
-        is_local: false,
-        swim_state: 'alive',
-        health_score: 94.2,
-        health_grade: 'GOOD',
-        clock_role: 'slave',
-        clock_offset_us: -1.2,
-        clock_drift_ppm: -0.32,
-        clock_sync: {
-          offset_us: -1.2,
-          drift_ppm: -0.32,
-          sync_rtt_us: 920,
-          packets_sent: 2480,
-          packets_lost: 1,
-          is_master: false,
-        },
-        active_streams: 2,
-        packet_loss_ratio: 0.0018,
-        rtt_ms: 1.24,
-        bitrate_kbps: 1536,
-        uptime_seconds: 94100,
-        last_seen: new Date().toISOString(),
-        devices: [
-          {
-            id: 'hw:scarlett18i20',
-            device_id: 'hw:scarlett18i20',
-            node_id: peer1Id,
-            node_name: 'Stagebox A (Left Wing)',
-            name: 'Focusrite Scarlett 18i20 Preamp',
-            direction: 'input',
-            max_input: 8,
-            max_output: 0,
-            default_sample_rate: 48000,
-            is_virtual: false,
-            volume: 0.85,
-            muted: false,
-            supported_layouts: ['stereo', '7.1'],
-            state: 'active',
-          },
-          {
-            id: 'hw:iem-rig-01',
-            device_id: 'hw:iem-rig-01',
-            node_id: peer1Id,
-            node_name: 'Stagebox A (Left Wing)',
-            name: 'Stage In-Ear Monitor Transmitters 1-4',
-            direction: 'output',
-            max_input: 0,
-            max_output: 4,
-            default_sample_rate: 48000,
-            is_virtual: false,
-            volume: 0.9,
-            muted: false,
-            supported_layouts: ['quad'],
-            state: 'active',
-          },
-        ],
-      },
-      {
-        id: peer2Id,
-        node_id: peer2Id,
-        name: 'Broadcast Mobile OB-Van',
-        api_addr: 'https://10.0.2.20:8080',
-        is_local: false,
-        swim_state: 'alive',
-        health_score: 82.0,
-        health_grade: 'GOOD',
-        clock_role: 'slave',
-        clock_offset_us: 4.8,
-        clock_drift_ppm: 1.15,
-        clock_sync: {
-          offset_us: 4.8,
-          drift_ppm: 1.15,
-          sync_rtt_us: 4650,
-          packets_sent: 2472,
-          packets_lost: 8,
-          is_master: false,
-        },
-        active_streams: 2,
-        packet_loss_ratio: 0.0065,
-        rtt_ms: 4.65,
-        bitrate_kbps: 1536,
-        uptime_seconds: 36200,
-        last_seen: new Date().toISOString(),
-        devices: [
-          {
-            id: 'hw:dante-vsc',
-            device_id: 'hw:dante-vsc',
-            node_id: peer2Id,
-            node_name: 'Broadcast Mobile OB-Van',
-            name: 'Dante Virtual Soundcard Multitrack Feed',
-            direction: 'input',
-            max_input: 16,
-            max_output: 0,
-            default_sample_rate: 48000,
-            is_virtual: false,
-            volume: 0.9,
-            muted: false,
-            supported_layouts: ['custom'],
-            state: 'active',
-          },
-          {
-            id: 'hw:program-return',
-            device_id: 'hw:program-return',
-            node_id: peer2Id,
-            node_name: 'Broadcast Mobile OB-Van',
-            name: 'Live Program Return Master Audio',
-            direction: 'output',
-            max_input: 0,
-            max_output: 2,
-            default_sample_rate: 48000,
-            is_virtual: false,
-            volume: 1.0,
-            muted: false,
-            supported_layouts: ['stereo'],
-            state: 'active',
-          },
-        ],
-      },
-    ];
-
-    this.nodes = mockNodes;
-    this.totalNodes = mockNodes.length;
-    this.healthyNodes = mockNodes.length;
-    this.degradedNodes = 0;
-    this.activeNodes = mockNodes.length;
-
-    // Latency matrix
-    this.latencyMatrix = {
-      [localId]: {
-        [localId]: 0.0,
-        [peer1Id]: 1.24,
-        [peer2Id]: 4.65,
-      },
-      [peer1Id]: {
-        [localId]: 1.24,
-        [peer1Id]: 0.0,
-        [peer2Id]: 3.82,
-      },
-      [peer2Id]: {
-        [localId]: 4.65,
-        [peer1Id]: 3.82,
-        [peer2Id]: 0.0,
-      },
-    };
-
-    // Flatten devices
-    this.devices = mockNodes.flatMap((n) => n.devices);
-
-    this.networkHealth = {
-      node_id: localId,
-      timestamp: new Date().toISOString(),
-      health_score: 95.8,
-      health_grade: 'EXCELLENT',
-      cluster: {
-        active_members: 3,
-        suspect_members: 0,
-        dead_members: 0,
-        lan_beacon_active: true,
-        beacons_sent: 1420,
-        beacons_received: 2840,
-        token_rejections: 0,
-        seed_retry_active: false,
-        seed_join_attempts: 2,
-        seed_join_successes: 2,
-      },
-      sync: {
-        offset_us: 0.0,
-        drift_ppm: 0.05,
-        sync_rtt_us: 0.0,
-        packets_sent: 2480,
-        packets_lost: 0,
-        is_master: true,
-      },
-      latency_matrix: {
-        [peer1Id]: 1.24,
-        [peer2Id]: 4.65,
-      },
-      peers: {
-        [peer1Id]: {
-          peer_id: peer1Id,
-          address: '10.0.1.11:8080',
-          health_score: 94.2,
-          health_grade: 'GOOD',
-          swim_state: 'alive',
-          direct_ping_failed: false,
-          rtt_ms: 1.24,
-          last_seen: new Date().toISOString(),
-          loss_ratio: 0.0018,
-          bitrate_kbps: 1536,
-          streaming: {
-            stream_id: 'stream-stagebox-01',
-            packets_sent: 48920,
-            packets_received: 48910,
-            packets_lost: 10,
-            loss_ratio: 0.0002,
-            effective_kbps: 1536,
-            jitter_depth_frames: 3,
-            jitter_target_delay_ms: 1.5,
-            underruns: 0,
-            overruns: 0,
-            fec_recovered: 10,
-            plc_concealed: 2,
-          },
-        },
-        [peer2Id]: {
-          peer_id: peer2Id,
-          address: '10.0.2.20:8080',
-          health_score: 82.0,
-          health_grade: 'GOOD',
-          swim_state: 'alive',
-          direct_ping_failed: false,
-          rtt_ms: 4.65,
-          last_seen: new Date().toISOString(),
-          loss_ratio: 0.0065,
-          bitrate_kbps: 1536,
-          streaming: {
-            stream_id: 'stream-truck-01',
-            packets_sent: 48900,
-            packets_received: 48580,
-            packets_lost: 320,
-            loss_ratio: 0.0065,
-            effective_kbps: 1536,
-            jitter_depth_frames: 4,
-            jitter_target_delay_ms: 3.0,
-            underruns: 0,
-            overruns: 0,
-            fec_recovered: 290,
-            plc_concealed: 30,
-          },
-        },
-      },
-      local_underruns: 0,
-    };
   }
 
   // Update remote or local device volume / mute via atomic proxy

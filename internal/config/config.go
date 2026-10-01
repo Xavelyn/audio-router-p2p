@@ -21,6 +21,7 @@ type Config struct {
 	Encrypt     bool   // enable DTLS/SRTP encryption for audio streams
 	PSK         string // Pre-shared key for DTLS (base64 encoded)
 	RoutesFile  string // Path to the JSON routes file
+	RoomsFile   string // Path to the JSON rooms file
 
 	MulticastGroup   string
 	MulticastPort    int
@@ -69,6 +70,7 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.BoolVar(&cfg.Encrypt, "encrypt", false, "Enable DTLS/SRTP encryption for audio streams")
 	fs.StringVar(&cfg.PSK, "psk", "", "Pre-shared key for DTLS encryption (base64 encoded)")
 	fs.StringVar(&cfg.RoutesFile, "routes", "routes.json", "Path to the JSON routes file")
+	fs.StringVar(&cfg.RoomsFile, "rooms", "rooms.json", "Path to the JSON rooms file")
 
 	fs.StringVar(&cfg.MulticastGroup, "multicast-group", "239.255.0.1", "Multicast group for peer discovery")
 	fs.IntVar(&cfg.MulticastPort, "multicast-port", 45400, "Multicast port for peer announcements")

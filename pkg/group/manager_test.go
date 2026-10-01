@@ -301,3 +301,91 @@ func TestDefaultRoomManager_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestDefaultRoomManager_Persistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	roomsFile := tmpDir + "/rooms.json"
+
+	vp := NewVirtualDeviceProvider(nil, nil)
+	mgr1 := NewDefaultRoomManager(nil, nil, nil, nil, vp)
+	mgr1.SetRoomsFile(roomsFile)
+
+	// Create room and configure bindings
+	_, err := mgr1.CreateRoom("room-studio", "Main Studio")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+
+	micURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=1"
+	spkURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=0"
+
+	if err := mgr1.AddInput("room-studio", micURN); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	if err := mgr1.AddOutput("room-studio", spkURN); err != nil {
+		t.Fatalf("AddOutput: %v", err)
+	}
+	if err := mgr1.SetInputGain("room-studio", micURN, 1.25); err != nil {
+		t.Fatalf("SetInputGain: %v", err)
+	}
+	if err := mgr1.SetOutputGain("room-studio", spkURN, 0.85); err != nil {
+		t.Fatalf("SetOutputGain: %v", err)
+	}
+	if err := mgr1.SetRoomSync("room-studio", true); err != nil {
+		t.Fatalf("SetRoomSync: %v", err)
+	}
+
+	mgr1.Close()
+
+	// Spin up a brand new room manager instance and load from file
+	mgr2 := NewDefaultRoomManager(nil, nil, nil, nil, vp)
+	mgr2.SetRoomsFile(roomsFile)
+	if err := mgr2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer mgr2.Close()
+
+	rooms := mgr2.ListRooms()
+	if len(rooms) != 1 {
+		t.Fatalf("expected 1 restored room, got %d", len(rooms))
+	}
+	r := rooms[0]
+	if r.ID != "room-studio" || r.Name != "Main Studio" {
+		t.Fatalf("restored room ID/name mismatch: %+v", r)
+	}
+	if len(r.Inputs) != 1 || r.Inputs[0] != micURN {
+		t.Fatalf("restored inputs mismatch: got %v, want [%s]", r.Inputs, micURN)
+	}
+	if len(r.Outputs) != 1 || r.Outputs[0] != spkURN {
+		t.Fatalf("restored outputs mismatch: got %v, want [%s]", r.Outputs, spkURN)
+	}
+	if !r.Synced {
+		t.Fatalf("restored synced mismatch: got false, want true")
+	}
+	if g, ok := r.InputGains[micURN]; !ok || g != 1.25 {
+		t.Fatalf("restored input gain mismatch: got %v, want 1.25", r.InputGains)
+	}
+	if g, ok := r.OutputGains[spkURN]; !ok || g != 0.85 {
+		t.Fatalf("restored output gain mismatch: got %v, want 0.85", r.OutputGains)
+	}
+
+	// Test deletion and persistence
+	if err := mgr2.DeleteRoom("room-studio"); err != nil {
+		t.Fatalf("DeleteRoom: %v", err)
+	}
+	if len(mgr2.ListRooms()) != 0 {
+		t.Fatalf("expected 0 rooms after DeleteRoom")
+	}
+
+	// Reload again to verify deletion persisted
+	mgr3 := NewDefaultRoomManager(nil, nil, nil, nil, vp)
+	mgr3.SetRoomsFile(roomsFile)
+	if err := mgr3.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer mgr3.Close()
+
+	if len(mgr3.ListRooms()) != 0 {
+		t.Fatalf("expected 0 rooms in mgr3 after deletion persisted, got %d", len(mgr3.ListRooms()))
+	}
+}

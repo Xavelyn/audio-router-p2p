@@ -29,6 +29,7 @@ type StreamManager interface {
 type RoomManager interface {
 	ListRooms() []RoomInfo
 	CreateRoom(id, name string) (RoomInfo, error)
+	DeleteRoom(id string) error
 	JoinRoom(id string) error
 	LeaveRoom(id string) error
 	AddInput(roomID, deviceID string) error

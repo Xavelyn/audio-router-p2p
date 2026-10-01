@@ -88,11 +88,11 @@
           devices: node.devices || [],
         });
       }
-    } else {
-      // Fallback: only local deviceStore available
+    } else if (localDevices.length > 0) {
+      // Only local devices available
       result.push({
         id: 'node-local',
-        name: 'Local Gateway Node',
+        name: 'Local Node',
         address: '127.0.0.1:8080',
         isLocal: true,
         swimState: 'alive',
@@ -270,7 +270,12 @@
 
   <!-- Node Accordions List -->
   <div class="flex-1 overflow-y-auto p-3 space-y-3">
-    {#each groupedNodes as node (node.id)}
+    {#if groupedNodes.length === 0}
+      <div class="rounded-xl border border-dashed border-zinc-800 p-6 text-center text-xs font-mono text-zinc-500">
+        No gateway or audio devices connected
+      </div>
+    {:else}
+      {#each groupedNodes as node (node.id)}
       {@const isCollapsed = flowLayoutStore.isNodeCollapsed(node.id)}
       {@const matchingDevices = node.devices.filter((d) => filterDevice(d, node.name))}
 
@@ -423,6 +428,7 @@
         {/if}
       </div>
     {/each}
+    {/if}
   </div>
 
   <!-- Palette Footer Stats & Hint -->

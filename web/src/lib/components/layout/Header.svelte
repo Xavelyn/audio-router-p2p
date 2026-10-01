@@ -45,6 +45,9 @@
   const badge = $derived(getStatusBadge(authStore.connectionStatus));
 
   const clusterHealthDotColor = $derived.by(() => {
+    if (authStore.connectionStatus !== 'connected' || clusterStore.nodes.length === 0) {
+      return 'bg-zinc-600';
+    }
     const score = clusterStore.clusterHealthScore;
     if (score >= 90) return 'bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]';
     if (score >= 75) return 'bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]';
@@ -53,6 +56,9 @@
   });
 
   const clusterHealthTextColor = $derived.by(() => {
+    if (authStore.connectionStatus !== 'connected' || clusterStore.nodes.length === 0) {
+      return 'text-zinc-500';
+    }
     const score = clusterStore.clusterHealthScore;
     if (score >= 90) return 'text-emerald-400';
     if (score >= 75) return 'text-cyan-400';

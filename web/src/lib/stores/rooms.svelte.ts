@@ -26,41 +26,8 @@ class RoomStore {
       }));
     } catch (err: any) {
       this.error = err.message || 'Failed to enumerate audio conference rooms';
-      if (this.rooms.length === 0) {
-        this.rooms = [
-          {
-            id: 'room-main-broadcast',
-            name: 'Main Stage Broadcast',
-            leader: 'node-studio-ctrl-01',
-            state: 'active',
-            members: ['node-studio-ctrl-01', 'node-stage-box-02', 'local'],
-            inputs: ['hw:0', 'virt:loop-main'],
-            outputs: ['hw:0', 'hw:1'],
-            synced: true,
-          },
-          {
-            id: 'room-in-ear-monitors',
-            name: 'IEM Low-Latency Mix (Musicians)',
-            leader: 'node-stage-box-02',
-            state: 'active',
-            members: ['node-stage-box-02', 'local'],
-            inputs: ['hw:1'],
-            outputs: ['hw:1'],
-            synced: true,
-          },
-          {
-            id: 'room-control-booth',
-            name: 'Production Talkback & Intercom',
-            leader: 'local',
-            state: 'idle',
-            members: ['local'],
-            inputs: ['virt:loop-main'],
-            outputs: ['hw:0'],
-            synced: false,
-          },
-        ];
-        this.activeJoinedRoomId = 'room-main-broadcast';
-      }
+      this.rooms = [];
+      this.activeJoinedRoomId = null;
     } finally {
       this.isLoading = false;
     }
@@ -83,19 +50,7 @@ class RoomStore {
       const msg = err.message || 'Failed to create audio conference room';
       this.lastError = msg;
       this.error = msg;
-      // Optimistic local add if daemon unavailable
-      const fallback: RoomInfo = {
-        id: req.id,
-        name: req.name,
-        leader: 'local',
-        state: 'active',
-        members: ['local'],
-        inputs: [],
-        outputs: [],
-        synced: true,
-      };
-      this.rooms = [...this.rooms, fallback];
-      return fallback;
+      throw err;
     } finally {
       this.isLoading = false;
     }
@@ -114,11 +69,7 @@ class RoomStore {
       const msg = err.message || 'Failed to delete room';
       this.lastError = msg;
       this.error = msg;
-      // Optimistic local removal
-      this.rooms = this.rooms.filter((r) => r.id !== roomId);
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
+      throw err;
     } finally {
       this.isLoading = false;
     }
@@ -144,12 +95,6 @@ class RoomStore {
       const msg = err.message || 'Failed to join room';
       this.lastError = msg;
       this.error = msg;
-      // Local fallback for UI preview
-      this.activeJoinedRoomId = roomId;
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && target.members && !target.members.includes('local')) {
-        target.members.push('local');
-      }
     } finally {
       this.isLoading = false;
     }
@@ -177,13 +122,6 @@ class RoomStore {
       const msg = err.message || 'Failed to leave room';
       this.lastError = msg;
       this.error = msg;
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && target.members) {
-        target.members = target.members.filter((m) => m !== 'local');
-      }
     } finally {
       this.isLoading = false;
     }
@@ -208,15 +146,6 @@ class RoomStore {
       const msg = err.message || 'Failed to update room bindings';
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic update
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.inputs = [...req.inputs];
-        target.outputs = [...req.outputs];
-        if (req.synced !== undefined) {
-          target.synced = req.synced;
-        }
-      }
     } finally {
       this.isLoading = false;
     }
@@ -240,11 +169,6 @@ class RoomStore {
       const msg = err.message || `Failed to assign input ${devId} to room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && !target.inputs.includes(devId)) {
-        target.inputs.push(devId);
-      }
     }
   }
 
@@ -266,11 +190,6 @@ class RoomStore {
       const msg = err.message || `Failed to remove input ${devId} from room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.inputs = target.inputs.filter((id) => id !== devId);
-      }
     }
   }
 
@@ -292,11 +211,6 @@ class RoomStore {
       const msg = err.message || `Failed to assign output ${devId} to room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && !target.outputs.includes(devId)) {
-        target.outputs.push(devId);
-      }
     }
   }
 
@@ -318,11 +232,6 @@ class RoomStore {
       const msg = err.message || `Failed to remove output ${devId} from room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.outputs = target.outputs.filter((id) => id !== devId);
-      }
     }
   }
 
@@ -344,11 +253,6 @@ class RoomStore {
       const msg = err.message || `Failed to set room sync to ${synced}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.synced = synced;
-      }
     }
   }
 }

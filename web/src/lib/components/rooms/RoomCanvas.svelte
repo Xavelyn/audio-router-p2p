@@ -60,17 +60,18 @@
     // Graceful fallback if SvelteFlowProvider is not yet active in parent context
   }
 
-  onMount(() => {
-    roomStore.loadRooms();
-    deviceStore.loadDevices();
-    clusterStore.pollCluster();
+  onMount(async () => {
+    await Promise.allSettled([
+      roomStore.loadRooms(),
+      deviceStore.loadDevices(),
+      clusterStore.pollCluster(),
+    ]);
     meterStore.init();
 
     // Initial default staging if canvas has never been configured
-    setTimeout(() => {
-      ensureDefaultStaging();
-      syncFlowGraph();
-    }, 150);
+    ensureRoomDevicesStaged();
+    ensureDefaultStaging();
+    syncFlowGraph();
   });
 
   // Consolidate devices from local deviceStore and clusterStore
@@ -102,6 +103,26 @@
     }
   }
 
+  // Ensure devices bound to any room are staged on canvas
+  function ensureRoomDevicesStaged() {
+    for (const room of roomStore.rooms) {
+      if (room.inputs) {
+        for (const inId of room.inputs) {
+          if (!flowLayoutStore.isDeviceEnabled(inId)) {
+            flowLayoutStore.enableDevice(inId);
+          }
+        }
+      }
+      if (room.outputs) {
+        for (const outId of room.outputs) {
+          if (!flowLayoutStore.isDeviceEnabled(outId)) {
+            flowLayoutStore.enableDevice(outId);
+          }
+        }
+      }
+    }
+  }
+
   // Ensure sensible defaults on first load (e.g. stage room-bound devices or default hardware)
   function ensureDefaultStaging() {
     if (flowLayoutStore.enabledDevices.size > 0) return;
@@ -118,7 +139,7 @@
       }
     }
 
-    // If still empty, stage primary local inputs and outputs
+    // If still empty and hardware devices exist, stage primary local inputs and outputs
     if (defaultIds.size === 0 && deviceStore.devices.length > 0) {
       const inputs = deviceStore.inputDevices.slice(0, 2);
       const outputs = deviceStore.outputDevices.slice(0, 2);
@@ -294,6 +315,7 @@
   function syncFlowGraph(forceResetPositions = false) {
     const allKnown = getAllKnownDevices();
     const stagedIds = flowLayoutStore.enabledDevices;
+    const currentRooms = roomStore.rooms;
 
     const stagedDevs: (AudioDevice | AudioDeviceSummary)[] = [];
     for (const id of stagedIds) {
@@ -302,13 +324,24 @@
         stagedDevs.push(dev);
       } else {
         // Disconnected or offline device fallback
+        const isVirt = id.startsWith('virt:');
+        const isKnownOutput =
+          flowLayoutStore.getPosition(`output-${id}`) !== undefined ||
+          currentRooms.some((r) => r.outputs && r.outputs.includes(id));
+        const isKnownInput =
+          flowLayoutStore.getPosition(`input-${id}`) !== undefined ||
+          currentRooms.some((r) => r.inputs && r.inputs.includes(id));
+
+        const maxIn = isKnownOutput && !isKnownInput ? 0 : (isVirt ? 2 : 1);
+        const maxOut = isKnownInput && !isKnownOutput ? 0 : (isVirt ? 2 : 1);
+
         stagedDevs.push({
           id,
           name: `${id} (Offline / Disconnected)`,
-          max_input: 2,
-          max_output: 2,
+          max_input: maxIn,
+          max_output: maxOut,
           default_sample_rate: 48000,
-          is_virtual: id.startsWith('virt:'),
+          is_virtual: isVirt,
           volume: 1.0,
           muted: false,
         });
@@ -317,7 +350,6 @@
 
     const inputDevs = stagedDevs.filter((d) => d.max_input > 0);
     const outputDevs = stagedDevs.filter((d) => d.max_output > 0);
-    const currentRooms = roomStore.rooms;
     const roomSummaries = currentRooms.map((r) => ({ id: r.id, name: r.name }));
 
     const nextNodes: Node[] = [];
@@ -475,6 +507,7 @@
     const _staged = flowLayoutStore.enabledDevices;
 
     untrack(() => {
+      ensureRoomDevicesStaged();
       syncFlowGraph(false);
     });
   });

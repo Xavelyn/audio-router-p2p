@@ -121,6 +121,14 @@ func (m *testMockRoomManager) LeaveRoom(id string) error {
 	return nil
 }
 
+func (m *testMockRoomManager) DeleteRoom(id string) error {
+	if _, ok := m.rooms[id]; !ok {
+		return fmt.Errorf("room %s not found", id)
+	}
+	delete(m.rooms, id)
+	return nil
+}
+
 func (m *testMockRoomManager) AddInput(roomID, deviceID string) error {
 	r, ok := m.rooms[roomID]
 	if !ok {
