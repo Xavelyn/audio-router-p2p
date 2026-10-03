@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -200,24 +201,36 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 
 		switch action {
 		case "join":
+			w.Header().Set("Allow", http.MethodPost)
+			w.Header().Set("Warning", `299 - "POST /api/v1/rooms/{id}/join is deprecated and will be removed in v2.0.0; audio routes are automatically compiled via bindings."`)
+			w.Header().Set("Deprecation", "@1759449600")
+			w.Header().Set("Sunset", "Fri, 01 Jan 2027 00:00:00 GMT")
+			w.Header().Set("Link", `</api/v1/docs/adr/0022>; rel="deprecation"`)
 			if r.Method != http.MethodPost {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
+			log.Printf("[DEPRECATION] Client invoked legacy JoinRoom endpoint: room_id=%s remote_addr=%s. Migrate to declarative Audio Flow routing.", roomID, r.RemoteAddr)
 			if err := s.roomMgr.JoinRoom(roomID); err != nil {
-				s.WriteError(w, http.StatusNotFound, "ERR_JOIN_FAILED", err.Error())
+				s.WriteError(w, http.StatusInternalServerError, "ERR_JOIN_FAILED", err.Error())
 				return
 			}
 			updated := s.findRoom(roomID)
 			s.WriteJSON(w, http.StatusOK, updated)
 
 		case "leave":
+			w.Header().Set("Allow", http.MethodPost)
+			w.Header().Set("Warning", `299 - "POST /api/v1/rooms/{id}/leave is deprecated and will be removed in v2.0.0; audio routes are automatically compiled via bindings."`)
+			w.Header().Set("Deprecation", "@1759449600")
+			w.Header().Set("Sunset", "Fri, 01 Jan 2027 00:00:00 GMT")
+			w.Header().Set("Link", `</api/v1/docs/adr/0022>; rel="deprecation"`)
 			if r.Method != http.MethodPost {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
+			log.Printf("[DEPRECATION] Client invoked legacy LeaveRoom endpoint: room_id=%s remote_addr=%s. Migrate to declarative Audio Flow routing.", roomID, r.RemoteAddr)
 			if err := s.roomMgr.LeaveRoom(roomID); err != nil {
-				s.WriteError(w, http.StatusNotFound, "ERR_LEAVE_FAILED", err.Error())
+				s.WriteError(w, http.StatusInternalServerError, "ERR_LEAVE_FAILED", err.Error())
 				return
 			}
 			updated := s.findRoom(roomID)

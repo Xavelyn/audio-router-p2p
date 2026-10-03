@@ -451,10 +451,13 @@ paths:
 
   /api/v1/rooms/{roomId}/join:
     post:
+      deprecated: true
       tags:
         - Rooms
-      summary: Join local node to audio room
-      description: Joins the room, establishes mesh audio peer connections, and engages format downmix/upmix adapters.
+      summary: Join local node to audio room (Deprecated)
+      description: |
+        Deprecated: Audio routes are automatically compiled via bindings and the Audio Flow engine.
+        Joins the room, establishes mesh audio peer connections, and engages format downmix/upmix adapters.
       operationId: joinRoom
       parameters:
         - $ref: '#/components/parameters/RoomIdParam'
@@ -470,10 +473,13 @@ paths:
 
   /api/v1/rooms/{roomId}/leave:
     post:
+      deprecated: true
       tags:
         - Rooms
-      summary: Leave audio room
-      description: Disconnects local peer from room session.
+      summary: Leave audio room (Deprecated)
+      description: |
+        Deprecated: Audio routes are automatically compiled via bindings and the Audio Flow engine.
+        Disconnects local peer from room session.
       operationId: leaveRoom
       parameters:
         - $ref: '#/components/parameters/RoomIdParam'

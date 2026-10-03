@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
   import { telemetryStore } from '$lib/stores/telemetry.svelte';
+  import { peerStore } from '$lib/stores/peers.svelte';
   import type { ClusterNodeSummary, AudioDeviceSummary } from '$lib/api/types';
 
   import Cpu from '@lucide/svelte/icons/cpu';
@@ -22,16 +23,64 @@
   import Shield from '@lucide/svelte/icons/shield';
   import Layers from '@lucide/svelte/icons/layers';
   import ArrowUpDown from '@lucide/svelte/icons/arrow-up-down';
+  import X from '@lucide/svelte/icons/x';
+
+  // Form state for connecting unicast peer
+  let isPeerModalOpen = $state(false);
+  let peerAddr = $state('192.168.1.150:7001');
+  let peerTlsFingerprint = $state('');
+  let isConnectingPeer = $state(false);
+  let peerError = $state<string | null>(null);
+
+  let peerPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let isDestroyed = false;
+
+  async function pollPeersRecursively() {
+    if (isDestroyed) return;
+    try {
+      await Promise.allSettled([
+        peerStore.loadPeers(),
+        peerStore.loadClockSync(),
+      ]);
+    } finally {
+      if (!isDestroyed) {
+        peerPollTimer = setTimeout(pollPeersRecursively, 2500);
+      }
+    }
+  }
 
   onMount(() => {
-    clusterStore.startPolling(2500);
     telemetryStore.startPolling(2000);
+    pollPeersRecursively();
   });
 
   onDestroy(() => {
-    clusterStore.stopPolling();
+    isDestroyed = true;
     telemetryStore.stopPolling();
+    if (peerPollTimer) {
+      clearTimeout(peerPollTimer);
+      peerPollTimer = null;
+    }
   });
+
+  async function handleConnectPeer() {
+    isConnectingPeer = true;
+    peerError = null;
+    try {
+      await peerStore.connectPeer(peerAddr.trim(), peerTlsFingerprint.trim() || undefined);
+      isPeerModalOpen = false;
+    } catch (err: any) {
+      peerError = err.message || 'Failed to initiate peer handshake';
+    } finally {
+      isConnectingPeer = false;
+    }
+  }
+
+  function handleScrapeNow() {
+    clusterStore.pollCluster();
+    peerStore.loadPeers();
+    peerStore.loadClockSync();
+  }
 
   // Selected node
   const activeNode = $derived(clusterStore.selectedNode);
@@ -159,14 +208,23 @@
 
     <!-- Right Poll Actions -->
     <div class="flex items-center gap-2">
+      <button
+        onclick={() => (isPeerModalOpen = true)}
+        class="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-mono font-medium text-cyan-300 hover:bg-cyan-500/20 hover:border-cyan-500/60 transition-colors cursor-pointer shadow-sm shadow-cyan-500/10"
+        title="Pair Remote Mesh Peer via unicast handshake"
+      >
+        <Radio class="w-3.5 h-3.5 text-cyan-400" />
+        <span>Pair Remote Peer</span>
+      </button>
+
       {#if clusterStore.lastUpdated}
         <span class="text-[10px] font-mono text-zinc-500 hidden sm:inline">
           Updated: {clusterStore.lastUpdated.toLocaleTimeString()}
         </span>
       {/if}
       <button
-        onclick={() => clusterStore.pollCluster()}
-        class="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-cyan-300 transition-colors"
+        onclick={handleScrapeNow}
+        class="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-cyan-300 transition-colors cursor-pointer"
         title="Trigger cluster snapshot scrape"
       >
         <RefreshCw class="w-3.5 h-3.5 text-cyan-400 {clusterStore.isLoading ? 'animate-spin' : ''}" />
@@ -498,7 +556,80 @@
       </div>
 
       <!-- ==================================================================== -->
-      <!-- 4. SELECTED NODE INSPECTOR                                          -->
+      <!-- 4. DISCOVERED MESH PEERS & PTP CLOCK ALIGNMENT                       -->
+      <!-- ==================================================================== -->
+      <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-xl">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-zinc-800 pb-3 mb-4 gap-3">
+          <div class="flex items-center gap-2">
+            <Radio class="w-4 h-4 text-cyan-400" />
+            <h2 class="text-xs font-mono font-bold uppercase tracking-wider text-zinc-200">
+              Discovered Mesh Peers & PTP Clock Alignment ({peerStore.peers.length} Peers)
+            </h2>
+          </div>
+
+          <div class="flex items-center gap-3">
+            <span class="text-[11px] font-mono text-zinc-500 hidden md:inline">
+              mDNS & DHT Discovery &bull; PTP IEEE 1588 Sync
+            </span>
+            <button
+              onclick={() => (isPeerModalOpen = true)}
+              class="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-mono font-medium text-cyan-300 hover:bg-cyan-500/20 hover:border-cyan-500/60 transition-all cursor-pointer shadow-sm shadow-cyan-500/10"
+            >
+              <Radio class="w-3.5 h-3.5 text-cyan-400" />
+              <span>Pair Remote Peer</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="rounded-lg border border-zinc-800/80 bg-zinc-950/40 overflow-x-auto shadow-inner">
+          <table class="w-full text-left text-xs font-mono">
+            <thead class="border-b border-zinc-800 bg-zinc-950/80 text-zinc-400 text-[10px] uppercase">
+              <tr>
+                <th class="px-4 py-3 whitespace-nowrap">Peer Node ID</th>
+                <th class="px-4 py-3 whitespace-nowrap">Network Address</th>
+                <th class="px-4 py-3 whitespace-nowrap">Status</th>
+                <th class="px-4 py-3 whitespace-nowrap">RTT Latency</th>
+                <th class="px-4 py-3 whitespace-nowrap">Clock Offset</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-zinc-800/60 text-zinc-200">
+              {#if peerStore.peers.length === 0}
+                <tr>
+                  <td colspan="5" class="px-4 py-8 text-center text-zinc-500 italic">
+                    No mesh peers discovered. Click "Pair Remote Peer" to initiate a direct peer connection.
+                  </td>
+                </tr>
+              {:else}
+                {#each peerStore.peers as peer}
+                  <tr class="hover:bg-zinc-800/30 transition-colors">
+                    <td class="px-4 py-3 font-semibold text-zinc-100 flex items-center gap-2 min-w-0">
+                      <span class="h-2 w-2 rounded-full shrink-0 {peer.status === 'connected' ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' : 'bg-amber-400'}"></span>
+                      <span class="truncate max-w-[200px]" title={peer.id}>{peer.id}</span>
+                    </td>
+                    <td class="px-4 py-3 text-zinc-400 whitespace-nowrap">{peer.addr}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                      <span class="rounded px-2 py-0.5 text-[10px] font-bold uppercase {peer.status === 'connected'
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                        : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}">
+                        {peer.status}
+                      </span>
+                    </td>
+                    <td class="px-4 py-3 text-cyan-400 font-bold whitespace-nowrap">
+                      {peer.rtt_ms !== undefined ? `${peer.rtt_ms.toFixed(1)} ms` : '--'}
+                    </td>
+                    <td class="px-4 py-3 text-zinc-300 whitespace-nowrap">
+                      {peerStore.clockSync?.offset_ns !== undefined ? (peerStore.clockSync.offset_ns / 1000).toFixed(2) : '0.00'} &mu;s
+                    </td>
+                  </tr>
+                {/each}
+              {/if}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ==================================================================== -->
+      <!-- 5. SELECTED NODE INSPECTOR                                          -->
       <!-- ==================================================================== -->
       {#if activeNode}
         <div class="rounded-xl border border-cyan-500/30 bg-zinc-900/80 p-5 shadow-2xl space-y-5">
@@ -739,3 +870,76 @@
     </div>
   </div>
 </div>
+
+<!-- Pair Remote Peer Modal -->
+{#if isPeerModalOpen}
+  <div
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+    role="dialog"
+    aria-modal="true"
+  >
+    <div class="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl text-zinc-100">
+      <div class="flex items-center justify-between border-b border-zinc-800 pb-3 mb-4">
+        <div class="flex items-center gap-2">
+          <Radio class="w-4 h-4 text-cyan-400" />
+          <h2 class="text-sm font-semibold text-zinc-100 uppercase tracking-wide">
+            Pair Remote Mesh Peer
+          </h2>
+        </div>
+        <button
+          onclick={() => (isPeerModalOpen = false)}
+          class="rounded p-1 text-zinc-400 hover:text-zinc-200 cursor-pointer"
+          aria-label="Close dialog"
+        >
+          <X class="w-4 h-4" />
+        </button>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label for="peer-addr" class="block text-xs font-mono text-zinc-300 mb-1">PEER ADDRESS (IP:PORT)</label>
+          <input
+            id="peer-addr"
+            type="text"
+            bind:value={peerAddr}
+            placeholder="192.168.1.150:7001"
+            class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
+          />
+        </div>
+
+        <div>
+          <label for="peer-cert" class="block text-xs font-mono text-zinc-300 mb-1">DTLS CERTIFICATE FINGERPRINT (OPTIONAL)</label>
+          <input
+            id="peer-cert"
+            type="text"
+            bind:value={peerTlsFingerprint}
+            placeholder="SHA-256 fingerprint hex..."
+            class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
+          />
+        </div>
+
+        {#if peerError}
+          <div class="text-xs text-red-400 bg-red-950/40 p-2 rounded border border-red-800/50">
+            {peerError}
+          </div>
+        {/if}
+      </div>
+
+      <div class="mt-6 flex justify-end gap-2 border-t border-zinc-800 pt-4">
+        <button
+          onclick={() => (isPeerModalOpen = false)}
+          class="rounded-lg px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer"
+        >
+          Cancel
+        </button>
+        <button
+          onclick={handleConnectPeer}
+          disabled={isConnectingPeer}
+          class="rounded-lg bg-cyan-500 px-4 py-1.5 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 disabled:opacity-50 cursor-pointer transition-colors shadow-sm shadow-cyan-500/20"
+        >
+          {isConnectingPeer ? 'Connecting...' : 'Initiate Handshake'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}

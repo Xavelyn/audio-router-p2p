@@ -263,11 +263,46 @@ func TestV1RoomsCRUD(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for join, got %d: %s", w.Code, w.Body.String())
 	}
+	expectedJoinWarn := `299 - "POST /api/v1/rooms/{id}/join is deprecated and will be removed in v2.0.0; audio routes are automatically compiled via bindings."`
+	if w.Header().Get("Warning") != expectedJoinWarn {
+		t.Errorf("expected Warning header %q, got %q", expectedJoinWarn, w.Header().Get("Warning"))
+	}
+	if w.Header().Get("Deprecation") != "@1759449600" {
+		t.Errorf("expected Deprecation header @1759449600, got %q", w.Header().Get("Deprecation"))
+	}
+	if w.Header().Get("Sunset") != "Fri, 01 Jan 2027 00:00:00 GMT" {
+		t.Errorf("expected Sunset header, got %q", w.Header().Get("Sunset"))
+	}
+	if w.Header().Get("Link") != `</api/v1/docs/adr/0022>; rel="deprecation"` {
+		t.Errorf("expected Link header, got %q", w.Header().Get("Link"))
+	}
+
+	// 4b. GET /api/v1/rooms/{id}/join should return 405 Method Not Allowed with Allow header
+	w = doV1Request(mux, http.MethodGet, "/api/v1/rooms/studio-room-a/join", nil, "Bearer test-v1-token")
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for GET /join, got %d", w.Code)
+	}
+	if w.Header().Get("Allow") != http.MethodPost {
+		t.Errorf("expected Allow: POST, got %q", w.Header().Get("Allow"))
+	}
 
 	// 5. POST /api/v1/rooms/{id}/leave
 	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/studio-room-a/leave", nil, "Bearer test-v1-token")
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for leave, got %d: %s", w.Code, w.Body.String())
+	}
+	expectedLeaveWarn := `299 - "POST /api/v1/rooms/{id}/leave is deprecated and will be removed in v2.0.0; audio routes are automatically compiled via bindings."`
+	if w.Header().Get("Warning") != expectedLeaveWarn {
+		t.Errorf("expected Warning header %q, got %q", expectedLeaveWarn, w.Header().Get("Warning"))
+	}
+	if w.Header().Get("Deprecation") != "@1759449600" {
+		t.Errorf("expected Deprecation header @1759449600, got %q", w.Header().Get("Deprecation"))
+	}
+	if w.Header().Get("Sunset") != "Fri, 01 Jan 2027 00:00:00 GMT" {
+		t.Errorf("expected Sunset header, got %q", w.Header().Get("Sunset"))
+	}
+	if w.Header().Get("Link") != `</api/v1/docs/adr/0022>; rel="deprecation"` {
+		t.Errorf("expected Link header, got %q", w.Header().Get("Link"))
 	}
 
 	// Verify 404 after room removed via leave

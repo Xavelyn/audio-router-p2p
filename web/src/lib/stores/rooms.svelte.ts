@@ -3,7 +3,6 @@ import { apiClient } from '$lib/api/client';
 
 class RoomStore {
   rooms = $state<RoomInfo[]>([]);
-  activeJoinedRoomId = $state<string | null>(null);
   isLoading = $state<boolean>(false);
   error = $state<string | null>(null);
   lastError = $state<string | null>(null);
@@ -27,7 +26,6 @@ class RoomStore {
     } catch (err: any) {
       this.error = err.message || 'Failed to enumerate audio conference rooms';
       this.rooms = [];
-      this.activeJoinedRoomId = null;
     } finally {
       this.isLoading = false;
     }
@@ -61,9 +59,6 @@ class RoomStore {
     this.lastError = null;
     // Optimistic local removal
     this.rooms = this.rooms.filter((r) => r.id !== roomId);
-    if (this.activeJoinedRoomId === roomId) {
-      this.activeJoinedRoomId = null;
-    }
     try {
       await apiClient.deleteRoom(roomId);
     } catch (err: any) {
@@ -71,58 +66,6 @@ class RoomStore {
       this.lastError = msg;
       this.error = msg;
       throw err;
-    } finally {
-      this.isLoading = false;
-    }
-  }
-
-  async joinRoom(roomId: string) {
-    this.isLoading = true;
-    this.lastError = null;
-    try {
-      const updated = await apiClient.joinRoom(roomId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || this.rooms[idx].inputs || [],
-          outputs: updated.outputs || this.rooms[idx].outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
-      }
-      this.activeJoinedRoomId = roomId;
-    } catch (err: any) {
-      const msg = err.message || 'Failed to join room';
-      this.lastError = msg;
-      this.error = msg;
-    } finally {
-      this.isLoading = false;
-    }
-  }
-
-  async leaveRoom(roomId: string) {
-    this.isLoading = true;
-    this.lastError = null;
-    try {
-      const updated = await apiClient.leaveRoom(roomId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || this.rooms[idx].inputs || [],
-          outputs: updated.outputs || this.rooms[idx].outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
-      }
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
-    } catch (err: any) {
-      const msg = err.message || 'Failed to leave room';
-      this.lastError = msg;
-      this.error = msg;
     } finally {
       this.isLoading = false;
     }

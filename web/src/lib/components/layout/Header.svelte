@@ -2,20 +2,17 @@
   import { authStore } from '$lib/stores/auth.svelte';
   import { peerStore } from '$lib/stores/peers.svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
-  import { matrixStore } from '$lib/stores/matrix.svelte';
   import AuthModal from './AuthModal.svelte';
   import Radio from '@lucide/svelte/icons/radio';
-  import Sliders from '@lucide/svelte/icons/sliders';
   import Activity from '@lucide/svelte/icons/activity';
   import Speaker from '@lucide/svelte/icons/speaker';
   import Network from '@lucide/svelte/icons/network';
   import Cpu from '@lucide/svelte/icons/cpu';
-  import Shield from '@lucide/svelte/icons/shield';
   import Key from '@lucide/svelte/icons/key';
   import Clock from '@lucide/svelte/icons/clock';
   import Workflow from '@lucide/svelte/icons/workflow';
 
-  export type TabId = 'flow' | 'meters' | 'devices' | 'rooms' | 'diagnostics';
+  export type TabId = 'flow' | 'meters' | 'devices' | 'diagnostics';
 
   let { activeTab = $bindable('flow' as TabId) } = $props<{ activeTab: TabId }>();
 
@@ -25,7 +22,6 @@
     { id: 'flow', label: 'Audio Flow', icon: Workflow },
     { id: 'meters', label: 'Live Meters', icon: Activity },
     { id: 'devices', label: 'Audio Devices', icon: Speaker },
-    { id: 'rooms', label: 'Mesh Rooms', icon: Network },
     { id: 'diagnostics', label: 'Cluster Diagnostics', icon: Cpu },
   ];
 
