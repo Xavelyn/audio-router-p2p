@@ -178,15 +178,18 @@ class MatrixStore {
         coeffs[1] = 1.0;
       }
 
+      const srcNodeId = (sourceDevice as any).node_id || (sourceDevice as any).nodeId || 'local';
+      const dstNodeId = (destDevice as any).node_id || (destDevice as any).nodeId || 'local';
+
       const newRouteReq: CreateRouteRequest = {
         name: `${srcName} -> ${dstName}`,
         source: {
-          node_id: 'local',
+          node_id: srcNodeId,
           device_id: srcId,
           channels: inChannels,
         },
         destination: {
-          node_id: 'local',
+          node_id: dstNodeId,
           device_id: dstId,
           channels: outChannels,
         },

@@ -133,6 +133,8 @@ type DefaultRoomManager struct {
 	streamMgr   StreamManager
 	devProvider DeviceProvider
 
+	clusterMgr ClusterDeviceProvider
+
 	roomsFile string
 	rooms     map[string]*managedRoom
 	crdt      *LWWSet
@@ -235,6 +237,18 @@ func (m *DefaultRoomManager) SetDeviceProvider(dp DeviceProvider) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.devProvider = dp
+}
+
+// SetClusterManager sets the cluster device provider and updates all rooms.
+func (m *DefaultRoomManager) SetClusterManager(cm ClusterDeviceProvider) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.clusterMgr = cm
+	for _, mr := range m.rooms {
+		if mr.room != nil {
+			mr.room.SetClusterManager(cm)
+		}
+	}
 }
 
 // ListRooms lists all known rooms and their current statuses.
@@ -847,7 +861,7 @@ func (m *DefaultRoomManager) MergeRemoteState(buf []byte, join bool) {
 // ExportCRDTRooms exports the serialized CRDT room state for HTTP anti-entropy.
 func (m *DefaultRoomManager) ExportCRDTRooms() ([]byte, error) {
 	m.crdt.PruneTombstones()
-	return json.Marshal(m.crdt.ExportState())
+	return m.crdt.ExportStateJSON()
 }
 
 // MergeCRDTRooms merges incoming serialized CRDT room state for HTTP anti-entropy.

@@ -260,10 +260,10 @@ export class ApiClient {
     });
   }
 
-  async addRoomInput(roomId: string, devId: string, gain?: number): Promise<RoomInfo> {
+  async addRoomInput(roomId: string, devId: string, gain?: number, nodeId?: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/inputs`, {
       method: 'POST',
-      body: JSON.stringify({ device_id: devId, gain }),
+      body: JSON.stringify({ device_id: devId, node_id: nodeId, gain }),
     });
   }
 
@@ -273,10 +273,10 @@ export class ApiClient {
     });
   }
 
-  async addRoomOutput(roomId: string, devId: string, gain?: number): Promise<RoomInfo> {
+  async addRoomOutput(roomId: string, devId: string, gain?: number, nodeId?: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs`, {
       method: 'POST',
-      body: JSON.stringify({ device_id: devId, gain }),
+      body: JSON.stringify({ device_id: devId, node_id: nodeId, gain }),
     });
   }
 

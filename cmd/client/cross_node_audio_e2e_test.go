@@ -113,6 +113,7 @@ func spawnClusterNode(t *testing.T, id string, seedAddrs ...string) *testCluster
 
 	go disc.Run()
 	if cm := apiSrv.ClusterManager(); cm != nil {
+		roomMgr.SetClusterManager(cm)
 		cm.Start(context.Background())
 	}
 
@@ -862,4 +863,172 @@ func TestClusterCrossNodeAudioRouting_FormatAgility_E2E(t *testing.T) {
 	}
 
 	t.Log("Format agility bidirectional test completed successfully.")
+}
+
+func TestClusterCrossNodeAudioRouting_RoomSynthesis_E2E(t *testing.T) {
+	nodeA := spawnClusterNode(t, "node-room-A")
+	defer nodeA.close()
+
+	nodeB := spawnClusterNode(t, "node-room-B", nodeA.disc.OwnAddr())
+	defer nodeB.close()
+
+	// Wait for convergence
+	t.Log("Waiting for 2-node cluster convergence...")
+	deadline := time.Now().Add(5 * time.Second)
+	converged := false
+	for time.Now().Before(deadline) {
+		snapA := nodeA.apiServer.ClusterManager().GetSnapshot()
+		snapB := nodeB.apiServer.ClusterManager().GetSnapshot()
+		if snapA != nil && snapB != nil && snapA.ActiveNodes >= 2 && snapB.ActiveNodes >= 2 {
+			converged = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !converged {
+		t.Fatalf("cluster failed to converge within 5s")
+	}
+
+	// 1. Provision Input on Node A and Output on Node B
+	micReqA := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-room-mic",
+		Direction:        "input",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err := nodeA.post("/api/v1/devices/virtual", micReqA)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node A failed: %v", err)
+	}
+	var devMic v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devMic)
+	_ = resp.Body.Close()
+
+	spkReqB := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-room-spk",
+		Direction:        "output",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err = nodeB.post("/api/v1/devices/virtual", spkReqB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node B failed: %v", err)
+	}
+	var devSpk v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devSpk)
+	_ = resp.Body.Close()
+
+	// Force scrape on both cluster managers so device inventory is populated
+	nodeA.apiServer.ClusterManager().ScrapeCluster(context.Background())
+	nodeB.apiServer.ClusterManager().ScrapeCluster(context.Background())
+
+	// 2. Create Room on Node A
+	roomReq := map[string]string{
+		"id":   "room-cross-synth",
+		"name": "Cross Synthesis Room",
+	}
+	resp, err = nodeA.post("/api/v1/rooms", roomReq)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/rooms failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// 3. Bind Input (on Node A) and Output (on Node B) with node_id
+	bindInReq := v1.RoomDeviceBindingRequest{
+		DeviceID: devMic.URN,
+		NodeID:   "node-room-A",
+	}
+	resp, err = nodeA.post("/api/v1/rooms/room-cross-synth/inputs", bindInReq)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/rooms/.../inputs failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	bindOutReq := v1.RoomDeviceBindingRequest{
+		DeviceID: devSpk.URN,
+		NodeID:   "node-room-B",
+	}
+	resp, err = nodeA.post("/api/v1/rooms/room-cross-synth/outputs", bindOutReq)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/rooms/.../outputs failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// 4. Wait for CRDT convergence on Node B
+	t.Log("Waiting for room-cross-synth to converge on Node B...")
+	deadline = time.Now().Add(5 * time.Second)
+	roomBReady := false
+	for time.Now().Before(deadline) {
+		rResp, rErr := nodeB.get("/api/v1/rooms/room-cross-synth")
+		if rErr == nil && rResp.StatusCode == http.StatusOK {
+			var rInfo api.RoomInfo
+			_ = json.NewDecoder(rResp.Body).Decode(&rInfo)
+			_ = rResp.Body.Close()
+			if len(rInfo.Inputs) > 0 && len(rInfo.Outputs) > 0 {
+				roomBReady = true
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !roomBReady {
+		t.Fatalf("room-cross-synth did not converge on Node B within 5s")
+	}
+
+	// 5. Verify Virtual Stream handles exist and stream audio
+	micStream, okMic := nodeA.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devMic.URN)
+	spkStream, okSpk := nodeB.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devSpk.URN)
+	if !okMic || !okSpk || micStream == nil || spkStream == nil {
+		t.Fatalf("could not obtain VirtualAudioDevice streams for room cross synth")
+	}
+
+	// Inject 440 Hz stereo sine wave on Node A
+	frames := 480
+	sineBlock := generateSineBlock(48000, 2, frames, 440.0, 0.707)
+
+	doneFeed := make(chan struct{})
+	go func() {
+		defer close(doneFeed)
+		for i := 0; i < 40; i++ {
+			_, _ = micStream.InjectPush(sineBlock)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	// 6. Verify delivery on Node B
+	t.Log("Verifying room synthesized cross-node audio delivery to Node B speaker...")
+	deadline = time.Now().Add(5 * time.Second)
+	var captured []byte
+	for time.Now().Before(deadline) {
+		captured = spkStream.CapturedBytes()
+		if len(captured) >= len(sineBlock)*2 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	<-doneFeed
+
+	if len(captured) < len(sineBlock)*2 {
+		t.Fatalf("expected audio delivered to Node B speaker via synthesized room route: got %d bytes, want >= %d",
+			len(captured), len(sineBlock)*2)
+	}
+
+	maxAmp := int16(0)
+	for i := 0; i+2 <= len(captured); i += 2 {
+		sample := int16(binary.LittleEndian.Uint16(captured[i : i+2]))
+		if sample < 0 {
+			sample = -sample
+		}
+		if sample > maxAmp {
+			maxAmp = sample
+		}
+	}
+
+	if maxAmp < 1000 {
+		t.Fatalf("room synthesized audio silent on Node B: maxAmp=%d (want > 1000)", maxAmp)
+	}
+	t.Logf("SUCCESS: Room synthesized cross-node audio delivered to Node B (bytes=%d, peakAmp=%d / 32767)",
+		len(captured), maxAmp)
 }

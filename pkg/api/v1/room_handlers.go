@@ -177,7 +177,11 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_PARAMS", "device_id is required")
 				return
 			}
-			if err := s.roomMgr.AddInput(roomID, req.DeviceID); err != nil {
+			bindID := req.DeviceID
+			if req.NodeID != "" && !strings.Contains(bindID, "/") {
+				bindID = req.NodeID + "/" + bindID
+			}
+			if err := s.roomMgr.AddInput(roomID, bindID); err != nil {
 				s.WriteError(w, http.StatusInternalServerError, "ERR_ADD_INPUT", err.Error())
 				return
 			}
@@ -185,7 +189,7 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				if gSetter, ok := s.roomMgr.(interface {
 					SetInputGain(string, string, float64) error
 				}); ok {
-					_ = gSetter.SetInputGain(roomID, req.DeviceID, *req.Gain)
+					_ = gSetter.SetInputGain(roomID, bindID, *req.Gain)
 				}
 			}
 			updated := s.findRoom(roomID)
@@ -206,7 +210,11 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_PARAMS", "device_id is required")
 				return
 			}
-			if err := s.roomMgr.AddOutput(roomID, req.DeviceID); err != nil {
+			bindID := req.DeviceID
+			if req.NodeID != "" && !strings.Contains(bindID, "/") {
+				bindID = req.NodeID + "/" + bindID
+			}
+			if err := s.roomMgr.AddOutput(roomID, bindID); err != nil {
 				s.WriteError(w, http.StatusInternalServerError, "ERR_ADD_OUTPUT", err.Error())
 				return
 			}
@@ -214,7 +222,7 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				if gSetter, ok := s.roomMgr.(interface {
 					SetOutputGain(string, string, float64) error
 				}); ok {
-					_ = gSetter.SetOutputGain(roomID, req.DeviceID, *req.Gain)
+					_ = gSetter.SetOutputGain(roomID, bindID, *req.Gain)
 				}
 			}
 			updated := s.findRoom(roomID)
@@ -246,11 +254,11 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3 segments: /api/v1/rooms/{id}/{category}/{devId}
-	if len(parts) == 3 {
+	// 3+ segments: /api/v1/rooms/{id}/{category}/{devId...}
+	if len(parts) >= 3 {
 		roomID := parts[0]
 		category := parts[1]
-		devID := parts[2]
+		devID := strings.Join(parts[2:], "/")
 
 		room := s.findRoom(roomID)
 		if room.ID == "" {

@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
+	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/audio/urn"
+	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
@@ -88,6 +90,9 @@ type Room struct {
 	router    *router.Router
 	streamMgr StreamManager
 
+	clusterMgr  ClusterDeviceProvider
+	devResolver LocalDeviceResolver
+
 	inputs         []string
 	outputs        []string
 	synced         bool
@@ -109,6 +114,16 @@ type Room struct {
 	onStateChange  func(RoomState)
 }
 
+// ClusterDeviceProvider enables room route resolution across cluster nodes.
+type ClusterDeviceProvider interface {
+	GetSnapshot() *cluster.ClusterSnapshot
+}
+
+// LocalDeviceResolver resolves local hardware or virtual audio devices.
+type LocalDeviceResolver interface {
+	Resolve(ref string) (audio.Device, bool)
+}
+
 // DiscoveryProvider provides peer topology and live peer membership.
 type DiscoveryProvider interface {
 	Peers() []discovery.Peer
@@ -118,15 +133,17 @@ type DiscoveryProvider interface {
 
 // RoomConfig holds the configuration for creating a room
 type RoomConfig struct {
-	ID            RoomID
-	Name          string
-	LocalPeerID   string
-	Config        *config.Config
-	Discovery     DiscoveryProvider
-	SyncManager   *syncmgr.Manager
-	Transport     streamer.Transport
-	Router        *router.Router
-	StreamManager StreamManager
+	ID             RoomID
+	Name           string
+	LocalPeerID    string
+	Config         *config.Config
+	Discovery      DiscoveryProvider
+	SyncManager    *syncmgr.Manager
+	Transport      streamer.Transport
+	Router         *router.Router
+	StreamManager  StreamManager
+	ClusterManager ClusterDeviceProvider
+	DeviceResolver LocalDeviceResolver
 }
 
 // NewRoom creates a new room
@@ -149,6 +166,8 @@ func NewRoom(cfg RoomConfig) *Room {
 		transport:      cfg.Transport,
 		router:         cfg.Router,
 		streamMgr:      cfg.StreamManager,
+		clusterMgr:     cfg.ClusterManager,
+		devResolver:    cfg.DeviceResolver,
 		inputs:         make([]string, 0),
 		outputs:        make([]string, 0),
 		inputGains:     make(map[string]float64),
@@ -159,6 +178,22 @@ func NewRoom(cfg RoomConfig) *Room {
 	r.state.Store(RoomState(RoomStateCreated))
 	r.leader.Store("")
 	return r
+}
+
+// SetClusterManager updates the cluster manager and re-synthesizes routes.
+func (r *Room) SetClusterManager(cm ClusterDeviceProvider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clusterMgr = cm
+	r.recompileRoutesLocked()
+}
+
+// SetDeviceResolver updates the local device resolver and re-synthesizes routes.
+func (r *Room) SetDeviceResolver(res LocalDeviceResolver) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.devResolver = res
+	r.recompileRoutesLocked()
 }
 
 // SetLeader updates the current room leader peer ID.
@@ -665,6 +700,64 @@ func (r *Room) clearCompiledRoutesLocked() {
 	r.compiledRoutes = make(map[string]struct{})
 }
 
+func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+	devRef = strings.TrimSpace(devRef)
+	if devRef == "" {
+		return "local", ""
+	}
+
+	// 1. Explicit node prefix: "nodeID/urn:..."
+	if slash := strings.Index(devRef, "/"); slash > 0 {
+		return devRef[:slash], devRef[slash+1:]
+	}
+
+	cleanDevID = devRef
+
+	// 2. Check local hardware / virtual resolver
+	if r.devResolver != nil {
+		if _, ok := r.devResolver.Resolve(cleanDevID); ok {
+			if r.localID != "" {
+				return r.localID, cleanDevID
+			}
+			return "local", cleanDevID
+		}
+	} else if gr := audio.GlobalResolver(); gr != nil {
+		if _, ok := gr.Resolve(cleanDevID); ok {
+			if r.localID != "" {
+				return r.localID, cleanDevID
+			}
+			return "local", cleanDevID
+		}
+	}
+
+	// 3. Check cluster snapshot from ClusterManager
+	if r.clusterMgr != nil {
+		if snap := r.clusterMgr.GetSnapshot(); snap != nil {
+			for _, cd := range snap.ClusterDevices {
+				if cd.URN == cleanDevID || cd.ID == cleanDevID || cd.DeviceID == cleanDevID {
+					if cd.NodeID != "" {
+						return cd.NodeID, cleanDevID
+					}
+				}
+			}
+		}
+	}
+
+	// 4. Fallback: if single live discovery peer exists, it must belong to that peer
+	if r.disc != nil {
+		live := r.disc.LivePeers()
+		if len(live) == 1 && live[0].ID != "" {
+			return live[0].ID, cleanDevID
+		}
+	}
+
+	// 5. Fallback to local
+	if r.localID != "" {
+		return r.localID, cleanDevID
+	}
+	return "local", cleanDevID
+}
+
 func (r *Room) recompileRoutesLocked() {
 	if r.router == nil {
 		return
@@ -675,22 +768,29 @@ func (r *Room) recompileRoutesLocked() {
 	desired := make(map[string]router.MatrixRoute)
 	for _, inDev := range r.inputs {
 		for _, outDev := range r.outputs {
-			inKey := inDev
-			if strings.Contains(inDev, ":") {
-				inKey = urn.Checksum(inDev)
+			srcNodeID, cleanInDev := r.resolveDeviceEndpoint(inDev)
+			dstNodeID, cleanOutDev := r.resolveDeviceEndpoint(outDev)
+
+			inKey := cleanInDev
+			if strings.Contains(cleanInDev, ":") {
+				inKey = urn.Checksum(cleanInDev)
 			}
-			outKey := outDev
-			if strings.Contains(outDev, ":") {
-				outKey = urn.Checksum(outDev)
+			outKey := cleanOutDev
+			if strings.Contains(cleanOutDev, ":") {
+				outKey = urn.Checksum(cleanOutDev)
 			}
 			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, inKey, outKey)
 
 			inGain := 1.0
 			if g, ok := r.inputGains[inDev]; ok {
 				inGain = g
+			} else if g, ok := r.inputGains[cleanInDev]; ok {
+				inGain = g
 			}
 			outGain := 1.0
 			if g, ok := r.outputGains[outDev]; ok {
+				outGain = g
+			} else if g, ok := r.outputGains[cleanOutDev]; ok {
 				outGain = g
 			}
 			totalGain := inGain * outGain
@@ -702,20 +802,21 @@ func (r *Room) recompileRoutesLocked() {
 
 			coeffs := []float64{totalGain, 0.0, 0.0, totalGain}
 
-			log.Printf("[ROOM:ROUTE] Synthesized intra-room route=%s in=%s out=%s gain=%.2f", routeID, inDev, outDev, totalGain)
+			log.Printf("[ROOM:ROUTE] Synthesized intra-room route=%s in=%s (%s) out=%s (%s) gain=%.2f",
+				routeID, cleanInDev, srcNodeID, cleanOutDev, dstNodeID, totalGain)
 
 			desired[routeID] = router.MatrixRoute{
 				ID:   routeID,
-				Name: fmt.Sprintf("room-%s-%s-%s", r.id, inDev, outDev),
+				Name: fmt.Sprintf("room-%s-%s-%s", r.id, cleanInDev, cleanOutDev),
 				Source: router.MatrixEndpoint{
-					NodeID:   "local",
-					DeviceID: inDev,
+					NodeID:   srcNodeID,
+					DeviceID: cleanInDev,
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},
 				Destination: router.MatrixEndpoint{
-					NodeID:   "local",
-					DeviceID: outDev,
+					NodeID:   dstNodeID,
+					DeviceID: cleanOutDev,
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},

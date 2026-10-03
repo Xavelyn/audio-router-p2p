@@ -240,6 +240,27 @@ Direct cross-node routing enables any audio source to be patched to any audio de
    - The transport layer demuxes incoming packets by SSRC, feeding them directly into the pre-bound `IngressRouteDemuxer`.
    - Audio is decoded, synchronized through the adaptive jitter buffer, and rendered to the physical DAC with sub-millisecond latency.
 
+### 4. Cluster-Wide Device Ownership Resolution and Cross-Node Format Agility
+
+To eliminate cross-node audio silence when rooms bind devices distributed across physical cluster nodes:
+1. **Device Ownership Resolution**:
+   - Room device references support both bare URNs (`urn:audio:hw:alsa:...`) and node-qualified references (`<node_id>/<urn>`).
+   - The room synthesizer resolves endpoints hierarchically:
+     1. Node prefix inspection (`<node_id>/<urn>`).
+     2. Local hardware/virtual device resolver check.
+     3. Periodic cluster inventory snapshot lookup (`ClusterSnapshot.ClusterDevices`).
+     4. Single live discovery peer fallback.
+     5. Local node fallback.
+2. **Directional Stream Role Filtering**:
+   - Each node compares route `Source.NodeID` and `Destination.NodeID` against its canonical `localNodeID`.
+   - If a route's source is remote and destination is local, the node mounts an **Ingress Route** (opens local output DAC, receives incoming UDP stream).
+   - If a route's source is local and destination is remote, the node mounts an **Egress Route** (opens local input ADC, resolves remote peer stream address, streams UDP packets).
+   - If both source and destination are remote, the node ignores the route locally, preventing quarantine and silent `GhostAudioStream` allocation on bystander nodes.
+3. **Format Agility & Resampling**:
+   - Routes automatically detect mismatching sample rates (44.1 kHz $\leftrightarrow$ 48 kHz) and channel layouts (mono $\leftrightarrow$ stereo).
+   - Egress streams sample hardware at the input device's native rate and channel count.
+   - Ingress streams open the destination output hardware at its native rate and channel count, dynamically applying cubic hermite spline resampling and channel remapping.
+
 ---
 
 ## Consequences

@@ -191,15 +191,18 @@
 
   function handleConnect(connection: Connection) {
     invalidConnectionNotice = null;
+    const allKnown = getAllKnownDevices();
 
     if (connection.source.startsWith('input-') && connection.target.startsWith('room-')) {
       const devId = connection.source.replace('input-', '');
       const roomId = connection.target.replace('room-', '');
-      roomStore.addRoomInput(roomId, devId);
+      const d = allKnown.get(devId);
+      roomStore.addRoomInput(roomId, devId, (d as any)?.node_id);
     } else if (connection.source.startsWith('room-') && connection.target.startsWith('output-')) {
       const roomId = connection.source.replace('room-', '');
       const devId = connection.target.replace('output-', '');
-      roomStore.addRoomOutput(roomId, devId);
+      const d = allKnown.get(devId);
+      roomStore.addRoomOutput(roomId, devId, (d as any)?.node_id);
     } else {
       invalidConnectionNotice =
         'Direct connection rejected: In Room-Centric Audio Flow, connect Input devices to a Room, and the Room to Output devices.';
@@ -414,8 +417,13 @@
         flowLayoutStore.setPosition(nodeId, pos);
       }
 
+      const isAssigned = (devId: string, list?: string[]) => {
+        if (!list) return false;
+        return list.includes(devId) || list.some((item) => item.endsWith(`/${devId}`));
+      };
+
       const assignedRooms = currentRooms
-        .filter((r) => r.inputs && r.inputs.includes(dev.id))
+        .filter((r) => isAssigned(dev.id, r.inputs))
         .map((r) => ({ id: r.id, name: r.name }));
 
       nextNodes.push({
@@ -426,7 +434,7 @@
           device: dev,
           assignedRooms,
           allRooms: roomSummaries,
-          onAddToRoom: (roomId: string) => roomStore.addRoomInput(roomId, dev.id),
+          onAddToRoom: (roomId: string) => roomStore.addRoomInput(roomId, dev.id, (dev as any).node_id),
           onRemoveFromRoom: (roomId: string) => roomStore.removeRoomInput(roomId, dev.id),
           onDismiss: () => handleDismissDevice(dev.id, 'input'),
         },
@@ -442,18 +450,23 @@
         flowLayoutStore.setPosition(nodeId, pos);
       }
 
+      const isDevInList = (devId: string, list?: string[]) => {
+        if (!list) return false;
+        return list.includes(devId) || list.some((item) => item.endsWith(`/${devId}`));
+      };
+
       const assignedInputs = stagedDevs.filter(
-        (d) => d.max_input > 0 && room.inputs && room.inputs.includes(d.id)
+        (d) => d.max_input > 0 && isDevInList(d.id, room.inputs)
       );
       const assignedOutputs = stagedDevs.filter(
-        (d) => d.max_output > 0 && room.outputs && room.outputs.includes(d.id)
+        (d) => d.max_output > 0 && isDevInList(d.id, room.outputs)
       );
 
       const availableInputs = stagedDevs.filter(
-        (d) => d.max_input > 0 && (!room.inputs || !room.inputs.includes(d.id))
+        (d) => d.max_input > 0 && !isDevInList(d.id, room.inputs)
       );
       const availableOutputs = stagedDevs.filter(
-        (d) => d.max_output > 0 && (!room.outputs || !room.outputs.includes(d.id))
+        (d) => d.max_output > 0 && !isDevInList(d.id, room.outputs)
       );
 
       nextNodes.push({
@@ -467,9 +480,15 @@
           availableInputs,
           availableOutputs,
           onToggleSync: (synced: boolean) => roomStore.setRoomSync(room.id, synced),
-          onAddInput: (devId: string) => roomStore.addRoomInput(room.id, devId),
+          onAddInput: (devId: string) => {
+            const d = allKnown.get(devId);
+            roomStore.addRoomInput(room.id, devId, (d as any)?.node_id);
+          },
           onRemoveInput: (devId: string) => roomStore.removeRoomInput(room.id, devId),
-          onAddOutput: (devId: string) => roomStore.addRoomOutput(room.id, devId),
+          onAddOutput: (devId: string) => {
+            const d = allKnown.get(devId);
+            roomStore.addRoomOutput(room.id, devId, (d as any)?.node_id);
+          },
           onRemoveOutput: (devId: string) => roomStore.removeRoomOutput(room.id, devId),
           onDeleteRoom: async () => {
             if (confirm(`Delete audio room "${room.name}" (${room.id})?`)) {
@@ -490,10 +509,11 @@
       // (a) Input -> Room
       if (room.inputs) {
         for (const inputDevId of room.inputs) {
-          if (inputDevs.some((d) => d.id === inputDevId)) {
+          const matchDev = inputDevs.find((d) => d.id === inputDevId || inputDevId.endsWith(`/${d.id}`));
+          if (matchDev) {
             nextEdges.push({
-              id: `edge-in-${inputDevId}-to-${room.id}`,
-              source: `input-${inputDevId}`,
+              id: `edge-in-${matchDev.id}-to-${room.id}`,
+              source: `input-${matchDev.id}`,
               target: `room-${room.id}`,
               sourceHandle: 'out',
               targetHandle: 'in',
@@ -508,11 +528,12 @@
       // (b) Room -> Output
       if (room.outputs) {
         for (const outputDevId of room.outputs) {
-          if (outputDevs.some((d) => d.id === outputDevId)) {
+          const matchDev = outputDevs.find((d) => d.id === outputDevId || outputDevId.endsWith(`/${d.id}`));
+          if (matchDev) {
             nextEdges.push({
-              id: `edge-room-${room.id}-to-out-${outputDevId}`,
+              id: `edge-room-${room.id}-to-out-${matchDev.id}`,
               source: `room-${room.id}`,
-              target: `output-${outputDevId}`,
+              target: `output-${matchDev.id}`,
               sourceHandle: 'out',
               targetHandle: 'in',
               animated: true,
@@ -533,8 +554,13 @@
         flowLayoutStore.setPosition(nodeId, pos);
       }
 
+      const isDevAssigned = (devId: string, list?: string[]) => {
+        if (!list) return false;
+        return list.includes(devId) || list.some((item) => item.endsWith(`/${devId}`));
+      };
+
       const sourceRooms = currentRooms
-        .filter((r) => r.outputs && r.outputs.includes(dev.id))
+        .filter((r) => isDevAssigned(dev.id, r.outputs))
         .map((r) => ({ id: r.id, name: r.name }));
 
       nextNodes.push({
@@ -545,7 +571,7 @@
           device: dev,
           sourceRooms,
           allRooms: roomSummaries,
-          onAddToRoom: (roomId: string) => roomStore.addRoomOutput(roomId, dev.id),
+          onAddToRoom: (roomId: string) => roomStore.addRoomOutput(roomId, dev.id, (dev as any).node_id),
           onRemoveFromRoom: (roomId: string) => roomStore.removeRoomOutput(roomId, dev.id),
           onDismiss: () => handleDismissDevice(dev.id, 'output'),
         },

@@ -152,10 +152,10 @@ class RoomStore {
     }
   }
 
-  async addRoomInput(roomId: string, devId: string) {
+  async addRoomInput(roomId: string, devId: string, nodeId?: string) {
     this.lastError = null;
     try {
-      const updated = await apiClient.addRoomInput(roomId, devId);
+      const updated = await apiClient.addRoomInput(roomId, devId, undefined, nodeId);
       const idx = this.rooms.findIndex((r) => r.id === roomId);
       if (idx !== -1) {
         this.rooms = this.rooms.map((r, i) =>
@@ -183,7 +183,7 @@ class RoomStore {
     const idx = this.rooms.findIndex((r) => r.id === roomId);
     if (idx !== -1) {
       this.rooms = this.rooms.map((r, i) =>
-        i === idx ? { ...r, inputs: (r.inputs || []).filter((id) => id !== devId) } : r
+        i === idx ? { ...r, inputs: (r.inputs || []).filter((id) => id !== devId && !id.endsWith(`/${devId}`)) } : r
       );
     }
     try {
@@ -209,10 +209,10 @@ class RoomStore {
     }
   }
 
-  async addRoomOutput(roomId: string, devId: string) {
+  async addRoomOutput(roomId: string, devId: string, nodeId?: string) {
     this.lastError = null;
     try {
-      const updated = await apiClient.addRoomOutput(roomId, devId);
+      const updated = await apiClient.addRoomOutput(roomId, devId, undefined, nodeId);
       const idx = this.rooms.findIndex((r) => r.id === roomId);
       if (idx !== -1) {
         this.rooms = this.rooms.map((r, i) =>
@@ -240,7 +240,7 @@ class RoomStore {
     const idx = this.rooms.findIndex((r) => r.id === roomId);
     if (idx !== -1) {
       this.rooms = this.rooms.map((r, i) =>
-        i === idx ? { ...r, outputs: (r.outputs || []).filter((id) => id !== devId) } : r
+        i === idx ? { ...r, outputs: (r.outputs || []).filter((id) => id !== devId && !id.endsWith(`/${devId}`)) } : r
       );
     }
     try {

@@ -62,45 +62,45 @@ type RoomRecord struct {
 // Clone returns a deep copy of the RoomRecord.
 func (r RoomRecord) Clone() RoomRecord {
 	cp := r
-	if len(r.Inputs) > 0 {
+	if r.Inputs != nil {
 		cp.Inputs = make([]string, len(r.Inputs))
 		copy(cp.Inputs, r.Inputs)
 	}
-	if len(r.Outputs) > 0 {
+	if r.Outputs != nil {
 		cp.Outputs = make([]string, len(r.Outputs))
 		copy(cp.Outputs, r.Outputs)
 	}
-	if len(r.InputGains) > 0 {
+	if r.InputGains != nil {
 		cp.InputGains = make(map[string]float64, len(r.InputGains))
 		for k, v := range r.InputGains {
 			cp.InputGains[k] = v
 		}
 	}
-	if len(r.OutputGains) > 0 {
+	if r.OutputGains != nil {
 		cp.OutputGains = make(map[string]float64, len(r.OutputGains))
 		for k, v := range r.OutputGains {
 			cp.OutputGains[k] = v
 		}
 	}
-	if len(r.InputAdds) > 0 {
+	if r.InputAdds != nil {
 		cp.InputAdds = make(map[string]HLT, len(r.InputAdds))
 		for k, v := range r.InputAdds {
 			cp.InputAdds[k] = v
 		}
 	}
-	if len(r.InputRemoves) > 0 {
+	if r.InputRemoves != nil {
 		cp.InputRemoves = make(map[string]HLT, len(r.InputRemoves))
 		for k, v := range r.InputRemoves {
 			cp.InputRemoves[k] = v
 		}
 	}
-	if len(r.OutputAdds) > 0 {
+	if r.OutputAdds != nil {
 		cp.OutputAdds = make(map[string]HLT, len(r.OutputAdds))
 		for k, v := range r.OutputAdds {
 			cp.OutputAdds[k] = v
 		}
 	}
-	if len(r.OutputRemoves) > 0 {
+	if r.OutputRemoves != nil {
 		cp.OutputRemoves = make(map[string]HLT, len(r.OutputRemoves))
 		for k, v := range r.OutputRemoves {
 			cp.OutputRemoves[k] = v
@@ -237,6 +237,7 @@ func (s *LWWSet) SetLeader(id, leader string) (RoomRecord, error) {
 	if rec.Leader == leader {
 		return rec.Clone(), nil
 	}
+	rec = rec.Clone()
 	ts := s.nextHLTLocked()
 	rec.Leader = leader
 	rec.Timestamp = ts
@@ -249,10 +250,11 @@ func (s *LWWSet) AddInput(id, devID string) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.InputAdds == nil {
 		rec.InputAdds = make(map[string]HLT)
@@ -269,10 +271,11 @@ func (s *LWWSet) RemoveInput(id, devID string) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.InputRemoves == nil {
 		rec.InputRemoves = make(map[string]HLT)
@@ -289,10 +292,11 @@ func (s *LWWSet) AddOutput(id, devID string) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.OutputAdds == nil {
 		rec.OutputAdds = make(map[string]HLT)
@@ -309,10 +313,11 @@ func (s *LWWSet) RemoveOutput(id, devID string) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.OutputRemoves == nil {
 		rec.OutputRemoves = make(map[string]HLT)
@@ -329,10 +334,11 @@ func (s *LWWSet) SetRoomBindings(id string, inputs, outputs []string, synced boo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.InputAdds == nil {
 		rec.InputAdds = make(map[string]HLT)
@@ -382,10 +388,11 @@ func (s *LWWSet) SetInputGain(id, devID string, gain float64) (RoomRecord, error
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.InputGains == nil {
 		rec.InputGains = make(map[string]float64)
@@ -401,10 +408,11 @@ func (s *LWWSet) SetOutputGain(id, devID string, gain float64) (RoomRecord, erro
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	if rec.OutputGains == nil {
 		rec.OutputGains = make(map[string]float64)
@@ -420,10 +428,11 @@ func (s *LWWSet) SetRoomSync(id string, synced bool) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	rec, exists := s.records[id]
-	if !exists || rec.Deleted {
+	raw, exists := s.records[id]
+	if !exists || raw.Deleted {
 		return RoomRecord{}, fmt.Errorf("room %s not found", id)
 	}
+	rec := raw.Clone()
 	ts := s.nextHLTLocked()
 	rec.Synced = synced
 	rec.Timestamp = ts
@@ -443,7 +452,7 @@ func (s *LWWSet) MergeRecord(incoming RoomRecord) (RoomRecord, bool) {
 
 // mergeRecordLocked implements join-semilattice merge for a room record.
 func (s *LWWSet) mergeRecordLocked(incoming RoomRecord) (RoomRecord, bool) {
-	local, exists := s.records[incoming.ID]
+	raw, exists := s.records[incoming.ID]
 	if !exists {
 		// New record
 		rec := incoming.Clone()
@@ -453,10 +462,12 @@ func (s *LWWSet) mergeRecordLocked(incoming RoomRecord) (RoomRecord, bool) {
 		return rec.Clone(), true
 	}
 
+	local := raw.Clone()
+	inClone := incoming.Clone()
 	changed := false
 
 	// Merge nested device LWW sets
-	if mergeNestedSets(&local, &incoming) {
+	if mergeNestedSets(&local, &inClone) {
 		changed = true
 	}
 
@@ -581,6 +592,19 @@ func (s *LWWSet) ExportState() []RoomRecord {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// ExportStateJSON exports serialized JSON of all room records while holding the read lock.
+func (s *LWWSet) ExportStateJSON() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]RoomRecord, 0, len(s.records))
+	for _, rec := range s.records {
+		out = append(out, rec.Clone())
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return json.Marshal(out)
 }
 
 // ImportState seeds or merges initial state records (used on Load).

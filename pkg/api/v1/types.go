@@ -120,6 +120,7 @@ type RoomInfo struct {
 // RoomDeviceBindingRequest assigns or updates an input or output device in a room.
 type RoomDeviceBindingRequest struct {
 	DeviceID string   `json:"device_id"`
+	NodeID   string   `json:"node_id,omitempty"`
 	Gain     *float64 `json:"gain,omitempty"`
 	Muted    *bool    `json:"muted,omitempty"`
 }

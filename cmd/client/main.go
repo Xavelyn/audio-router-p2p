@@ -131,6 +131,7 @@ func main() {
 	}
 
 	if cm := apiSrv.ClusterManager(); cm != nil {
+		roomMgr.SetClusterManager(cm)
 		cm.Start(context.Background())
 		defer cm.Stop()
 	}
@@ -436,6 +437,12 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 
 		m.routes[sr.ID] = &activeStream{route: sr, st: st, in: nil, out: out}
 		log.Printf("[STREAM:MGR] Ingress route %s active: receiving from node %s -> local output %s (%d Hz, %d ch)", sr.ID, sr.SourceNodeID, dstRef, sampleRate, chans)
+		return nil
+	}
+
+	// Remote route between other nodes in cluster: neither source nor destination is this node.
+	if isRemoteSource && !isLocalDest {
+		log.Printf("[STREAM:MGR] Route %s is between remote peers (src=%s, dst=%s); ignoring locally", sr.ID, sr.SourceNodeID, sr.PeerID)
 		return nil
 	}
 

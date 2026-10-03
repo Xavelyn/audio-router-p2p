@@ -203,6 +203,7 @@ export interface UpdateRoomBindingsRequest {
 
 export interface RoomDeviceBindingRequest {
   device_id: string;
+  node_id?: string;
   gain?: number;
   muted?: boolean;
 }
