@@ -213,4 +213,37 @@ func TestV1TelemetryWebSocket(t *testing.T) {
 	if mr.Coefficients[1] != 0.5 {
 		t.Errorf("crosspoint gain = %f; want 0.5", mr.Coefficients[1])
 	}
+
+	// Send live crosspoint gain command with nested crosspoint object (frontend web/src/lib/api/ws.ts format)
+	nestedCmd := WSControlMessage{
+		Type:    "crosspoint",
+		RouteID: "ws-route-1",
+		Crosspoint: &CrosspointGainRequest{
+			OutChannel: 0,
+			InChannel:  1,
+			Gain:       0.75,
+			SlewMS:     15.0,
+		},
+	}
+	_ = ws.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := websocket.JSON.Send(ws, nestedCmd); err != nil {
+		t.Fatalf("WS send nested command failed: %v", err)
+	}
+
+	var nestedResp map[string]any
+	if err := websocket.JSON.Receive(ws, &nestedResp); err != nil {
+		t.Fatalf("WS receive nested ack failed: %v", err)
+	}
+
+	if nestedResp["status"] != "ok" {
+		t.Errorf("expected status ok for nested crosspoint, got %+v", nestedResp)
+	}
+
+	mr2, found := s.router.GetMatrix("ws-route-1")
+	if !found {
+		t.Fatal("route not found after nested ws command")
+	}
+	if mr2.Coefficients[1] != 0.75 {
+		t.Errorf("nested crosspoint gain = %f; want 0.75", mr2.Coefficients[1])
+	}
 }

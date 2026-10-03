@@ -1,9 +1,6 @@
 package sync
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-	"encoding/json"
 	"log"
 	"net"
 	"sync"
@@ -15,23 +12,13 @@ import (
 	"github.com/audio-router-p2p/pkg/telemetry"
 )
 
-// message is the wire format for clock-sync pings/pongs (all times in ns).
-type message struct {
-	Type  string `json:"type"` // "sync-request" | "sync-response"
-	ID    string `json:"id"`   // sender node id (diagnostic only; not trusted for accounting)
-	Nonce uint64 `json:"nonce"`
-	T1    int64  `json:"t1"` // client send time
-	T2    int64  `json:"t2"` // server receive time
-	T3    int64  `json:"t3"` // server send time
-	T4    int64  `json:"t4"` // client receive time (response only)
-}
-
 const (
-	msgRequest  = "sync-request"
-	msgResponse = "sync-response"
+	defaultSyncInterval = 1 * time.Second
+	defaultPeerTTL      = 5 * time.Second
+	recvBufferSize      = 2048
 )
 
-// PeerOffset is the estimated clock offset for a peer.
+// PeerOffset is the estimated clock offset and link telemetry for a peer.
 type PeerOffset struct {
 	Offset     time.Duration `json:"offset"`
 	RTT        time.Duration `json:"rtt"`
@@ -48,10 +35,12 @@ type PeerSource interface {
 
 // Manager performs NTP-style clock synchronisation against discovered peers.
 type Manager struct {
-	cfg  *config.Config
-	disc PeerSource
+	cfg          *config.Config
+	disc         PeerSource
+	syncInterval time.Duration
+	peerTTL      time.Duration
 
-	mu      sync.Mutex
+	mu      sync.RWMutex
 	conn    *net.UDPConn
 	started bool
 	stopCh  chan struct{}
@@ -66,18 +55,32 @@ type Manager struct {
 	isMaster    atomic.Bool
 }
 
-// NewManager creates a clock-sync manager for the given discovery service.
+// NewManager creates a clock-sync manager for the given discovery service and configuration.
+// If intervals are zero or invalid, sensible defaults are automatically established.
 func NewManager(cfg *config.Config, disc PeerSource) *Manager {
+	interval := defaultSyncInterval
+	ttl := defaultPeerTTL
+	if cfg != nil {
+		if cfg.SyncInterval > 0 {
+			interval = cfg.SyncInterval
+		}
+		if cfg.PeerTTL > 0 {
+			ttl = cfg.PeerTTL
+		}
+	}
+
 	return &Manager{
-		cfg:     cfg,
-		disc:    disc,
-		offsets: make(map[string]PeerOffset),
-		pending: make(map[uint64]time.Time),
-		stopCh:  make(chan struct{}),
+		cfg:          cfg,
+		disc:         disc,
+		syncInterval: interval,
+		peerTTL:      ttl,
+		offsets:      make(map[string]PeerOffset),
+		pending:      make(map[uint64]time.Time),
+		stopCh:       make(chan struct{}),
 	}
 }
 
-// Run starts the sync loop. It blocks until Close is called.
+// Run starts the clock synchronization engine and blocks until Close is called.
 func (m *Manager) Run() {
 	m.mu.Lock()
 	if m.started {
@@ -85,7 +88,9 @@ func (m *Manager) Run() {
 		return
 	}
 	m.started = true
-	if m.cfg.SyncPort > 0 {
+
+	// Bind UDP listener if a port was configured
+	if m.cfg != nil && m.cfg.SyncPort > 0 {
 		if c, err := net.ListenUDP("udp4", &net.UDPAddr{Port: m.cfg.SyncPort}); err == nil {
 			m.conn = c
 			m.wg.Add(1)
@@ -96,214 +101,208 @@ func (m *Manager) Run() {
 	}
 	m.mu.Unlock()
 
-	ticker := time.NewTicker(m.cfg.SyncInterval)
+	// Track the main worker loop on m.wg so Close() cleanly awaits total shutdown
+	m.wg.Add(1)
+	defer m.wg.Done()
+
+	ticker := time.NewTicker(m.syncInterval)
 	defer ticker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
 			m.pingPeers()
 			m.sweepPending()
 		case <-m.stopCh:
-			m.mu.Lock()
-			if m.conn != nil {
-				_ = m.conn.Close()
-			}
-			m.mu.Unlock()
-			m.wg.Wait()
 			return
 		}
 	}
 }
 
+// recvLoop continuously reads and decodes incoming synchronization datagrams.
 func (m *Manager) recvLoop(conn *net.UDPConn) {
 	defer m.wg.Done()
-	buf := make([]byte, 2048)
+	buf := make([]byte, recvBufferSize)
+
 	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			m.mu.Lock()
+			m.mu.RLock()
 			stopping := m.conn == nil
-			m.mu.Unlock()
+			m.mu.RUnlock()
 			if stopping {
 				return
 			}
-			log.Printf("sync: receive: %v", err)
+			log.Printf("sync: receive error: %v", err)
 			continue
 		}
-		var msg message
-		if err := json.Unmarshal(buf[:n], &msg); err != nil {
-			continue
-		}
-		m.handle(addr, &msg)
-	}
-}
 
-// syncAddrMatches compares a source socket with an advertised UDP endpoint.
-// Discovery normally emits numeric IPv4 addresses, but resolving the advertised
-// value also keeps a configured hostname from being rejected merely because the
-// UDP source is numeric.
-func syncAddrMatches(advertised string, source *net.UDPAddr) bool {
-	if source == nil {
-		return false
+		msg, err := decodeMessage(buf[:n])
+		if err != nil {
+			continue
+		}
+
+		m.handle(addr, msg)
 	}
-	peerAddr, err := net.ResolveUDPAddr("udp4", advertised)
-	if err != nil {
-		return false
-	}
-	return peerAddr.Port == source.Port && peerAddr.IP.Equal(source.IP)
 }
 
 // peerIDForSyncAddr resolves a sync datagram source address to the ID of a
-// currently-discovered peer. It binds accounting to the address that discovery
-// supplied rather than to a sender-claimed ID. The local node is excluded.
-//
-// This is an admission check, not cryptographic authentication: discovery's
-// current token check is LAN-level and is addressed separately in finding 4.1.
+// currently-discovered peer. The local node is excluded.
 func (m *Manager) peerIDForSyncAddr(addr *net.UDPAddr) (string, bool) {
-	if addr == nil {
+	if addr == nil || m.disc == nil {
 		return "", false
 	}
-	localID := m.disc.NodeID()
-	for _, p := range m.disc.Peers() {
-		if p.ID == "" || p.ID == localID || p.SyncAddr == "" {
-			continue
-		}
-		if syncAddrMatches(p.SyncAddr, addr) {
-			return p.ID, true
-		}
-	}
-	return "", false
+	return resolvePeerID(m.disc.Peers(), m.disc.NodeID(), addr)
 }
 
+// handle processes an incoming request or response message.
 func (m *Manager) handle(addr *net.UDPAddr, msg *message) {
+	if msg == nil || addr == nil {
+		return
+	}
+
 	switch msg.Type {
 	case msgRequest:
-		// Restrict sync to peers that discovery currently knows about. This
-		// avoids replying to arbitrary UDP senders; it does not replace
-		// message authentication, which remains an open finding 4.1 item.
-		if _, ok := m.peerIDForSyncAddr(addr); !ok {
-			return
-		}
-		now := time.Now().UnixNano()
-		resp := message{
-			Type:  msgResponse,
-			ID:    m.disc.NodeID(),
-			Nonce: msg.Nonce,
-			T1:    msg.T1,
-			T2:    now, // server receive time of the request
-			T3:    now, // server send time of the response
-		}
-		payload, _ := json.Marshal(resp)
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if m.conn != nil {
-			_, _ = m.conn.WriteToUDP(payload, addr)
-		}
+		m.handleRequest(addr, msg)
 	case msgResponse:
-		t4 := time.Now().UnixNano()
-		nowTime := time.Now()
-		m.packetsRecv.Add(1)
-		// The response arrived from a concrete UDP source; resolve its
-		// identity from discovery instead of trusting the sender-claimed
-		// msg.ID (which any off-path attacker can set). Do this before m.mu:
-		// PeerSource may take the discovery lock.
-		peerID, ok := m.peerIDForSyncAddr(addr)
-		if !ok {
-			return
-		}
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		t1, ok := m.pending[msg.Nonce]
-		if !ok {
-			return
-		}
-		delete(m.pending, msg.Nonce)
-		t1ns := t1.UnixNano()
-		// offset = ((t2 - t1) + (t3 - t4)) / 2
-		offset := ((msg.T2 - t1ns) + (msg.T3 - t4)) / 2
-		rtt := t4 - msg.T3 + msg.T2 - t1ns
-
-		driftPPM := 0.0
-		if prev, hasPrev := m.offsets[peerID]; hasPrev {
-			dt := nowTime.Sub(prev.LastUpdate).Seconds()
-			if dt > 0.05 {
-				deltaOffsetSec := (time.Duration(offset) - prev.Offset).Seconds()
-				instantDrift := (deltaOffsetSec / dt) * 1e6
-				driftPPM = 0.8*prev.DriftPPM + 0.2*instantDrift
-			} else {
-				driftPPM = prev.DriftPPM
-			}
-		}
-
-		m.offsets[peerID] = PeerOffset{
-			Offset:     time.Duration(offset),
-			RTT:        time.Duration(rtt),
-			DriftPPM:   driftPPM,
-			LastUpdate: nowTime,
-		}
+		m.handleResponse(addr, msg)
 	}
 }
 
-// pingPeers sends a time-sync request to every discovered peer.
+// handleRequest responds to incoming sync pings from authorized cluster peers.
+func (m *Manager) handleRequest(addr *net.UDPAddr, msg *message) {
+	// Restrict sync to peers that discovery currently knows about.
+	if _, ok := m.peerIDForSyncAddr(addr); !ok {
+		return
+	}
+
+	now := time.Now().UnixNano()
+	resp := message{
+		Type:  msgResponse,
+		ID:    m.disc.NodeID(),
+		Nonce: msg.Nonce,
+		T1:    msg.T1,
+		T2:    now, // server receive time of the request
+		T3:    now, // server send time of the response
+	}
+
+	payload, err := encodeMessage(&resp)
+	if err != nil {
+		return
+	}
+
+	m.mu.RLock()
+	conn := m.conn
+	m.mu.RUnlock()
+
+	if conn != nil {
+		_, _ = conn.WriteToUDP(payload, addr)
+	}
+}
+
+// handleResponse handles arriving sync pong responses, measuring skew, RTT, and clock drift.
+func (m *Manager) handleResponse(addr *net.UDPAddr, msg *message) {
+	t4 := time.Now().UnixNano()
+	nowTime := time.Now()
+
+	// Verify sender identity against discovery
+	peerID, ok := m.peerIDForSyncAddr(addr)
+	if !ok {
+		return
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	t1, ok := m.pending[msg.Nonce]
+	if !ok {
+		return
+	}
+	delete(m.pending, msg.Nonce)
+	m.packetsRecv.Add(1)
+
+	offset, rtt := ComputeOffsetAndRTT(t1.UnixNano(), msg.T2, msg.T3, t4)
+
+	prev, hasPrev := m.offsets[peerID]
+	dt := nowTime.Sub(prev.LastUpdate)
+	driftPPM := ComputeDriftPPM(prev.Offset, offset, prev.DriftPPM, dt, hasPrev)
+
+	m.offsets[peerID] = PeerOffset{
+		Offset:     offset,
+		RTT:        rtt,
+		DriftPPM:   driftPPM,
+		LastUpdate: nowTime,
+	}
+}
+
+// pingPeers transmits a time-sync request to every discovered cluster peer.
 func (m *Manager) pingPeers() {
-	for _, p := range m.disc.Peers() {
-		if p.SyncAddr == "" {
+	if m.disc == nil {
+		return
+	}
+
+	peers := m.disc.Peers()
+	localID := m.disc.NodeID()
+
+	for _, p := range peers {
+		if p.ID == localID || p.SyncAddr == "" {
 			continue
 		}
+
 		nonce, err := randomNonce()
 		if err != nil {
 			continue
 		}
+
 		req := message{
 			Type:  msgRequest,
-			ID:    m.disc.NodeID(),
+			ID:    localID,
 			Nonce: nonce,
 			T1:    time.Now().UnixNano(),
 		}
-		payload, err := json.Marshal(req)
+
+		payload, err := encodeMessage(&req)
 		if err != nil {
 			continue
 		}
-		m.mu.Lock()
-		if m.conn == nil {
-			m.mu.Unlock()
-			return
-		}
+
+		// Resolve destination socket outside of mutex lock
 		addr, err := net.ResolveUDPAddr("udp4", p.SyncAddr)
-		if err == nil {
-			_, _ = m.conn.WriteToUDP(payload, addr)
-			m.pending[nonce] = time.Unix(0, req.T1)
-			m.packetsSent.Add(1)
+		if err != nil {
+			continue
+		}
+
+		m.mu.Lock()
+		if m.conn != nil {
+			if _, err := m.conn.WriteToUDP(payload, addr); err == nil {
+				m.pending[nonce] = time.Unix(0, req.T1)
+				m.packetsSent.Add(1)
+			}
 		}
 		m.mu.Unlock()
 	}
 }
 
-// sweepPending drops sync requests older than PeerTTL that never got a reply.
+// sweepPending drops sync requests older than peerTTL that never received a response.
 func (m *Manager) sweepPending() {
-	cutoff := time.Now().Add(-m.cfg.PeerTTL)
+	cutoff := time.Now().Add(-m.peerTTL)
+
 	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	for nonce, sent := range m.pending {
 		if sent.Before(cutoff) {
 			delete(m.pending, nonce)
 			m.packetsLost.Add(1)
 		}
 	}
-	m.mu.Unlock()
 }
 
-func randomNonce() (uint64, error) {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return 0, err
-	}
-	return binary.LittleEndian.Uint64(b[:]), nil
-}
-
-// Offsets returns a snapshot of all known clock offsets.
+// Offsets returns a thread-safe snapshot of all known peer clock offsets.
 func (m *Manager) Offsets() map[string]PeerOffset {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
 	out := make(map[string]PeerOffset, len(m.offsets))
 	for k, v := range m.offsets {
 		out[k] = v
@@ -323,8 +322,8 @@ func (m *Manager) SetMaster(v bool) {
 
 // Telemetry returns aggregated clock sync health metrics safely.
 func (m *Manager) Telemetry() telemetry.ClockSyncHealth {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	var totalOffsetUS, totalDriftPPM, totalRTTUS float64
 	count := 0
@@ -354,8 +353,8 @@ func (m *Manager) Telemetry() telemetry.ClockSyncHealth {
 
 // PeerOffsets returns peer sync telemetry formatted for the telemetry aggregator.
 func (m *Manager) PeerOffsets() map[string]telemetry.PeerSyncOffset {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	out := make(map[string]telemetry.PeerSyncOffset, len(m.offsets))
 	for k, v := range m.offsets {
@@ -369,16 +368,18 @@ func (m *Manager) PeerOffsets() map[string]telemetry.PeerSyncOffset {
 	return out
 }
 
-// Close stops the manager and closes its socket.
+// Close stops the manager, closes its UDP socket, and awaits termination of all background routines.
 func (m *Manager) Close() {
 	m.once.Do(func() {
 		close(m.stopCh)
+
 		m.mu.Lock()
 		if m.conn != nil {
 			_ = m.conn.Close()
 			m.conn = nil
 		}
 		m.mu.Unlock()
+
 		m.wg.Wait()
 	})
 }

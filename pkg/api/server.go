@@ -201,6 +201,12 @@ func (s *Server) SetClusterManager(mgr *cluster.Manager) {
 
 // Close gracefully shuts down the API server and its background subsystems.
 func (s *Server) Close() error {
+	if s.hub != nil {
+		s.hub.Stop()
+	}
+	if s.aggregator != nil {
+		_ = s.aggregator.Close()
+	}
 	if s.clusterMgr != nil {
 		_ = s.clusterMgr.Close()
 	}

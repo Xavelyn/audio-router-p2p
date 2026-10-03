@@ -457,3 +457,20 @@ func (r *DeviceResolver) ListDevices() []Device {
 	})
 	return out
 }
+
+// Close closes all active device streams and clears the active streams catalog.
+func (r *DeviceResolver) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var firstErr error
+	for urnKey, st := range r.streams {
+		if st != nil {
+			if err := st.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+		delete(r.streams, urnKey)
+	}
+	return firstErr
+}

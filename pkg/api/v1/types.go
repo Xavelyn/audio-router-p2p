@@ -199,14 +199,15 @@ type StreamStats struct {
 
 // WSControlMessage represents command payloads received over live WebSocket.
 type WSControlMessage struct {
-	Type         string    `json:"type"` // "crosspoint", "patch_route", "mute"
-	RouteID      string    `json:"route_id"`
-	OutChannel   int       `json:"out_channel,omitempty"`
-	InChannel    int       `json:"in_channel,omitempty"`
-	Gain         float64   `json:"gain,omitempty"`
-	Coefficients []float64 `json:"coefficients,omitempty"`
-	SlewMS       float64   `json:"slew_ms,omitempty"`
-	Muted        *bool     `json:"muted,omitempty"`
+	Type         string                 `json:"type"` // "crosspoint", "patch_route", "mute"
+	RouteID      string                 `json:"route_id"`
+	OutChannel   int                    `json:"out_channel,omitempty"`
+	InChannel    int                    `json:"in_channel,omitempty"`
+	Gain         float64                `json:"gain,omitempty"`
+	Coefficients []float64              `json:"coefficients,omitempty"`
+	SlewMS       float64                `json:"slew_ms,omitempty"`
+	Muted        *bool                  `json:"muted,omitempty"`
+	Crosspoint   *CrosspointGainRequest `json:"crosspoint,omitempty"`
 }
 
 // NetworkHealthResponse represents the JSON response for GET /api/v1/network/health per ADR 0010.

@@ -123,3 +123,50 @@ func TestEmulatorInputNormalizesParams(t *testing.T) {
 		t.Fatalf("read %d bytes, not frame-aligned", n)
 	}
 }
+
+func TestEmulatorOutputDrained(t *testing.T) {
+	// Case 1: Empty on close
+	out1, err := OpenOutput(1, 44100, 1, true)
+	if err != nil {
+		t.Fatalf("OpenOutput: %v", err)
+	}
+	eo1, ok := out1.(*emulatorOutput)
+	if !ok {
+		t.Fatal("expected emulatorOutput")
+	}
+	if eo1.Drained() {
+		t.Fatal("expected Drained() to be false before close")
+	}
+	if err := eo1.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !eo1.Drained() {
+		t.Fatal("expected Drained() to be true immediately when closed with empty buffer")
+	}
+
+	// Case 2: Buffer populated on close, drained subsequently
+	out2, err := OpenOutput(2, 44100, 1, true)
+	if err != nil {
+		t.Fatalf("OpenOutput: %v", err)
+	}
+	eo2, ok := out2.(*emulatorOutput)
+	if !ok {
+		t.Fatal("expected emulatorOutput")
+	}
+	if _, err := eo2.Write([]byte{1, 2, 3, 4}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := eo2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if eo2.Drained() {
+		t.Fatal("expected Drained() to be false when closed with buffered data")
+	}
+	drainedData := eo2.Drain()
+	if len(drainedData) != 4 {
+		t.Fatalf("expected 4 bytes drained, got %d", len(drainedData))
+	}
+	if !eo2.Drained() {
+		t.Fatal("expected Drained() to be true after Drain() emptied the closed buffer")
+	}
+}

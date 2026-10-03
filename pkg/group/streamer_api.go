@@ -100,9 +100,10 @@ func (gs *GroupStreamer) Start() error {
 	gs.playing.Store(true)
 
 	// If output != nil and room has transport, listen for room audio packets
-	if gs.output != nil && gs.room.transport != nil {
+	trans := gs.room.Transport()
+	if gs.output != nil && trans != nil {
 		gs.jitterBuf = streamer.NewJitterBuffer(gs.packetBytes, gs.sampleRate, gs.channels, 200)
-		gs.unregister = gs.room.transport.Receive(gs.handlePacket)
+		gs.unregister = trans.Receive(gs.handlePacket)
 		gs.wg.Add(1)
 		go gs.playoutLoop()
 	}
@@ -212,11 +213,11 @@ func (gs *GroupStreamer) sendLoop() {
 		}
 		pkt := transport.Marshal(hdr, payload)
 
-		if gs.room.transport != nil {
+		if trans := gs.room.Transport(); trans != nil {
 			members := gs.room.Members()
 			for _, m := range members {
 				if m.PeerID != gs.room.localID && m.StreamAddr != "" {
-					_ = gs.room.transport.Send(m.StreamAddr, pkt)
+					_ = trans.Send(m.StreamAddr, pkt)
 				}
 			}
 		}
@@ -250,6 +251,9 @@ func (gs *GroupStreamer) Stop() {
 		if closer, ok := gs.input.(io.Closer); ok {
 			_ = closer.Close()
 		}
+		if closer, ok := gs.output.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		done := make(chan struct{})
 		go func() {
 			gs.wg.Wait()
@@ -275,8 +279,12 @@ type GroupStreamerStats struct {
 
 // Stats reports group-playback metrics.
 func (gs *GroupStreamer) Stats() GroupStreamerStats {
+	memberCount := len(gs.room.Members()) - 1
+	if memberCount < 0 {
+		memberCount = 0
+	}
 	stats := GroupStreamerStats{
-		MemberCount: len(gs.room.Members()) - 1,
+		MemberCount: memberCount,
 		PacketsSent: gs.sendSeq.Load(),
 	}
 	if gs.jitterBuf != nil {

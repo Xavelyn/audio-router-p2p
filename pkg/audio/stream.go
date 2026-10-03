@@ -205,13 +205,14 @@ func (e *emulatorInput) Close() error {
 
 // emulatorOutput implements AudioStream by buffering written PCM data.
 type emulatorOutput struct {
-	deviceID   int
-	buf        []byte
-	mu         sync.Mutex
-	closed     bool
-	closedCh   chan struct{}
-	closedOnce sync.Once
-	drainedCh  chan struct{} // closed when buffer is fully drained after close
+	deviceID    int
+	buf         []byte
+	mu          sync.Mutex
+	closed      bool
+	closedCh    chan struct{}
+	closedOnce  sync.Once
+	drainedCh   chan struct{} // closed when buffer is fully drained after close
+	drainedOnce sync.Once
 }
 
 func newEmulatorOutput(deviceID int) *emulatorOutput {
@@ -246,7 +247,7 @@ func (e *emulatorOutput) Drain() []byte {
 	e.buf = e.buf[:0]
 	// If closed and buffer is now empty, signal drained
 	if e.closed {
-		e.closedOnce.Do(func() { close(e.drainedCh) })
+		e.drainedOnce.Do(func() { close(e.drainedCh) })
 	}
 	return out
 }
@@ -280,7 +281,7 @@ func (e *emulatorOutput) Close() error {
 	e.closedOnce.Do(func() { close(e.closedCh) })
 	// If buffer is already empty, signal drained immediately
 	if len(e.buf) == 0 {
-		e.closedOnce.Do(func() { close(e.drainedCh) })
+		e.drainedOnce.Do(func() { close(e.drainedCh) })
 	}
 	e.mu.Unlock()
 	return nil

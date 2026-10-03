@@ -145,6 +145,11 @@ func main() {
 	streams.SetHub(apiSrv.Hub())
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
 
+	if hub := apiSrv.Hub(); hub != nil {
+		hub.Start(context.Background())
+		defer hub.Stop()
+	}
+
 	if agg := apiSrv.Aggregator(); agg != nil {
 		agg.Start(context.Background())
 		defer agg.Stop()
@@ -186,6 +191,10 @@ func main() {
 		log.Printf("HTTP shutdown: %v", err)
 	}
 
+	if hub := apiSrv.Hub(); hub != nil {
+		hub.Stop()
+	}
+
 	if agg := apiSrv.Aggregator(); agg != nil {
 		agg.Stop()
 	}
@@ -200,6 +209,7 @@ func main() {
 	disc.Close()
 	sm.Close()
 	_ = trans.Close()
+	_ = audio.GlobalResolver().Close()
 	log.Println("Shutdown complete")
 }
 

@@ -3,9 +3,9 @@ package v1
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -143,14 +143,22 @@ func (s *V1Server) serveWebSocket(ws *websocket.Conn) {
 	sub := s.hub.Subscribe(4)
 	defer s.hub.Unsubscribe(sub)
 
-	doneCh := make(chan struct{})
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+			_ = ws.Close()
+		})
+	}
+	defer stop()
 
 	// Goroutine 1: Fan-out telemetry frames to WebSocket client
 	go func() {
-		defer close(doneCh)
+		defer stop()
 		for {
 			select {
-			case <-doneCh:
+			case <-stopCh:
 				return
 			case msg, ok := <-sub.Ch:
 				if !ok {
@@ -168,9 +176,6 @@ func (s *V1Server) serveWebSocket(ws *websocket.Conn) {
 	for {
 		var rawMsg string
 		if err := websocket.Message.Receive(ws, &rawMsg); err != nil {
-			if err == io.EOF {
-				break
-			}
 			break
 		}
 
@@ -193,11 +198,24 @@ func (s *V1Server) processWSCommand(ws *websocket.Conn, cmd WSControlMessage) {
 
 	switch cmd.Type {
 	case "crosspoint":
+		outCh := cmd.OutChannel
+		inCh := cmd.InChannel
+		gain := cmd.Gain
 		slew := cmd.SlewMS
+
+		if cmd.Crosspoint != nil {
+			outCh = cmd.Crosspoint.OutChannel
+			inCh = cmd.Crosspoint.InChannel
+			gain = cmd.Crosspoint.Gain
+			if cmd.Crosspoint.SlewMS > 0 {
+				slew = cmd.Crosspoint.SlewMS
+			}
+		}
+
 		if slew <= 0 {
 			slew = 20.0
 		}
-		mr, err := s.router.UpdateCrosspoint(cmd.RouteID, cmd.OutChannel, cmd.InChannel, cmd.Gain, slew)
+		mr, err := s.router.UpdateCrosspoint(cmd.RouteID, outCh, inCh, gain, slew)
 		if err != nil {
 			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
 			return
