@@ -554,3 +554,312 @@ func TestClusterCrossNodeAudioRouting_E2E(t *testing.T) {
 
 	t.Log("All e2e API operations completed and verified successfully.")
 }
+
+// TestClusterCrossNodeAudioRouting_FormatAgility_E2E verifies cross-node audio routing with
+// dynamic channel remapping (mono <-> stereo) and sample rate conversion (44.1 kHz <-> 48 kHz):
+// 1. Node A creates a 44.1 kHz 1-channel (mono) input device.
+// 2. Node B creates a 48 kHz 2-channel (stereo) output device.
+// 3. Audio flows from Node A (44.1 kHz mono) -> Node B (48 kHz stereo) over UDP.
+// 4. Verifies both Left and Right channels on Node B capture the converted 48 kHz stereo signal.
+// 5. Tests reverse routing from Node B (48 kHz stereo) -> Node A (44.1 kHz mono) with downmixing.
+func TestClusterCrossNodeAudioRouting_FormatAgility_E2E(t *testing.T) {
+	nodeA := spawnClusterNode(t, "node-fmt-A")
+	defer nodeA.close()
+
+	nodeB := spawnClusterNode(t, "node-fmt-B", nodeA.disc.OwnAddr())
+	defer nodeB.close()
+
+	// Wait for 2-node cluster convergence
+	t.Log("Waiting for 2-node cluster convergence...")
+	deadline := time.Now().Add(6 * time.Second)
+	converged := false
+	for time.Now().Before(deadline) {
+		resp, err := nodeA.get("/api/v1/cluster/nodes")
+		if err == nil && resp.StatusCode == http.StatusOK {
+			var nodeResp cluster.ClusterNodesResponse
+			if err := json.NewDecoder(resp.Body).Decode(&nodeResp); err == nil && len(nodeResp.Nodes) == 2 {
+				_ = resp.Body.Close()
+				converged = true
+				break
+			}
+			_ = resp.Body.Close()
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !converged {
+		t.Fatalf("cluster nodes failed to converge within deadline")
+	}
+
+	// 1. Forward direction: 44.1 kHz Mono (Node A) -> 48 kHz Stereo (Node B)
+	micReqA := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-nodeA-mono-44k",
+		Direction:        "input",
+		Channels:         1,
+		SampleRate:       44100,
+		BufferSizeFrames: 441,
+	}
+	resp, err := nodeA.post("/api/v1/devices/virtual", micReqA)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node A failed: %v", err)
+	}
+	var devA v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devA)
+	_ = resp.Body.Close()
+
+	spkReqB := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-nodeB-stereo-48k",
+		Direction:        "output",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err = nodeB.post("/api/v1/devices/virtual", spkReqB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node B failed: %v", err)
+	}
+	var devB v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devB)
+	_ = resp.Body.Close()
+
+	routeID_AtoB := "route-mono44k-to-stereo48k"
+	routeReq_AtoB := v1.CreateRouteRequest{
+		ID:   routeID_AtoB,
+		Name: "Node A Mono 44.1k to Node B Stereo 48k",
+		Source: router.MatrixEndpoint{
+			NodeID:   "node-fmt-A",
+			DeviceID: devA.URN,
+			Channels: []int{0},
+		},
+		Destination: router.MatrixEndpoint{
+			NodeID:   "node-fmt-B",
+			DeviceID: devB.URN,
+			Channels: []int{0, 1},
+		},
+		Coefficients: []float64{1.0, 1.0}, // 1x2: duplicate mono input to both stereo channels
+		SlewMS:       20.0,
+	}
+
+	// Establish egress on Node A and ingress on Node B
+	resp, err = nodeA.post("/api/v1/routes", routeReq_AtoB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Node A: POST /api/v1/routes failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	resp, err = nodeB.post("/api/v1/routes", routeReq_AtoB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Node B: POST /api/v1/routes failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	streamA, okA := nodeA.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devA.URN)
+	streamB, okB := nodeB.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devB.URN)
+	if !okA || !okB || streamA == nil || streamB == nil {
+		t.Fatalf("could not obtain VirtualAudioDevice streams for route AtoB")
+	}
+
+	// Inject 440 Hz mono sine wave at 44100 Hz into Node A
+	framesMono := 441 // 10ms @ 44.1 kHz
+	monoChunk := generateSineBlock(44100, 1, framesMono, 440.0, 0.707)
+
+	doneFeedA := make(chan struct{})
+	go func() {
+		defer close(doneFeedA)
+		for i := 0; i < 40; i++ {
+			_, _ = streamA.InjectPush(monoChunk)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	// Verify converted 48 kHz stereo delivery on Node B
+	t.Log("Verifying 44.1kHz mono -> 48kHz stereo conversion across nodes...")
+	deadline = time.Now().Add(4 * time.Second)
+	var capturedStereo []byte
+	for time.Now().Before(deadline) {
+		capturedStereo = streamB.CapturedBytes()
+		// 10ms of 48kHz stereo is 480 * 2 * 2 = 1920 bytes
+		if len(capturedStereo) >= 1920*2 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	<-doneFeedA
+
+	if len(capturedStereo) < 1920*2 {
+		t.Fatalf("expected converted stereo frames at Node B: got %d bytes, want >= %d",
+			len(capturedStereo), 1920*2)
+	}
+
+	if len(capturedStereo)%4 != 0 {
+		t.Fatalf("expected captured buffer to be aligned to 4-byte stereo frames, got len=%d", len(capturedStereo))
+	}
+
+	// Verify both Left and Right stereo channels received signal
+	maxLeft, maxRight := int16(0), int16(0)
+	for i := 0; i+4 <= len(capturedStereo); i += 4 {
+		sampleL := int16(binary.LittleEndian.Uint16(capturedStereo[i : i+2]))
+		sampleR := int16(binary.LittleEndian.Uint16(capturedStereo[i+2 : i+4]))
+		if sampleL < 0 {
+			sampleL = -sampleL
+		}
+		if sampleR < 0 {
+			sampleR = -sampleR
+		}
+		if sampleL > maxLeft {
+			maxLeft = sampleL
+		}
+		if sampleR > maxRight {
+			maxRight = sampleR
+		}
+	}
+
+	if maxLeft < 1000 || maxRight < 1000 {
+		t.Fatalf("stereo playout silent or missing channel: maxLeft=%d maxRight=%d (want > 1000)", maxLeft, maxRight)
+	}
+	t.Logf("SUCCESS: Mono 44.1k -> Stereo 48k converted & delivered (bytes=%d, peakL=%d, peakR=%d)",
+		len(capturedStereo), maxLeft, maxRight)
+
+	// Clean up route AtoB
+	if resp, err := nodeA.delete("/api/v1/routes/" + routeID_AtoB); err == nil && resp != nil {
+		_ = resp.Body.Close()
+	}
+	if resp, err := nodeB.delete("/api/v1/routes/" + routeID_AtoB); err == nil && resp != nil {
+		_ = resp.Body.Close()
+	}
+
+	// 2. Reverse direction: 48 kHz Stereo (Node B) -> 44.1 kHz Mono (Node A)
+	micReqB := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-nodeB-stereo-in",
+		Direction:        "input",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err = nodeB.post("/api/v1/devices/virtual", micReqB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node B stereo in failed: %v", err)
+	}
+	var devB_in v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devB_in)
+	_ = resp.Body.Close()
+
+	spkReqA := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-nodeA-mono-out",
+		Direction:        "output",
+		Channels:         1,
+		SampleRate:       44100,
+		BufferSizeFrames: 441,
+	}
+	resp, err = nodeA.post("/api/v1/devices/virtual", spkReqA)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node A mono out failed: %v", err)
+	}
+	var devA_out v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devA_out)
+	_ = resp.Body.Close()
+
+	routeID_BtoA := "route-stereo48k-to-mono44k"
+	routeReq_BtoA := v1.CreateRouteRequest{
+		ID:   routeID_BtoA,
+		Name: "Node B Stereo 48k to Node A Mono 44.1k",
+		Source: router.MatrixEndpoint{
+			NodeID:   "node-fmt-B",
+			DeviceID: devB_in.URN,
+			Channels: []int{0, 1},
+		},
+		Destination: router.MatrixEndpoint{
+			NodeID:   "node-fmt-A",
+			DeviceID: devA_out.URN,
+			Channels: []int{0},
+		},
+		Coefficients: []float64{0.5, 0.5}, // 2x1 downmix: average L and R
+		SlewMS:       20.0,
+	}
+
+	resp, err = nodeB.post("/api/v1/routes", routeReq_BtoA)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Node B: POST /api/v1/routes failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	resp, err = nodeA.post("/api/v1/routes", routeReq_BtoA)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("Node A: POST /api/v1/routes failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	streamB_in, okB_in := nodeB.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devB_in.URN)
+	streamA_out, okA_out := nodeA.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devA_out.URN)
+	if !okB_in || !okA_out || streamB_in == nil || streamA_out == nil {
+		t.Fatalf("could not obtain VirtualAudioDevice streams for route BtoA")
+	}
+
+	// Inject 440 Hz stereo sine wave at 48000 Hz into Node B
+	framesStereo := 480 // 10ms @ 48 kHz
+	stereoChunk := generateSineBlock(48000, 2, framesStereo, 440.0, 0.707)
+
+	doneFeedB := make(chan struct{})
+	go func() {
+		defer close(doneFeedB)
+		for i := 0; i < 40; i++ {
+			_, _ = streamB_in.InjectPush(stereoChunk)
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+
+	// Verify converted 44.1 kHz mono delivery on Node A
+	t.Log("Verifying 48kHz stereo -> 44.1kHz mono downmixing across nodes...")
+	deadline = time.Now().Add(4 * time.Second)
+	var capturedMono []byte
+	for time.Now().Before(deadline) {
+		capturedMono = streamA_out.CapturedBytes()
+		// 10ms of 44.1kHz mono is 441 * 1 * 2 = 882 bytes
+		if len(capturedMono) >= 882*2 {
+			break
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+	<-doneFeedB
+
+	if len(capturedMono) < 882*2 {
+		t.Fatalf("expected converted mono frames at Node A: got %d bytes, want >= %d",
+			len(capturedMono), 882*2)
+	}
+
+	if len(capturedMono)%2 != 0 {
+		t.Fatalf("expected captured buffer to be aligned to 2-byte mono frames, got len=%d", len(capturedMono))
+	}
+
+	maxMono := int16(0)
+	for i := 0; i+2 <= len(capturedMono); i += 2 {
+		sample := int16(binary.LittleEndian.Uint16(capturedMono[i : i+2]))
+		if sample < 0 {
+			sample = -sample
+		}
+		if sample > maxMono {
+			maxMono = sample
+		}
+	}
+
+	if maxMono < 1000 {
+		t.Fatalf("mono playout silent: maxMono=%d (want > 1000)", maxMono)
+	}
+	t.Logf("SUCCESS: Stereo 48k -> Mono 44.1k converted & delivered (bytes=%d, peakMono=%d)",
+		len(capturedMono), maxMono)
+
+	// Teardown
+	for _, delCall := range []func() (*http.Response, error){
+		func() (*http.Response, error) { return nodeB.delete("/api/v1/routes/" + routeID_BtoA) },
+		func() (*http.Response, error) { return nodeA.delete("/api/v1/routes/" + routeID_BtoA) },
+		func() (*http.Response, error) { return nodeA.delete("/api/v1/devices/virtual/" + devA.URN) },
+		func() (*http.Response, error) { return nodeB.delete("/api/v1/devices/virtual/" + devB.URN) },
+		func() (*http.Response, error) { return nodeB.delete("/api/v1/devices/virtual/" + devB_in.URN) },
+		func() (*http.Response, error) { return nodeA.delete("/api/v1/devices/virtual/" + devA_out.URN) },
+	} {
+		if resp, err := delCall(); err == nil && resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	t.Log("Format agility bidirectional test completed successfully.")
+}

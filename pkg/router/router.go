@@ -24,6 +24,7 @@ type StreamRoute struct {
 	Destinations    []string `json:"destinations"`
 	SampleRate      int      `json:"sampleRate,omitempty"`
 	Channels        int      `json:"channels,omitempty"`
+	OutChannels     int      `json:"outChannels,omitempty"`
 
 	// Peer binding and negotiated format
 	PeerID        string `json:"peerId,omitempty"`        // Bound peer ID (empty = any/unicast)
@@ -374,6 +375,7 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		Destinations:    dests,
 		SampleRate:      48000,
 		Channels:        mr.InChannels,
+		OutChannels:     mr.OutChannels,
 		PeerID:          mr.Destination.NodeID,
 	}
 }

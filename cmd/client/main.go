@@ -388,10 +388,26 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		if dstRef == "" {
 			dstRef = strconv.Itoa(sr.DestDevice)
 		}
-		log.Printf("[STREAM:MGR] Opening local output device ref=%q for ingress route=%s from sourceNode=%s", dstRef, sr.ID, sr.SourceNodeID)
-		out := openOutputWithTimeout(m.resolver, dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator, 2*time.Second)
+		chans := sr.OutChannels
+		if chans <= 0 {
+			chans = sr.Channels
+		}
+		if chans <= 0 {
+			chans = 2
+		}
+		sampleRate := sr.SampleRate
+		if sampleRate <= 0 {
+			sampleRate = 48000
+		}
+		if m.resolver != nil {
+			if dev, ok := m.resolver.Resolve(dstRef); ok && dev.DefaultSampleRate > 0 {
+				sampleRate = int(dev.DefaultSampleRate)
+			}
+		}
+		log.Printf("[STREAM:MGR] Opening local output device ref=%q for ingress route=%s from sourceNode=%s (sampleRate=%d, channels=%d)", dstRef, sr.ID, sr.SourceNodeID, sampleRate, chans)
+		out := openOutputWithTimeout(m.resolver, dstRef, sampleRate, chans, m.cfg.UseEmulator, 2*time.Second)
 
-		streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
+		streamCfg := streamer.DefaultStreamConfig(sampleRate, chans)
 		st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, localNodeID)
 		if err != nil {
 			if out != nil {
@@ -413,13 +429,13 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 
 		if m.hub != nil {
-			tap := m.hub.RegisterTap(sr.ID, sr.Channels)
+			tap := m.hub.RegisterTap(sr.ID, chans)
 			st.SetAudioTap(tap)
-			log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to ingress route=%s (%d channels)", sr.ID, sr.Channels)
+			log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to ingress route=%s (%d channels)", sr.ID, chans)
 		}
 
 		m.routes[sr.ID] = &activeStream{route: sr, st: st, in: nil, out: out}
-		log.Printf("[STREAM:MGR] Ingress route %s active: receiving from node %s -> local output %s", sr.ID, sr.SourceNodeID, dstRef)
+		log.Printf("[STREAM:MGR] Ingress route %s active: receiving from node %s -> local output %s (%d Hz, %d ch)", sr.ID, sr.SourceNodeID, dstRef, sampleRate, chans)
 		return nil
 	}
 
@@ -428,7 +444,26 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		srcRef = strconv.Itoa(sr.SourceDevice)
 	}
 
-	in := openInputWithTimeout(m.resolver, srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator, 2*time.Second)
+	srcRate := sr.SampleRate
+	if srcRate <= 0 {
+		srcRate = 48000
+	}
+	srcChans := sr.Channels
+	if srcChans <= 0 {
+		srcChans = 2
+	}
+	if m.resolver != nil {
+		if dev, ok := m.resolver.Resolve(srcRef); ok {
+			if dev.DefaultSampleRate > 0 {
+				srcRate = int(dev.DefaultSampleRate)
+			}
+			if dev.MaxInput > 0 && dev.MaxInput < srcChans {
+				srcChans = dev.MaxInput
+			}
+		}
+	}
+
+	in := openInputWithTimeout(m.resolver, srcRef, srcRate, srcChans, m.cfg.UseEmulator, 2*time.Second)
 
 	var out audio.AudioStream
 	var destAddrs []string
@@ -511,14 +546,14 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			dstRef = strconv.Itoa(sr.DestDevice)
 		}
 		log.Printf("[STREAM:MGR] Opening local output device ref=%q for route=%s", dstRef, sr.ID)
-		out = openOutputWithTimeout(m.resolver, dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator, 2*time.Second)
+		out = openOutputWithTimeout(m.resolver, dstRef, srcRate, srcChans, m.cfg.UseEmulator, 2*time.Second)
 
 		if len(destAddrs) == 0 {
 			destAddrs = []string{"127.0.0.1:45678"}
 		}
 	}
 
-	streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
+	streamCfg := streamer.DefaultStreamConfig(srcRate, srcChans)
 	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, localNodeID)
 	if err != nil {
 		if in != nil {
