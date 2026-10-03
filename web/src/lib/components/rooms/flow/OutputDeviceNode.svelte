@@ -88,7 +88,7 @@
     type="target"
     position={Position.Left}
     id="in"
-    class="!w-3.5 !h-3.5 !-left-[7px] !bg-purple-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_8px_rgba(168,85,247,0.8)] hover:!scale-125 transition-transform cursor-crosshair"
+    class="!w-3.5 !h-3.5 !bg-purple-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_8px_rgba(168,85,247,0.8)] hover:shadow-[0_0_14px_rgba(168,85,247,1)] hover:brightness-125 hover:ring-2 hover:ring-purple-300/80 transition-all cursor-crosshair"
     title="Drop wire here to feed room audio into this output"
   />
 

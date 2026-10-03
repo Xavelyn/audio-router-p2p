@@ -44,7 +44,7 @@
     type="target"
     position={Position.Left}
     id="in"
-    class="!w-4 !h-4 !-left-[8px] !bg-cyan-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(6,182,212,0.9)] hover:!scale-125 transition-transform cursor-crosshair"
+    class="!w-4 !h-4 !bg-cyan-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(6,182,212,0.9)] hover:shadow-[0_0_16px_rgba(6,182,212,1)] hover:brightness-125 hover:ring-2 hover:ring-cyan-300/80 transition-all cursor-crosshair"
     title="Drop connection here to assign input device to this room"
   />
 
@@ -53,7 +53,7 @@
     type="source"
     position={Position.Right}
     id="out"
-    class="!w-4 !h-4 !-right-[8px] !bg-purple-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(168,85,247,0.9)] hover:!scale-125 transition-transform cursor-crosshair"
+    class="!w-4 !h-4 !bg-purple-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(168,85,247,0.9)] hover:shadow-[0_0_16px_rgba(168,85,247,1)] hover:brightness-125 hover:ring-2 hover:ring-purple-300/80 transition-all cursor-crosshair"
     title="Drag wire to route this room into an output device"
   />
 

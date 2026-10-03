@@ -88,7 +88,7 @@
     type="source"
     position={Position.Right}
     id="out"
-    class="!w-3.5 !h-3.5 !-right-[7px] !bg-cyan-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_8px_rgba(6,182,212,0.8)] hover:!scale-125 transition-transform cursor-crosshair"
+    class="!w-3.5 !h-3.5 !bg-cyan-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_8px_rgba(6,182,212,0.8)] hover:shadow-[0_0_14px_rgba(6,182,212,1)] hover:brightness-125 hover:ring-2 hover:ring-cyan-300/80 transition-all cursor-crosshair"
     title="Drag wire to route this input into a Room"
   />
 
