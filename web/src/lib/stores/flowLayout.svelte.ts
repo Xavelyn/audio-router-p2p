@@ -53,6 +53,9 @@ export class FlowLayoutStore {
   constructor() {
     if (typeof window !== 'undefined') {
       this.hydrate();
+      window.addEventListener('beforeunload', () => {
+        this.persistNow();
+      });
     }
   }
 
@@ -120,6 +123,42 @@ export class FlowLayoutStore {
   }
 
   /**
+   * Persist immediately to localStorage (synchronous write)
+   */
+  persistNow() {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined' || !this.isHydrated) {
+      return;
+    }
+
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      this.saveTimeout = null;
+    }
+
+    try {
+      const nodePositionsRecord: Record<string, { x: number; y: number }> = {};
+      for (const [nodeId, pos] of this.positions.entries()) {
+        nodePositionsRecord[nodeId] = { x: Math.round(pos.x), y: Math.round(pos.y) };
+      }
+
+      const payload: FlowLayoutStorageV1 = {
+        version: 1,
+        lastUpdated: Date.now(),
+        sidebarCollapsed: !this.sidebarOpen,
+        stagedDeviceIds: Array.from(this.enabledDevices),
+        nodePositions: nodePositionsRecord,
+        collapsedNodes: Array.from(this.collapsedNodes),
+        viewport: this.viewport ?? undefined,
+      };
+
+      localStorage.setItem(STORAGE_KEY_V1, JSON.stringify(payload));
+      this.hasSavedLayout = true;
+    } catch (err) {
+      console.warn('[flowLayoutStore] Failed to persist audio flow canvas layout to localStorage:', err);
+    }
+  }
+
+  /**
    * Queue debounced trailing write to localStorage (300ms delay)
    */
   private queuePersist() {
@@ -132,26 +171,7 @@ export class FlowLayoutStore {
     }
 
     this.saveTimeout = setTimeout(() => {
-      try {
-        const nodePositionsRecord: Record<string, { x: number; y: number }> = {};
-        for (const [nodeId, pos] of this.positions.entries()) {
-          nodePositionsRecord[nodeId] = { x: Math.round(pos.x), y: Math.round(pos.y) };
-        }
-
-        const payload: FlowLayoutStorageV1 = {
-          version: 1,
-          lastUpdated: Date.now(),
-          sidebarCollapsed: !this.sidebarOpen,
-          stagedDeviceIds: Array.from(this.enabledDevices),
-          nodePositions: nodePositionsRecord,
-          collapsedNodes: Array.from(this.collapsedNodes),
-          viewport: this.viewport ?? undefined,
-        };
-
-        localStorage.setItem(STORAGE_KEY_V1, JSON.stringify(payload));
-      } catch (err) {
-        console.warn('[flowLayoutStore] Failed to persist audio flow canvas layout to localStorage:', err);
-      }
+      this.persistNow();
     }, 300);
   }
 
@@ -177,7 +197,7 @@ export class FlowLayoutStore {
       this.positions = nextPositions;
     }
 
-    this.queuePersist();
+    this.persistNow();
   }
 
   /**
@@ -194,7 +214,7 @@ export class FlowLayoutStore {
     nextPositions.delete(`output-${deviceId}`);
     this.positions = nextPositions;
 
-    this.queuePersist();
+    this.persistNow();
   }
 
   /**
@@ -226,7 +246,7 @@ export class FlowLayoutStore {
       const next = new Map(this.positions);
       next.delete(nodeId);
       this.positions = next;
-      this.queuePersist();
+      this.persistNow();
     }
   }
 
@@ -242,7 +262,7 @@ export class FlowLayoutStore {
    */
   clearPositions() {
     this.positions = new Map();
-    this.queuePersist();
+    this.persistNow();
   }
 
   /**
@@ -308,9 +328,9 @@ export class FlowLayoutStore {
    * Initialize default staged devices on first load if none are saved
    */
   initDefaultsIfEmpty(defaultDeviceIds: string[]) {
-    if (this.enabledDevices.size === 0 && defaultDeviceIds.length > 0) {
+    if (!this.hasSavedLayout && this.enabledDevices.size === 0 && defaultDeviceIds.length > 0) {
       this.enabledDevices = new Set(defaultDeviceIds);
-      this.queuePersist();
+      this.persistNow();
     }
   }
 
@@ -320,7 +340,7 @@ export class FlowLayoutStore {
   resetLayout(defaultDeviceIds?: string[]) {
     this.positions = new Map();
     this.enabledDevices = new Set(defaultDeviceIds || []);
-    this.queuePersist();
+    this.persistNow();
   }
 }
 

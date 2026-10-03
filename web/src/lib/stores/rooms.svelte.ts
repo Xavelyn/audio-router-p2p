@@ -59,12 +59,13 @@ class RoomStore {
   async deleteRoom(roomId: string) {
     this.isLoading = true;
     this.lastError = null;
+    // Optimistic local removal
+    this.rooms = this.rooms.filter((r) => r.id !== roomId);
+    if (this.activeJoinedRoomId === roomId) {
+      this.activeJoinedRoomId = null;
+    }
     try {
       await apiClient.deleteRoom(roomId);
-      this.rooms = this.rooms.filter((r) => r.id !== roomId);
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
     } catch (err: any) {
       const msg = err.message || 'Failed to delete room';
       this.lastError = msg;
@@ -157,13 +158,17 @@ class RoomStore {
       const updated = await apiClient.addRoomInput(roomId, devId);
       const idx = this.rooms.findIndex((r) => r.id === roomId);
       if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+        this.rooms = this.rooms.map((r, i) =>
+          i === idx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to assign input ${devId} to room ${roomId}`;
@@ -174,17 +179,28 @@ class RoomStore {
 
   async removeRoomInput(roomId: string, devId: string) {
     this.lastError = null;
+    // Optimistic local unbinding
+    const idx = this.rooms.findIndex((r) => r.id === roomId);
+    if (idx !== -1) {
+      this.rooms = this.rooms.map((r, i) =>
+        i === idx ? { ...r, inputs: (r.inputs || []).filter((id) => id !== devId) } : r
+      );
+    }
     try {
       const updated = await apiClient.removeRoomInput(roomId, devId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+      const updatedIdx = this.rooms.findIndex((r) => r.id === roomId);
+      if (updatedIdx !== -1) {
+        this.rooms = this.rooms.map((r, i) =>
+          i === updatedIdx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to remove input ${devId} from room ${roomId}`;
@@ -199,13 +215,17 @@ class RoomStore {
       const updated = await apiClient.addRoomOutput(roomId, devId);
       const idx = this.rooms.findIndex((r) => r.id === roomId);
       if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+        this.rooms = this.rooms.map((r, i) =>
+          i === idx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to assign output ${devId} to room ${roomId}`;
@@ -216,17 +236,28 @@ class RoomStore {
 
   async removeRoomOutput(roomId: string, devId: string) {
     this.lastError = null;
+    // Optimistic local unbinding
+    const idx = this.rooms.findIndex((r) => r.id === roomId);
+    if (idx !== -1) {
+      this.rooms = this.rooms.map((r, i) =>
+        i === idx ? { ...r, outputs: (r.outputs || []).filter((id) => id !== devId) } : r
+      );
+    }
     try {
       const updated = await apiClient.removeRoomOutput(roomId, devId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+      const updatedIdx = this.rooms.findIndex((r) => r.id === roomId);
+      if (updatedIdx !== -1) {
+        this.rooms = this.rooms.map((r, i) =>
+          i === updatedIdx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to remove output ${devId} from room ${roomId}`;

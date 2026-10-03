@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { roomStore } from '$lib/stores/rooms.svelte';
   import { peerStore } from '$lib/stores/peers.svelte';
+  import { flowLayoutStore } from '$lib/stores/flowLayout.svelte';
   import Network from '@lucide/svelte/icons/network';
   import Crown from '@lucide/svelte/icons/crown';
   import Plus from '@lucide/svelte/icons/plus';
@@ -75,6 +76,8 @@
 
   function handleDeleteRoom(roomId: string) {
     if (confirm(`Delete audio conference room "${roomId}"?`)) {
+      flowLayoutStore.deleteNodePosition(`room-${roomId}`);
+      flowLayoutStore.persistNow();
       roomStore.deleteRoom(roomId);
     }
   }

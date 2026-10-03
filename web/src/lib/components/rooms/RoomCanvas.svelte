@@ -68,9 +68,11 @@
     ]);
     meterStore.init();
 
-    // Initial default staging if canvas has never been configured
-    ensureRoomDevicesStaged();
-    ensureDefaultStaging();
+    // Initial default staging ONLY if canvas has never been configured
+    if (!flowLayoutStore.hasSavedLayout) {
+      ensureRoomDevicesStaged();
+      ensureDefaultStaging();
+    }
     syncFlowGraph();
   });
 
@@ -125,7 +127,7 @@
 
   // Ensure sensible defaults on first load (e.g. stage room-bound devices or default hardware)
   function ensureDefaultStaging() {
-    if (flowLayoutStore.enabledDevices.size > 0) return;
+    if (flowLayoutStore.hasSavedLayout || flowLayoutStore.enabledDevices.size > 0) return;
 
     const defaultIds = new Set<string>();
 
@@ -176,6 +178,7 @@
         });
       }
     }
+    flowLayoutStore.persistNow();
   }
 
   // Validate directional room-centric routing rules
@@ -206,36 +209,63 @@
     }
   }
 
-  function handleDelete({ edges: deletedEdges }: { edges: Edge[] }) {
+  // Canvas element deletion handler (handles both keyboard delete on nodes and edges)
+  async function handleDelete({ nodes: deletedNodes = [], edges: deletedEdges = [] }: { nodes?: Node[]; edges?: Edge[] }) {
+    // 1. Defensively handle deleted edges (disconnect audio routes)
     for (const edge of deletedEdges) {
       if (edge.source.startsWith('input-') && edge.target.startsWith('room-')) {
         const devId = edge.source.replace('input-', '');
         const roomId = edge.target.replace('room-', '');
-        roomStore.removeRoomInput(roomId, devId);
+        await roomStore.removeRoomInput(roomId, devId);
       } else if (edge.source.startsWith('room-') && edge.target.startsWith('output-')) {
         const roomId = edge.source.replace('room-', '');
         const devId = edge.target.replace('output-', '');
-        roomStore.removeRoomOutput(roomId, devId);
+        await roomStore.removeRoomOutput(roomId, devId);
       }
     }
+
+    // 2. Defensively handle deleted nodes (input, output, or room nodes)
+    for (const node of deletedNodes) {
+      if (node.id.startsWith('input-')) {
+        const devId = node.id.replace('input-', '');
+        await handleDismissDevice(devId, 'input');
+      } else if (node.id.startsWith('output-')) {
+        const devId = node.id.replace('output-', '');
+        await handleDismissDevice(devId, 'output');
+      } else if (node.id.startsWith('room-')) {
+        const roomId = node.id.replace('room-', '');
+        flowLayoutStore.deleteNodePosition(node.id);
+        try {
+          await roomStore.deleteRoom(roomId);
+        } catch (err) {
+          console.error(`Failed to delete room ${roomId}:`, err);
+        }
+      }
+    }
+
+    flowLayoutStore.persistNow();
+    syncFlowGraph();
   }
 
   // Dismiss a node from the canvas: unbind dangling room routes and remove from flowLayoutStore
-  function handleDismissDevice(deviceId: string, direction?: 'input' | 'output') {
+  async function handleDismissDevice(deviceId: string, direction?: 'input' | 'output') {
     // 1. Defensively unbind audio routes from roomStore
     for (const room of roomStore.rooms) {
       if (direction !== 'output' && room.inputs && room.inputs.includes(deviceId)) {
-        roomStore.removeRoomInput(room.id, deviceId);
+        await roomStore.removeRoomInput(room.id, deviceId);
       }
       if (direction !== 'input' && room.outputs && room.outputs.includes(deviceId)) {
-        roomStore.removeRoomOutput(room.id, deviceId);
+        await roomStore.removeRoomOutput(room.id, deviceId);
       }
     }
 
     // 2. Remove device from persistent layout staging
     flowLayoutStore.disableDevice(deviceId);
 
-    // 3. Re-synchronize canvas graph
+    // 3. Immediately persist to localStorage
+    flowLayoutStore.persistNow();
+
+    // 4. Re-synchronize canvas graph
     syncFlowGraph();
   }
 
@@ -441,10 +471,16 @@
           onRemoveInput: (devId: string) => roomStore.removeRoomInput(room.id, devId),
           onAddOutput: (devId: string) => roomStore.addRoomOutput(room.id, devId),
           onRemoveOutput: (devId: string) => roomStore.removeRoomOutput(room.id, devId),
-          onDeleteRoom: () => {
+          onDeleteRoom: async () => {
             if (confirm(`Delete audio room "${room.name}" (${room.id})?`)) {
-              roomStore.deleteRoom(room.id);
               flowLayoutStore.deleteNodePosition(`room-${room.id}`);
+              flowLayoutStore.persistNow();
+              try {
+                await roomStore.deleteRoom(room.id);
+              } catch (err) {
+                console.error(`Failed to delete room ${room.id}:`, err);
+              }
+              syncFlowGraph();
             }
           },
         },
@@ -528,7 +564,6 @@
     const _staged = flowLayoutStore.enabledDevices;
 
     untrack(() => {
-      ensureRoomDevicesStaged();
       syncFlowGraph(false);
     });
   });
