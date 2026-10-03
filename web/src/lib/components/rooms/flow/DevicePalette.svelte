@@ -291,7 +291,7 @@
           class="w-full text-left p-2.5 flex items-center justify-between gap-2 hover:bg-zinc-800/40 transition-colors"
           aria-expanded={!isCollapsed}
         >
-          <div class="flex items-center gap-2 min-w-0">
+          <div class="flex items-center gap-2 min-w-0 flex-1">
             <span class="text-zinc-400 shrink-0">
               {#if isCollapsed}
                 <ChevronRight class="w-3.5 h-3.5" />
@@ -300,7 +300,7 @@
               {/if}
             </span>
 
-            <div class="min-w-0">
+            <div class="min-w-0 flex-1">
               <div class="flex items-center gap-1.5 leading-tight">
                 <span class="text-xs font-bold text-zinc-100 truncate font-mono">
                   {node.name}
@@ -312,11 +312,11 @@
                 {/if}
               </div>
               <div class="flex items-center gap-1.5 text-[9px] font-mono text-zinc-400 truncate">
-                <span class="h-1.5 w-1.5 rounded-full {node.swimState === 'alive' ? 'bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.8)]' : 'bg-amber-400'}"></span>
-                <span>{node.address.replace(/^https?:\/\//, '')}</span>
+                <span class="h-1.5 w-1.5 rounded-full shrink-0 {node.swimState === 'alive' ? 'bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.8)]' : 'bg-amber-400'}"></span>
+                <span class="truncate">{node.address.replace(/^https?:\/\//, '')}</span>
                 {#if node.clockRole}
-                  <span class="text-zinc-500">&bull;</span>
-                  <span class="uppercase text-cyan-400">{node.clockRole}</span>
+                  <span class="text-zinc-500 shrink-0">&bull;</span>
+                  <span class="uppercase text-cyan-400 shrink-0">{node.clockRole}</span>
                 {/if}
               </div>
             </div>
@@ -356,7 +356,7 @@
                   title="Drag onto Canvas or click + Add to route"
                 >
                   <!-- Drag Handle Icon & Device Info -->
-                  <div class="flex items-center gap-1.5 min-w-0">
+                  <div class="flex items-center gap-1.5 min-w-0 flex-1">
                     <GripVertical class="w-3.5 h-3.5 text-zinc-600 group-hover:text-cyan-400 shrink-0 transition-colors" />
 
                     <div class="flex h-6 w-6 items-center justify-center rounded bg-zinc-800/80 border border-zinc-700 text-zinc-300 shrink-0">
@@ -371,25 +371,25 @@
                       {/if}
                     </div>
 
-                    <div class="min-w-0">
+                    <div class="min-w-0 flex-1">
                       <div class="text-xs font-semibold text-zinc-200 truncate leading-snug font-sans group-hover:text-white" title={device.name}>
                         {device.name}
                       </div>
-                      <div class="flex items-center gap-1 text-[9px] font-mono text-zinc-400">
+                      <div class="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-mono text-zinc-400">
                         <!-- Direction Badge -->
                         {#if isInput}
-                          <span class="text-cyan-400 font-bold">IN ({device.max_input}ch)</span>
+                          <span class="text-cyan-400 font-bold shrink-0">IN ({device.max_input}ch)</span>
                         {:else if isOutput}
-                          <span class="text-purple-400 font-bold">OUT ({device.max_output}ch)</span>
+                          <span class="text-purple-400 font-bold shrink-0">OUT ({device.max_output}ch)</span>
                         {:else}
-                          <span class="text-emerald-400 font-bold">DUP ({device.max_input}x{device.max_output})</span>
+                          <span class="text-emerald-400 font-bold shrink-0">DUP ({device.max_input}x{device.max_output})</span>
                         {/if}
 
-                        <span class="text-zinc-600">&bull;</span>
-                        <span>{device.default_sample_rate / 1000}k</span>
+                        <span class="text-zinc-600 shrink-0">&bull;</span>
+                        <span class="shrink-0">{device.default_sample_rate / 1000}k</span>
 
-                        <span class="text-zinc-600">&bull;</span>
-                        <span class="{device.is_virtual ? 'text-purple-400' : 'text-zinc-400'}">
+                        <span class="text-zinc-600 shrink-0">&bull;</span>
+                        <span class="shrink-0 {device.is_virtual ? 'text-purple-400' : 'text-zinc-400'}">
                           {device.is_virtual ? 'VIRT' : 'HW'}
                         </span>
                       </div>
@@ -402,21 +402,21 @@
                       <button
                         type="button"
                         onclick={() => onFocusDevice?.(device.id)}
-                        class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors"
+                        class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
                         title="Already staged on canvas. Click to focus."
                       >
-                        <Check class="w-2.5 h-2.5 text-cyan-400" />
+                        <Check class="w-2.5 h-2.5 text-cyan-400 shrink-0" />
                         <span>On Canvas</span>
                       </button>
                     {:else}
                       <button
                         type="button"
                         onclick={() => onAddDevice?.(device, isOutput ? 'output' : 'input')}
-                        class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all shadow-sm"
-                        title="Add to canvas"
+                        class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all shadow-sm cursor-pointer"
+                        title={isDuplex ? "Add duplex device (both input and output) to canvas" : "Add to canvas"}
                         aria-label="Add {device.name} to canvas"
                       >
-                        <Plus class="w-2.5 h-2.5" />
+                        <Plus class="w-2.5 h-2.5 shrink-0" />
                         <span>Add</span>
                       </button>
                     {/if}

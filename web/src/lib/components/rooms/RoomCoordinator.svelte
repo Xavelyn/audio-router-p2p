@@ -147,13 +147,13 @@
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {#each roomStore.rooms as room}
             {@const isJoined = roomStore.activeJoinedRoomId === room.id}
-            <div class="rounded-xl border transition-all p-5 shadow-xl flex flex-col justify-between {isJoined
+            <div class="min-w-0 rounded-xl border transition-all p-5 shadow-xl flex flex-col justify-between {isJoined
               ? 'border-cyan-500/60 bg-gradient-to-b from-cyan-950/20 to-zinc-900/90 shadow-cyan-950/30'
               : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-700'}">
               <div>
                 <!-- Top Badge & Delete -->
                 <div class="flex items-center justify-between">
-                  <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase tracking-wide border {room.state === 'active'
+                  <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold uppercase tracking-wide border shrink-0 {room.state === 'active'
                     ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
                     : 'bg-zinc-800 text-zinc-400 border-zinc-700'}">
                     {room.state}
@@ -161,25 +161,26 @@
 
                   <button
                     onclick={() => handleDeleteRoom(room.id)}
-                    class="rounded p-1 text-zinc-500 hover:text-red-400 hover:bg-red-950/30 transition-colors"
+                    class="rounded p-1 text-zinc-500 hover:text-red-400 hover:bg-red-950/30 transition-colors shrink-0 cursor-pointer"
                     title="Delete Room"
+                    aria-label="Delete Room"
                   >
                     <Trash2 class="w-3.5 h-3.5" />
                   </button>
                 </div>
 
                 <!-- Room Title & ID -->
-                <h3 class="mt-3 text-base font-bold text-zinc-100 flex items-center gap-2">
-                  <span>{room.name}</span>
+                <h3 class="mt-3 text-base font-bold text-zinc-100 flex items-center gap-2 min-w-0" title={room.name}>
+                  <span class="truncate">{room.name}</span>
                 </h3>
-                <span class="text-[11px] font-mono text-zinc-500 block">{room.id}</span>
+                <span class="text-[11px] font-mono text-zinc-500 block truncate" title={room.id}>{room.id}</span>
 
                 <!-- Room Leader Pill -->
-                <div class="mt-4 flex items-center gap-2 rounded-lg bg-zinc-950/70 p-2.5 border border-zinc-800/80">
+                <div class="mt-4 flex items-center gap-2 rounded-lg bg-zinc-950/70 p-2.5 border border-zinc-800/80 min-w-0">
                   <Crown class="w-4 h-4 text-amber-400 shrink-0" />
-                  <div class="flex flex-col truncate">
+                  <div class="flex flex-col truncate min-w-0 flex-1">
                     <span class="text-[10px] font-mono text-zinc-400">CLOCK LEADER</span>
-                    <span class="text-xs font-mono font-bold text-amber-300 truncate">
+                    <span class="text-xs font-mono font-bold text-amber-300 truncate block">
                       {room.leader || 'node-local'}
                     </span>
                   </div>
@@ -214,11 +215,11 @@
                     </span>
                   </div>
                   <div class="grid grid-cols-2 gap-2 text-[10px] font-mono">
-                    <div>
+                    <div class="min-w-0">
                       <span class="text-cyan-400 block mb-1">Inputs ({room.inputs?.length || 0}):</span>
                       <div class="flex flex-wrap gap-1">
                         {#each room.inputs || [] as inDev}
-                          <span class="rounded bg-zinc-900 border border-cyan-500/30 px-1.5 py-0.5 text-zinc-300 truncate max-w-full">
+                          <span class="inline-block rounded bg-zinc-900 border border-cyan-500/30 px-1.5 py-0.5 text-zinc-300 truncate max-w-full" title={inDev}>
                             {inDev}
                           </span>
                         {/each}
@@ -227,11 +228,11 @@
                         {/if}
                       </div>
                     </div>
-                    <div>
+                    <div class="min-w-0">
                       <span class="text-purple-400 block mb-1">Outputs ({room.outputs?.length || 0}):</span>
                       <div class="flex flex-wrap gap-1">
                         {#each room.outputs || [] as outDev}
-                          <span class="rounded bg-zinc-900 border border-purple-500/30 px-1.5 py-0.5 text-zinc-300 truncate max-w-full">
+                          <span class="inline-block rounded bg-zinc-900 border border-purple-500/30 px-1.5 py-0.5 text-zinc-300 truncate max-w-full" title={outDev}>
                             {outDev}
                           </span>
                         {/each}
@@ -251,11 +252,11 @@
                   </div>
                   <div class="flex flex-wrap gap-1.5 max-h-24 overflow-y-auto">
                     {#each room.members || [] as member}
-                      <span class="inline-flex items-center gap-1 rounded bg-zinc-800/80 px-2 py-0.5 text-[10px] font-mono text-zinc-300 border border-zinc-700/50">
+                      <span class="inline-flex items-center gap-1 rounded bg-zinc-800/80 px-2 py-0.5 text-[10px] font-mono text-zinc-300 border border-zinc-700/50 max-w-full">
                         {#if member === room.leader}
-                          <Crown class="w-2.5 h-2.5 text-amber-400" />
+                          <Crown class="w-2.5 h-2.5 text-amber-400 shrink-0" />
                         {/if}
-                        <span>{member}</span>
+                        <span class="truncate max-w-[140px]">{member}</span>
                       </span>
                     {/each}
                   </div>
@@ -297,37 +298,37 @@
           </span>
         </div>
 
-        <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-hidden shadow-xl">
+        <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 overflow-x-auto shadow-xl">
           <table class="w-full text-left text-xs font-mono">
             <thead class="border-b border-zinc-800 bg-zinc-950/80 text-zinc-400 text-[10px] uppercase">
               <tr>
-                <th class="px-4 py-3">Peer Node ID</th>
-                <th class="px-4 py-3">Network Address</th>
-                <th class="px-4 py-3">Status</th>
-                <th class="px-4 py-3">RTT Latency</th>
-                <th class="px-4 py-3">Clock Offset</th>
+                <th class="px-4 py-3 whitespace-nowrap">Peer Node ID</th>
+                <th class="px-4 py-3 whitespace-nowrap">Network Address</th>
+                <th class="px-4 py-3 whitespace-nowrap">Status</th>
+                <th class="px-4 py-3 whitespace-nowrap">RTT Latency</th>
+                <th class="px-4 py-3 whitespace-nowrap">Clock Offset</th>
               </tr>
             </thead>
             <tbody class="divide-y divide-zinc-800/60 text-zinc-200">
               {#each peerStore.peers as peer}
                 <tr class="hover:bg-zinc-800/30 transition-colors">
-                  <td class="px-4 py-3 font-semibold text-zinc-100 flex items-center gap-2">
-                    <span class="h-2 w-2 rounded-full {peer.status === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                    <span>{peer.id}</span>
+                  <td class="px-4 py-3 font-semibold text-zinc-100 flex items-center gap-2 min-w-0">
+                    <span class="h-2 w-2 rounded-full shrink-0 {peer.status === 'connected' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                    <span class="truncate max-w-[200px]" title={peer.id}>{peer.id}</span>
                   </td>
-                  <td class="px-4 py-3 text-zinc-400">{peer.addr}</td>
-                  <td class="px-4 py-3">
+                  <td class="px-4 py-3 text-zinc-400 whitespace-nowrap">{peer.addr}</td>
+                  <td class="px-4 py-3 whitespace-nowrap">
                     <span class="rounded px-2 py-0.5 text-[10px] font-bold uppercase {peer.status === 'connected'
                       ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
                       : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}">
                       {peer.status}
                     </span>
                   </td>
-                  <td class="px-4 py-3 text-cyan-400 font-bold">
+                  <td class="px-4 py-3 text-cyan-400 font-bold whitespace-nowrap">
                     {peer.rtt_ms !== undefined ? `${peer.rtt_ms.toFixed(1)} ms` : '--'}
                   </td>
-                  <td class="px-4 py-3 text-zinc-300">
-                    {peerStore.clockSync.offset_ns / 1000} &mu;s
+                  <td class="px-4 py-3 text-zinc-300 whitespace-nowrap">
+                    {peerStore.clockSync?.offset_ns !== undefined ? (peerStore.clockSync.offset_ns / 1000).toFixed(2) : '0.00'} &mu;s
                   </td>
                 </tr>
               {/each}

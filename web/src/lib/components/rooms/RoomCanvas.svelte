@@ -48,7 +48,7 @@
 
   let nodes = $state<Node[]>([]);
   let edges = $state<Edge[]>([]);
-  let viewport = $state<Viewport>({ x: 0, y: 0, zoom: 1 });
+  let viewport = $state<Viewport>(flowLayoutStore.viewport || { x: 0, y: 0, zoom: 1 });
 
   let flowContainer: HTMLDivElement | null = $state(null);
 
@@ -91,15 +91,15 @@
     return map;
   }
 
-  // Calculate default column coordinates for Left-to-Right signal flow
+  // Calculate default column coordinates for Left-to-Right signal flow with non-colliding margins
   function getDefaultPosition(type: 'input' | 'room' | 'output', index: number): { x: number; y: number } {
     switch (type) {
       case 'input':
-        return { x: 50, y: 70 + index * 270 };
+        return { x: 50, y: 70 + index * 340 };
       case 'room':
-        return { x: 440, y: 70 + index * 420 };
+        return { x: 480, y: 70 + index * 500 };
       case 'output':
-        return { x: 970, y: 70 + index * 270 };
+        return { x: 1020, y: 70 + index * 340 };
     }
   }
 
@@ -161,13 +161,20 @@
     }
   }
 
-  // Update persistent position when node dragging stops
-  function handleNodeDragStop({ targetNode }: { targetNode: Node | null }) {
+  // Update persistent position when node dragging stops (supports single or multi-selection drags)
+  function handleNodeDragStop({ targetNode, nodes: draggedNodes }: { targetNode: Node | null; nodes?: Node[] }) {
     if (targetNode) {
       flowLayoutStore.setPosition(targetNode.id, {
         x: targetNode.position.x,
         y: targetNode.position.y,
       });
+    } else if (draggedNodes && draggedNodes.length > 0) {
+      for (const n of draggedNodes) {
+        flowLayoutStore.setPosition(n.id, {
+          x: n.position.x,
+          y: n.position.y,
+        });
+      }
     }
   }
 
@@ -250,9 +257,6 @@
       const deviceId = data.deviceId;
       if (!deviceId) return;
 
-      const isOutput = data.direction === 'output';
-      const nodeId = isOutput ? `output-${deviceId}` : `input-${deviceId}`;
-
       // Project screen coordinates to SvelteFlow canvas coordinates
       let flowPos: { x: number; y: number };
       if (svelteFlowInstance?.screenToFlowPosition) {
@@ -269,6 +273,10 @@
       } else {
         flowPos = { x: 100, y: 100 };
       }
+
+      // If user dropped on the right side of the canvas (x > 750) or device is an output, target the output node
+      const isOutput = data.direction === 'output' || (data.direction === 'duplex' && flowPos.x > 750);
+      const nodeId = isOutput ? `output-${deviceId}` : `input-${deviceId}`;
 
       flowLayoutStore.setPosition(nodeId, flowPos);
       flowLayoutStore.enableDevice(deviceId);
@@ -292,6 +300,18 @@
         isOutput ? stagedOutputCount : stagedInputCount
       );
       flowLayoutStore.setPosition(nodeId, defPos);
+    }
+
+    // If duplex, ensure counterpart node position is also pre-allocated
+    if (device.max_input > 0 && device.max_output > 0) {
+      const otherNodeId = isOutput ? `input-${device.id}` : `output-${device.id}`;
+      if (!flowLayoutStore.getPosition(otherNodeId)) {
+        const count = nodes.filter((n) => n.type === (isOutput ? 'inputDevice' : 'outputDevice')).length;
+        flowLayoutStore.setPosition(
+          otherNodeId,
+          getDefaultPosition(isOutput ? 'input' : 'output', count)
+        );
+      }
     }
 
     flowLayoutStore.enableDevice(device.id);
@@ -424,6 +444,7 @@
           onDeleteRoom: () => {
             if (confirm(`Delete audio room "${room.name}" (${room.id})?`)) {
               roomStore.deleteRoom(room.id);
+              flowLayoutStore.deleteNodePosition(`room-${room.id}`);
             }
           },
         },
@@ -538,7 +559,7 @@
     <!-- Prominent Sticky Error Notification Banner -->
     {#if roomStore.lastError || deviceStore.error || invalidConnectionNotice}
       <div
-        class="absolute top-2 left-1/2 -translate-x-1/2 z-50 w-11/12 max-w-2xl rounded-xl bg-red-950/95 border border-red-500/50 p-3 shadow-2xl backdrop-blur-md flex items-center justify-between gap-3 text-xs text-red-200 animate-in fade-in slide-in-from-top-2 duration-200"
+        class="absolute top-20 left-1/2 -translate-x-1/2 z-50 w-11/12 max-w-2xl rounded-xl bg-red-950/95 border border-red-500/50 p-3 shadow-2xl backdrop-blur-md flex items-center justify-between gap-3 text-xs text-red-200 animate-in fade-in slide-in-from-top-2 duration-200"
       >
         <div class="flex items-center gap-2 min-w-0">
           <AlertCircle class="w-4 h-4 text-red-400 shrink-0" />
@@ -567,10 +588,13 @@
       bind:edges
       bind:viewport
       {nodeTypes}
-      fitView
+      fitView={!flowLayoutStore.viewport}
       minZoom={0.2}
       maxZoom={2.0}
       onnodedragstop={handleNodeDragStop}
+      onmoveend={({ viewport: vp }) => {
+        if (vp) flowLayoutStore.setViewport(vp);
+      }}
       onconnect={handleConnect}
       ondelete={handleDelete}
       {isValidConnection}
@@ -637,32 +661,34 @@
 
       <!-- Top Right Action Toolbar Panel -->
       <Panel position="top-right" class="m-3">
-        <div class="flex items-center gap-2 rounded-2xl border border-zinc-800/90 bg-zinc-950/85 backdrop-blur-md p-2 shadow-2xl">
+        <div class="flex flex-wrap items-center justify-end gap-1.5 sm:gap-2 rounded-2xl border border-zinc-800/90 bg-zinc-950/85 backdrop-blur-md p-2 shadow-2xl">
           <!-- Add Room Button -->
           <button
             type="button"
             onclick={() => (isCreateRoomOpen = true)}
-            class="inline-flex items-center gap-1.5 rounded-lg bg-cyan-500 px-3 py-1.5 text-xs font-mono font-bold text-zinc-950 shadow-sm shadow-cyan-500/30 hover:bg-cyan-400 transition-all cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-lg bg-cyan-500 px-2.5 sm:px-3 py-1.5 text-xs font-mono font-bold text-zinc-950 shadow-sm shadow-cyan-500/30 hover:bg-cyan-400 transition-all cursor-pointer shrink-0"
           >
             <Plus class="w-3.5 h-3.5" />
-            <span>New Room</span>
+            <span class="hidden sm:inline">New Room</span>
+            <span class="sm:hidden">Room</span>
           </button>
 
           <!-- Add Virtual Device Button -->
           <button
             type="button"
             onclick={() => (isCreateVirtualOpen = true)}
-            class="inline-flex items-center gap-1.5 rounded-lg border border-purple-500/30 bg-purple-500/10 px-3 py-1.5 text-xs font-mono font-semibold text-purple-300 hover:bg-purple-500/20 transition-all cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-purple-500/30 bg-purple-500/10 px-2.5 sm:px-3 py-1.5 text-xs font-mono font-semibold text-purple-300 hover:bg-purple-500/20 transition-all cursor-pointer shrink-0"
           >
             <Radio class="w-3.5 h-3.5 text-purple-400" />
-            <span>New Virtual Loopback</span>
+            <span class="hidden md:inline">New Virtual Loopback</span>
+            <span class="md:hidden">Virtual</span>
           </button>
 
           <!-- Auto-Arrange Layout Button -->
           <button
             type="button"
             onclick={handleAutoArrange}
-            class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono font-medium text-zinc-300 hover:bg-zinc-800 transition-colors cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono font-medium text-zinc-300 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
             title="Reset layout and align nodes in Left-to-Right signal flow columns"
           >
             <RotateCcw class="w-3.5 h-3.5 text-cyan-400" />
@@ -673,7 +699,7 @@
           <button
             type="button"
             onclick={() => meterStore.toggleSimulation()}
-            class="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-mono transition-colors cursor-pointer {meterStore.useSimulation
+            class="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-mono transition-colors cursor-pointer shrink-0 {meterStore.useSimulation
               ? 'border-emerald-500/50 bg-emerald-950/30 text-emerald-300'
               : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200'}"
             title="Toggle audio signal simulation for live LED meters"
@@ -690,7 +716,7 @@
               deviceStore.loadDevices();
               clusterStore.pollCluster();
             }}
-            class="inline-flex items-center justify-center h-8 w-8 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
+            class="inline-flex items-center justify-center h-8 w-8 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
             title="Reload devices and rooms"
             aria-label="Reload devices and rooms"
           >

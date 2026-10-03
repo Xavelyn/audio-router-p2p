@@ -45,6 +45,9 @@ export class FlowLayoutStore {
   // Hydration readiness flag
   isHydrated = $state<boolean>(false);
 
+  // Flag indicating whether a saved layout was found in localStorage
+  hasSavedLayout = $state<boolean>(false);
+
   private saveTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
@@ -66,6 +69,7 @@ export class FlowLayoutStore {
       const raw = localStorage.getItem(STORAGE_KEY_V1);
       if (!raw) {
         this.isHydrated = true;
+        this.hasSavedLayout = false;
         return;
       }
 
@@ -75,25 +79,18 @@ export class FlowLayoutStore {
       if (!parsed || parsed.version !== 1) {
         console.warn(`[flowLayoutStore] Incompatible layout schema version (expected 1, got ${parsed?.version}). Resetting to default.`);
         this.isHydrated = true;
+        this.hasSavedLayout = false;
         return;
       }
+
+      this.hasSavedLayout = true;
 
       if (parsed.sidebarCollapsed !== undefined) {
         this.sidebarOpen = !parsed.sidebarCollapsed;
       }
 
-      const MOCK_DEVICE_IDS = new Set([
-        'hw:0',
-        'hw:1',
-        'virt:loop-main',
-        'hw:scarlett18i20',
-        'hw:iem-rig-01',
-        'hw:dante-vsc',
-        'hw:program-return',
-      ]);
-
       if (Array.isArray(parsed.stagedDeviceIds)) {
-        this.enabledDevices = new Set(parsed.stagedDeviceIds.filter((id) => !MOCK_DEVICE_IDS.has(id)));
+        this.enabledDevices = new Set(parsed.stagedDeviceIds);
       }
 
       if (Array.isArray(parsed.collapsedNodes)) {
@@ -103,20 +100,6 @@ export class FlowLayoutStore {
       if (parsed.nodePositions && typeof parsed.nodePositions === 'object') {
         const nextPos = new Map<string, { x: number; y: number }>();
         for (const [key, val] of Object.entries(parsed.nodePositions)) {
-          if (
-            key.includes('hw:0') ||
-            key.includes('hw:1') ||
-            key.includes('virt:loop-main') ||
-            key.includes('scarlett18i20') ||
-            key.includes('iem-rig-01') ||
-            key.includes('dante-vsc') ||
-            key.includes('program-return') ||
-            key === 'room-main-broadcast' ||
-            key === 'room-in-ear-monitors' ||
-            key === 'room-control-booth'
-          ) {
-            continue;
-          }
           if (val && typeof val.x === 'number' && typeof val.y === 'number' && !isNaN(val.x) && !isNaN(val.y)) {
             nextPos.set(key, { x: Math.round(val.x), y: Math.round(val.y) });
           }
@@ -132,6 +115,7 @@ export class FlowLayoutStore {
     } catch (err) {
       console.warn('[flowLayoutStore] Failed to parse stored canvas layout; recovering with clean defaults:', err);
       this.isHydrated = true;
+      this.hasSavedLayout = false;
     }
   }
 
@@ -232,6 +216,18 @@ export class FlowLayoutStore {
     next.set(nodeId, { x: Math.round(pos.x), y: Math.round(pos.y) });
     this.positions = next;
     this.queuePersist();
+  }
+
+  /**
+   * Remove stored coordinate for a specific node ID (e.g. deleted room)
+   */
+  deleteNodePosition(nodeId: string) {
+    if (this.positions.has(nodeId)) {
+      const next = new Map(this.positions);
+      next.delete(nodeId);
+      this.positions = next;
+      this.queuePersist();
+    }
   }
 
   /**

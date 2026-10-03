@@ -77,7 +77,7 @@
 </script>
 
 <div
-  class="relative w-72 rounded-xl border bg-zinc-900/95 backdrop-blur-md p-3.5 shadow-2xl transition-all select-none {selected
+  class="relative w-80 rounded-xl border bg-zinc-900/95 backdrop-blur-md p-3.5 shadow-2xl transition-all select-none {selected
     ? 'border-purple-400 ring-2 ring-purple-500/30 shadow-purple-500/20'
     : data.device.status === 'quarantined'
       ? 'border-amber-500/60 ring-1 ring-amber-500/30'
@@ -94,7 +94,7 @@
 
   <!-- Header -->
   <div class="flex items-start justify-between gap-2">
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 min-w-0 flex-1">
       <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-purple-500/10 border border-purple-500/30 text-purple-400 shrink-0">
         {#if data.device.is_virtual}
           <Headphones class="w-3.5 h-3.5 text-purple-300" />
@@ -102,7 +102,7 @@
           <Speaker class="w-3.5 h-3.5 text-purple-400" />
         {/if}
       </div>
-      <div class="min-w-0">
+      <div class="min-w-0 flex-1">
         <h3 class="text-xs font-bold text-zinc-100 truncate" title={data.device.name}>
           {data.device.name}
         </h3>
@@ -115,14 +115,14 @@
     <!-- Direction Badges & Dismiss -->
     <div class="flex items-center gap-1 shrink-0">
       {#if data.device.status === 'quarantined'}
-        <span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-amber-300 border border-amber-500/40 animate-pulse" title="Device disconnected: Discarding output">
+        <span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-amber-300 border border-amber-500/40 animate-pulse shrink-0" title="Device disconnected: Discarding output">
           GHOST
         </span>
       {/if}
-      <span class="rounded bg-purple-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-purple-300 border border-purple-500/40">
+      <span class="rounded bg-purple-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-purple-300 border border-purple-500/40 shrink-0">
         OUTPUT
       </span>
-      <span class="rounded px-1.5 py-0.5 text-[9px] font-mono font-semibold uppercase {data.device.is_virtual
+      <span class="rounded px-1.5 py-0.5 text-[9px] font-mono font-semibold uppercase shrink-0 {data.device.is_virtual
         ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30'
         : 'bg-zinc-800 text-zinc-300 border border-zinc-700'}">
         {data.device.is_virtual ? 'VIRT' : 'HW'}
@@ -134,7 +134,7 @@
             e.stopPropagation();
             data.onDismiss?.();
           }}
-          class="rounded p-0.5 text-zinc-400 hover:text-red-400 hover:bg-red-500/10 transition-colors ml-0.5 cursor-pointer"
+          class="rounded p-0.5 text-zinc-400 hover:text-red-400 hover:bg-red-500/10 transition-colors ml-0.5 cursor-pointer shrink-0"
           title="Remove from canvas"
           aria-label="Remove from canvas"
         >
@@ -245,12 +245,12 @@
     {#if data.sourceRooms.length > 0}
       <div class="flex flex-wrap gap-1 max-h-20 overflow-y-auto pr-0.5">
         {#each data.sourceRooms as room}
-          <span class="inline-flex items-center gap-1 rounded bg-purple-950/40 border border-purple-500/30 px-1.5 py-0.5 text-[10px] font-mono text-purple-300">
-            <span class="truncate max-w-[170px]">{room.name}</span>
+          <span class="inline-flex items-center gap-1 rounded bg-purple-950/40 border border-purple-500/30 px-1.5 py-0.5 text-[10px] font-mono text-purple-300 max-w-full">
+            <span class="truncate max-w-[200px]">{room.name}</span>
             <button
               type="button"
               onclick={() => data.onRemoveFromRoom(room.id)}
-              class="text-zinc-400 hover:text-red-400 p-0.5 transition-colors"
+              class="text-zinc-400 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Disconnect from {room.name}"
               aria-label="Disconnect from {room.name}"
             >

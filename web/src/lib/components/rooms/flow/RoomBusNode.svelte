@@ -64,11 +64,11 @@
         <Network class="w-4 h-4" />
       </div>
       <div class="min-w-0">
-        <div class="flex items-center gap-2">
-          <h2 class="text-sm font-bold text-zinc-100 truncate" title={data.room.name}>
+        <div class="flex items-center gap-2 min-w-0">
+          <h2 class="text-sm font-bold text-zinc-100 truncate flex-1 min-w-0" title={data.room.name}>
             {data.room.name}
           </h2>
-          <span class="rounded px-1.5 py-0.2 text-[9px] font-mono font-bold uppercase tracking-wider {data.room.state === 'active'
+          <span class="rounded px-1.5 py-0.2 text-[9px] font-mono font-bold uppercase tracking-wider shrink-0 {data.room.state === 'active'
             ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
             : 'bg-zinc-800 text-zinc-400 border border-zinc-700'}">
             {data.room.state}
@@ -121,12 +121,12 @@
 
   <!-- All-to-All Summing Bus Core Indicator -->
   <div class="mt-3 rounded-xl bg-gradient-to-r from-cyan-950/30 via-zinc-950/70 to-purple-950/30 p-2.5 border border-cyan-500/20">
-    <div class="flex items-center justify-between text-[11px] font-mono">
-      <span class="text-zinc-300 font-semibold flex items-center gap-1">
+    <div class="flex flex-wrap items-center justify-between gap-1.5 text-[11px] font-mono">
+      <span class="text-zinc-300 font-semibold flex items-center gap-1 shrink-0">
         <span>Summing Audio Bus</span>
         <ArrowRight class="w-3 h-3 text-cyan-400" />
       </span>
-      <span class="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/40">
+      <span class="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/40 shrink-0">
         {activeLinkCount} Active Paths ({data.room.inputs?.length || 0} In &times; {data.room.outputs?.length || 0} Out)
       </span>
     </div>
@@ -183,14 +183,14 @@
       <!-- Inputs List -->
       <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
         {#each data.inputDevices as dev (dev.id)}
-          <div class="flex items-center justify-between rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
-            <div class="truncate mr-1" title={dev.name}>
-              <span class="text-cyan-300 font-medium">{dev.name}</span>
+          <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
+            <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
+              <span class="text-cyan-300 font-medium truncate block">{dev.name}</span>
             </div>
             <button
               type="button"
               onclick={() => data.onRemoveInput(dev.id)}
-              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0"
+              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Remove {dev.name} from room"
               aria-label="Remove {dev.name} from room"
             >
@@ -252,14 +252,14 @@
       <!-- Outputs List -->
       <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
         {#each data.outputDevices as dev (dev.id)}
-          <div class="flex items-center justify-between rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
-            <div class="truncate mr-1" title={dev.name}>
-              <span class="text-purple-300 font-medium">{dev.name}</span>
+          <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
+            <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
+              <span class="text-purple-300 font-medium truncate block">{dev.name}</span>
             </div>
             <button
               type="button"
               onclick={() => data.onRemoveOutput(dev.id)}
-              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0"
+              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Remove {dev.name} from room"
               aria-label="Remove {dev.name} from room"
             >
@@ -277,12 +277,12 @@
   </div>
 
   <!-- Room Meta Footer -->
-  <div class="mt-3 flex items-center justify-between pt-2 border-t border-zinc-800/80 text-[10px] font-mono text-zinc-400">
-    <div class="flex items-center gap-1">
-      <Crown class="w-3 h-3 text-amber-400" />
-      <span>Leader: <strong class="text-amber-300 font-bold">{data.room.leader || 'node-local'}</strong></span>
+  <div class="mt-3 flex items-center justify-between pt-2 border-t border-zinc-800/80 text-[10px] font-mono text-zinc-400 min-w-0 gap-2">
+    <div class="flex items-center gap-1 min-w-0 flex-1">
+      <Crown class="w-3 h-3 text-amber-400 shrink-0" />
+      <span class="truncate">Leader: <strong class="text-amber-300 font-bold">{data.room.leader || 'node-local'}</strong></span>
     </div>
-    <div class="flex items-center gap-1.5">
+    <div class="flex items-center gap-1.5 shrink-0">
       <span>{data.room.members?.length || 1} peer node(s)</span>
     </div>
   </div>
