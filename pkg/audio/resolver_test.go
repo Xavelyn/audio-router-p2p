@@ -870,3 +870,80 @@ func TestDeviceResolver_WorkerLifecycleAndGoroutineLeak(t *testing.T) {
 		t.Fatalf("potential goroutine leak: %d additional goroutines running", leaked)
 	}
 }
+
+func TestDeviceResolver_HardwareOpenErrorBubblingWithoutCaching(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	activeURN := "urn:audio:hw:test:nonexistent-dev"
+	dev := Device{
+		ID:        activeURN,
+		URN:       activeURN,
+		RuntimeID: 9999, // non-existent hardware index
+		Name:      "Non-existent Active Device",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	}
+	resolver.Register(dev)
+
+	// 1. Attempt to open hardware input without emulator: should fail and bubble error
+	inStream, inErr := resolver.OpenInput(activeURN, 48000, 2, false)
+	if inErr == nil {
+		if inStream != nil {
+			_ = inStream.Close()
+		}
+		t.Fatal("expected OpenInput to return error for non-existent hardware device, got nil")
+	}
+	if inStream != nil {
+		t.Fatalf("expected nil stream on error, got %T", inStream)
+	}
+
+	// Verify no controller was cached for input
+	inKey := StreamKey{URN: activeURN, Direction: DirectionInput}
+	resolver.mu.Lock()
+	if _, cached := resolver.controllers[inKey]; cached {
+		resolver.mu.Unlock()
+		t.Fatal("expected no controller to be cached after input open failure")
+	}
+	resolver.mu.Unlock()
+
+	// 2. Attempt to open hardware output without emulator: should fail and bubble error
+	outStream, outErr := resolver.OpenOutput(activeURN, 48000, 2, false)
+	if outErr == nil {
+		if outStream != nil {
+			_ = outStream.Close()
+		}
+		t.Fatal("expected OpenOutput to return error for non-existent hardware device, got nil")
+	}
+	if outStream != nil {
+		t.Fatalf("expected nil stream on error, got %T", outStream)
+	}
+
+	// Verify no controller was cached for output
+	outKey := StreamKey{URN: activeURN, Direction: DirectionOutput}
+	resolver.mu.Lock()
+	if _, cached := resolver.controllers[outKey]; cached {
+		resolver.mu.Unlock()
+		t.Fatal("expected no controller to be cached after output open failure")
+	}
+	resolver.mu.Unlock()
+
+	// 3. Self-healing / retry: rebind virtual device to simulate hardware recovery
+	vDev := NewVirtualAudioDevice()
+	resolver.Rebind(activeURN, vDev)
+
+	// Now OpenInput should succeed and create a valid controller
+	recoveredStream, recErr := resolver.OpenInput(activeURN, 48000, 2, false)
+	if recErr != nil {
+		t.Fatalf("expected OpenInput to succeed after rebind, got %v", recErr)
+	}
+	defer recoveredStream.Close()
+
+	resolver.mu.Lock()
+	if _, cached := resolver.controllers[inKey]; !cached {
+		resolver.mu.Unlock()
+		t.Fatal("expected controller to be cached after successful rebind open")
+	}
+	resolver.mu.Unlock()
+}

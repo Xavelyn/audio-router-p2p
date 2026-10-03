@@ -283,6 +283,10 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 	if ch <= 0 {
 		ch = 2
 	}
+	sampleRate := sr.SampleRate
+	if sampleRate <= 0 {
+		sampleRate = 48000
+	}
 	srcNode := "local"
 	if sr.SourceNodeID != "" {
 		srcNode = sr.SourceNodeID
@@ -328,6 +332,7 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 			Layout:   LayoutStereo,
 			Channels: outChans,
 		},
+		SampleRate:   sampleRate,
 		InChannels:   ch,
 		OutChannels:  ch,
 		Coefficients: idMatrix.Coefficients,
@@ -365,6 +370,12 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 	} else if len(mr.Destination.Channels) > 0 {
 		dests = []string{"127.0.0.1:45678"}
 	}
+
+	sampleRate := mr.SampleRate
+	if sampleRate <= 0 {
+		sampleRate = 48000
+	}
+
 	return StreamRoute{
 		ID:              mr.ID,
 		SourceDevice:    srcDev,
@@ -373,7 +384,7 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		DestDevice:      dstDev,
 		DestDeviceURN:   mr.Destination.DeviceID,
 		Destinations:    dests,
-		SampleRate:      48000,
+		SampleRate:      sampleRate,
 		Channels:        mr.InChannels,
 		OutChannels:     mr.OutChannels,
 		PeerID:          mr.Destination.NodeID,

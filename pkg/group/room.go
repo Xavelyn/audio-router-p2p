@@ -244,16 +244,15 @@ func (r *Room) isLocalOnlyLocked() bool {
 	if len(r.inputs) == 0 && len(r.outputs) == 0 {
 		return false
 	}
-
 	for _, dev := range r.inputs {
-		loc, _ := urn.ClassifyDeviceLocality(dev, r.localID)
-		if loc != urn.LocalityLocal {
+		nodeID, _ := r.resolveDeviceEndpointLocked(dev)
+		if nodeID != "local" && nodeID != "" && (r.localID == "" || nodeID != r.localID) {
 			return false
 		}
 	}
 	for _, dev := range r.outputs {
-		loc, _ := urn.ClassifyDeviceLocality(dev, r.localID)
-		if loc != urn.LocalityLocal {
+		nodeID, _ := r.resolveDeviceEndpointLocked(dev)
+		if nodeID != "local" && nodeID != "" && (r.localID == "" || nodeID != r.localID) {
 			return false
 		}
 	}
@@ -707,8 +706,14 @@ func (r *Room) resolveDeviceEndpointLocked(devRef string) (nodeID, cleanDevID st
 	}
 
 	// Step 1: Explicit canonical slash prefix "<node_id>/<device_id>"
-	if slash := strings.Index(devRef, "/"); slash > 0 {
-		return devRef[:slash], devRef[slash+1:]
+	if !strings.HasPrefix(devRef, "urn:") {
+		if slash := strings.Index(devRef, "/"); slash > 0 {
+			parsedNode := strings.TrimSpace(devRef[:slash])
+			parsedDev := strings.TrimSpace(devRef[slash+1:])
+			if parsedDev != "" {
+				return parsedNode, parsedDev
+			}
+		}
 	}
 
 	// Step 2: RFC 8141 node URN "urn:audio:node:<nodeID>:dev:<devID>"
@@ -774,6 +779,14 @@ func (r *Room) resolveDeviceEndpointLocked(devRef string) (nodeID, cleanDevID st
 			}
 			return "local", cleanDevID
 		}
+	}
+
+	// Host-bound physical hardware and virtual URNs unlisted in cluster snapshot are local
+	if strings.HasPrefix(cleanDevID, "urn:audio:hw:") || strings.HasPrefix(cleanDevID, "urn:audio:virt:") {
+		if r.localID != "" {
+			return r.localID, cleanDevID
+		}
+		return "local", cleanDevID
 	}
 
 	// Step 5: Fallback to single live peer in discovery (if 1 live peer exists), else r.localID, cleanDevID

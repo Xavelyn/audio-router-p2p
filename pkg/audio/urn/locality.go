@@ -16,19 +16,34 @@ const (
 // and determines whether it resides on the local node or on a remote cluster peer.
 //
 // Rules:
-//  1. Physical hardware (urn:audio:hw:...) and virtual software endpoints (urn:audio:virt:...)
-//     are host-bound and classified as LocalityLocal with localNodeID.
-//  2. Legacy / plain identifiers (e.g. "default", "hw:0,0", "mic") are treated as LocalityLocal with localNodeID.
-//  3. Cluster mesh proxy endpoints (urn:audio:node:<nodeID>:dev:...) are classified as:
+//  1. Canonical slash syntax (<node_id>/<device_id>) is classified as:
 //     - LocalityLocal with localNodeID if nodeID == localNodeID, nodeID == "local", or nodeID == "".
 //     - LocalityRemote with the parsed nodeID if nodeID != localNodeID.
+//  2. Cluster mesh proxy endpoints (urn:audio:node:<nodeID>:dev:...) are classified as:
+//     - LocalityLocal with localNodeID if nodeID == localNodeID, nodeID == "local", or nodeID == "".
+//     - LocalityRemote with the parsed nodeID if nodeID != localNodeID.
+//  3. Physical hardware (urn:audio:hw:...) and virtual software endpoints (urn:audio:virt:...)
+//     are host-bound and classified as LocalityLocal with localNodeID.
+//  4. Legacy / plain identifiers (e.g. "default", "hw:0,0", "mic") are treated as LocalityLocal with localNodeID.
 func ClassifyDeviceLocality(rawURN string, localNodeID string) (Locality, string) {
 	trimmed := strings.TrimSpace(rawURN)
 	if trimmed == "" {
 		return LocalityLocal, localNodeID
 	}
 
-	// 1. Cluster mesh proxy URN: urn:audio:node:<nodeID>:dev:<local_urn>
+	// 1. Canonical slash syntax: <node_id>/<device_id>
+	if !strings.HasPrefix(trimmed, "urn:") {
+		if slash := strings.Index(trimmed, "/"); slash > 0 {
+			nodeID := strings.TrimSpace(trimmed[:slash])
+			devID := strings.TrimSpace(trimmed[slash+1:])
+			if devID != "" && nodeID != "" && nodeID != "local" && (localNodeID == "" || nodeID != localNodeID) {
+				return LocalityRemote, nodeID
+			}
+			return LocalityLocal, localNodeID
+		}
+	}
+
+	// 2. Cluster mesh proxy URN: urn:audio:node:<nodeID>:dev:<local_urn>
 	if strings.HasPrefix(trimmed, "urn:audio:node:") {
 		rest := strings.TrimPrefix(trimmed, "urn:audio:node:")
 		devIdx := strings.Index(rest, ":dev:")

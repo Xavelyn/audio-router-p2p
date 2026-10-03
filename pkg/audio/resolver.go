@@ -427,14 +427,10 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 		log.Printf("[AUDIO:DEV] Resolved input ref=%q to device URN=%q runtimeID=%d (Name=%q)", ref, dev.URN, dev.RuntimeID, dev.Name)
 		st, err := OpenInput(dev.RuntimeID, sampleRate, channels, useEmulator)
 		if err != nil {
-			log.Printf("[AUDIO:DEV] ERROR: failed to open hardware input URN=%q runtimeID=%d: %v. Quarantining and substituting GhostAudioStream", dev.URN, dev.RuntimeID, err)
-			r.quarantined[dev.URN] = true
-			dev.Status = "quarantined"
-			r.devices[dev.URN] = dev
-			phys = NewGhostAudioStream(sampleRate, channels)
-		} else {
-			phys = st
+			log.Printf("[AUDIO:DEV] ERROR: failed to open hardware input URN=%q runtimeID=%d: %v", dev.URN, dev.RuntimeID, err)
+			return nil, err
 		}
+		phys = st
 	}
 
 	gp := r.gracePeriod
@@ -537,14 +533,10 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 		log.Printf("[AUDIO:DEV] Resolved output ref=%q to device URN=%q runtimeID=%d (Name=%q)", ref, dev.URN, dev.RuntimeID, dev.Name)
 		st, err := OpenOutput(dev.RuntimeID, sampleRate, channels, useEmulator)
 		if err != nil {
-			log.Printf("[AUDIO:DEV] ERROR: failed to open hardware output URN=%q runtimeID=%d: %v. Quarantining and substituting GhostAudioStream", dev.URN, dev.RuntimeID, err)
-			r.quarantined[dev.URN] = true
-			dev.Status = "quarantined"
-			r.devices[dev.URN] = dev
-			phys = NewGhostAudioStream(sampleRate, channels)
-		} else {
-			phys = st
+			log.Printf("[AUDIO:DEV] ERROR: failed to open hardware output URN=%q runtimeID=%d: %v", dev.URN, dev.RuntimeID, err)
+			return nil, err
 		}
+		phys = st
 	}
 
 	gp := r.gracePeriod

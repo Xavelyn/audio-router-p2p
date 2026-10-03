@@ -105,6 +105,7 @@ type MatrixRoute struct {
 	Name         string           `json:"name,omitempty"`
 	Source       RouteSource      `json:"source"`
 	Destination  RouteDestination `json:"destination"`
+	SampleRate   int              `json:"sample_rate,omitempty"`
 	InChannels   int              `json:"in_channels"`
 	OutChannels  int              `json:"out_channels"`
 	Coefficients []float64        `json:"coefficients"`

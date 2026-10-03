@@ -340,6 +340,30 @@ func TestRoomLocalityClassification(t *testing.T) {
 			outputs:       []string{"urn:audio:node:node-remote-2:dev:dac"},
 			wantLocalOnly: false,
 		},
+		{
+			name:          "canonical slash remote input",
+			inputs:        []string{"node-remote-1/hw:0,0"},
+			outputs:       []string{"urn:audio:hw:alsa:c=0:d=1"},
+			wantLocalOnly: false,
+		},
+		{
+			name:          "canonical slash remote output",
+			inputs:        []string{"urn:audio:hw:alsa:c=0:d=0"},
+			outputs:       []string{"node-remote-2/hw:0,0"},
+			wantLocalOnly: false,
+		},
+		{
+			name:          "canonical slash local node inputs and outputs",
+			inputs:        []string{"node-alpha/hw:0,0"},
+			outputs:       []string{"node-alpha/hw:0,1"},
+			wantLocalOnly: true,
+		},
+		{
+			name:          "canonical slash literal 'local'",
+			inputs:        []string{"local/hw:0,0"},
+			outputs:       []string{"local/hw:0,1"},
+			wantLocalOnly: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -565,8 +589,9 @@ func TestRoom_ResolveDeviceEndpointWaterfall(t *testing.T) {
 	cm := &mockClusterProvider{snapshot: clusterSnap}
 	devRes := &mockDeviceResolver{
 		devices: map[string]audio.Device{
-			"urn:audio:hw:remote-mic": {URN: "urn:audio:hw:remote-mic", Name: "Hijack Attempt"},
-			"urn:audio:hw:local-dev":  {URN: "urn:audio:hw:local-dev", Name: "Local Card"},
+			"urn:audio:hw:remote-mic":              {URN: "urn:audio:hw:remote-mic", Name: "Hijack Attempt"},
+			"urn:audio:hw:local-dev":               {URN: "urn:audio:hw:local-dev", Name: "Local Card"},
+			"urn:audio:hw:alsa:c=ALC892/897:d=0": {URN: "urn:audio:hw:alsa:c=ALC892/897:d=0", Name: "ALC Codec"},
 		},
 	}
 
@@ -626,6 +651,18 @@ func TestRoom_ResolveDeviceEndpointWaterfall(t *testing.T) {
 			input:       "urn:audio:hw:local-dev",
 			wantNode:    localNode,
 			wantCleanID: "urn:audio:hw:local-dev",
+		},
+		{
+			name:        "RFC 8141 URN containing slash resolved via local resolver without being split as node/device",
+			input:       "urn:audio:hw:alsa:c=ALC892/897:d=0",
+			wantNode:    localNode,
+			wantCleanID: "urn:audio:hw:alsa:c=ALC892/897:d=0",
+		},
+		{
+			name:        "Remote node prefix with slashed URN device",
+			input:       "remote-node-A/urn:audio:hw:alsa:c=ALC892/897:d=0",
+			wantNode:    "remote-node-A",
+			wantCleanID: "urn:audio:hw:alsa:c=ALC892/897:d=0",
 		},
 		{
 			name:        "Step 5: Single live peer fallback for unknown device",
@@ -697,5 +734,92 @@ func TestRoomRouteCompiler_MultiNodeIdenticalHardwareNoCollision(t *testing.T) {
 		if mr.Destination.DeviceID != "urn:audio:hw:name:speaker:9999" {
 			t.Errorf("unexpected destination device: %s", mr.Destination.DeviceID)
 		}
+	}
+}
+
+func TestRoomCrossNodeConsensusSplitBrainAvoidance(t *testing.T) {
+	// Simulating ADR 0019 split-brain scenario:
+	// Node 1: d5b763fa76f1a048eb0710452ad23370
+	// Node 2: 20df5bc09db978cc75c41086fdc614bf
+	node1ID := "d5b763fa76f1a048eb0710452ad23370"
+	node2ID := "20df5bc09db978cc75c41086fdc614bf"
+
+	disc1 := &mockDiscoveryProvider{
+		nodeID: node1ID,
+		peers: []discovery.Peer{
+			{ID: node2ID, Addr: "192.168.1.102:4001", LastSeen: time.Now()},
+		},
+		livePeers: []discovery.Peer{
+			{ID: node2ID, Addr: "192.168.1.102:4001", LastSeen: time.Now()},
+		},
+	}
+	disc2 := &mockDiscoveryProvider{
+		nodeID: node2ID,
+		peers: []discovery.Peer{
+			{ID: node1ID, Addr: "192.168.1.101:4001", LastSeen: time.Now()},
+		},
+		livePeers: []discovery.Peer{
+			{ID: node1ID, Addr: "192.168.1.101:4001", LastSeen: time.Now()},
+		},
+	}
+
+	room1 := NewRoom(RoomConfig{
+		ID:          "room-291",
+		Name:        "Multi-Node Room 291",
+		LocalPeerID: node1ID,
+		Discovery:   disc1,
+	})
+	room2 := NewRoom(RoomConfig{
+		ID:          "room-291",
+		Name:        "Multi-Node Room 291",
+		LocalPeerID: node2ID,
+		Discovery:   disc2,
+	})
+
+	// Input on Node 1, Output on Node 2 using canonical slash syntax
+	inDev := node1ID + "/hw:0,0"
+	outDev := node2ID + "/hw:1,0"
+
+	for _, r := range []*Room{room1, room2} {
+		if err := r.AddInput(inDev); err != nil {
+			t.Fatalf("AddInput: %v", err)
+		}
+		if err := r.AddOutput(outDev); err != nil {
+			t.Fatalf("AddOutput: %v", err)
+		}
+	}
+
+	// Invariant 1: Neither node should classify the cross-node room as local-only
+	if room1.IsLocalOnly() {
+		t.Fatalf("Node 1 incorrectly evaluated cross-node room as local-only")
+	}
+	if room2.IsLocalOnly() {
+		t.Fatalf("Node 2 incorrectly evaluated cross-node room as local-only")
+	}
+
+	// Add membership to both rooms
+	room1.addMember(node1ID, &RoomMember{PeerID: node1ID, NodeID: node1ID})
+	room1.addMember(node2ID, &RoomMember{PeerID: node2ID, NodeID: node2ID})
+
+	room2.addMember(node1ID, &RoomMember{PeerID: node1ID, NodeID: node1ID})
+	room2.addMember(node2ID, &RoomMember{PeerID: node2ID, NodeID: node2ID})
+
+	// Run leader election on both nodes
+	room1.recomputeLeader()
+	room2.recomputeLeader()
+
+	// Invariant 2: Lowest ID must be deterministically elected by both nodes
+	// "20df5bc..." < "d5b763f..." -> node2ID must be elected by both!
+	expectedLeader := node2ID
+	if room1.Leader() != expectedLeader {
+		t.Errorf("Node 1 elected %s, want %s", room1.Leader(), expectedLeader)
+	}
+	if room2.Leader() != expectedLeader {
+		t.Errorf("Node 2 elected %s, want %s", room2.Leader(), expectedLeader)
+	}
+
+	// Verify no split-brain: both nodes agree on the exact same leader
+	if room1.Leader() != room2.Leader() {
+		t.Fatalf("Split-brain detected! Node 1 leader=%s, Node 2 leader=%s", room1.Leader(), room2.Leader())
 	}
 }

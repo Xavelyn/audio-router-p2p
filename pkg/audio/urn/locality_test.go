@@ -97,6 +97,72 @@ func TestClassifyDeviceLocality(t *testing.T) {
 			wantLocality: LocalityRemote,
 			wantNodeID:   "node-gamma",
 		},
+		{
+			name:         "Canonical slash with remote node ID",
+			urn:          "node-beta/hw:0,0",
+			wantLocality: LocalityRemote,
+			wantNodeID:   "node-beta",
+		},
+		{
+			name:         "Canonical slash with hex node ID remote",
+			urn:          "20df5bc09db978cc75c41086fdc614bf/hw:1,0",
+			wantLocality: LocalityRemote,
+			wantNodeID:   "20df5bc09db978cc75c41086fdc614bf",
+		},
+		{
+			name:         "Canonical slash matching local node ID",
+			urn:          "node-alpha/hw:0,0",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
+		{
+			name:         "Canonical slash with literal 'local'",
+			urn:          "local/hw:0,0",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
+		{
+			name:         "Leading slash Linux device path not treated as node ID",
+			urn:          "/dev/snd/pcmC0D0c",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
+		{
+			name:         "Slash with whitespace remote node ID",
+			urn:          "  node-beta  /  hw:0,0 ",
+			wantLocality: LocalityRemote,
+			wantNodeID:   "node-beta",
+		},
+		{
+			name:         "Canonical slash with empty node ID",
+			urn:          "/hw:0,0",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
+		{
+			name:         "RFC 8141 URN with slash in codec name is local",
+			urn:          "urn:audio:hw:alsa:c=ALC892/897:d=0",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
+		{
+			name:         "Remote node prefix with URN device is remote",
+			urn:          "remoteNode/urn:audio:hw:default",
+			wantLocality: LocalityRemote,
+			wantNodeID:   "remoteNode",
+		},
+		{
+			name:         "Local node prefix with URN device is local",
+			urn:          "node-alpha/urn:audio:hw:default",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
+		{
+			name:         "Literal local prefix with URN device is local",
+			urn:          "local/urn:audio:hw:default",
+			wantLocality: LocalityLocal,
+			wantNodeID:   localNode,
+		},
 	}
 
 	for _, tt := range tests {

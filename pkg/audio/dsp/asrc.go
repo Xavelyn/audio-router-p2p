@@ -158,14 +158,42 @@ func (r *ASRCResampler) Process(inPCM, outPCM []byte, step float64) int {
 	}
 
 	// Store last up to 3 frames of inPCM into history for next packet
-	for h := 0; h < 3; h++ {
-		srcFrame := inFrames - 3 + h
-		for ch := 0; ch < r.channels; ch++ {
-			if srcFrame >= 0 {
+	if inFrames >= 3 {
+		for h := 0; h < 3; h++ {
+			srcFrame := inFrames - 3 + h
+			for ch := 0; ch < r.channels; ch++ {
 				off := (srcFrame*r.channels + ch) * 2
 				r.history[h*r.channels+ch] = int16(binary.LittleEndian.Uint16(inPCM[off:]))
-			} else {
+			}
+		}
+	} else if r.hasHistory {
+		// Shift existing history left by inFrames frames to preserve continuity
+		shift := inFrames
+		for h := 0; h < 3-shift; h++ {
+			for ch := 0; ch < r.channels; ch++ {
+				r.history[h*r.channels+ch] = r.history[(h+shift)*r.channels+ch]
+			}
+		}
+		// Append inFrames frames to the end of history
+		for i := 0; i < inFrames; i++ {
+			h := 3 - inFrames + i
+			for ch := 0; ch < r.channels; ch++ {
+				off := (i*r.channels + ch) * 2
+				r.history[h*r.channels+ch] = int16(binary.LittleEndian.Uint16(inPCM[off:]))
+			}
+		}
+	} else {
+		// No previous history, zero pad older slots and fill from inPCM
+		for h := 0; h < 3-inFrames; h++ {
+			for ch := 0; ch < r.channels; ch++ {
 				r.history[h*r.channels+ch] = 0
+			}
+		}
+		for i := 0; i < inFrames; i++ {
+			h := 3 - inFrames + i
+			for ch := 0; ch < r.channels; ch++ {
+				off := (i*r.channels + ch) * 2
+				r.history[h*r.channels+ch] = int16(binary.LittleEndian.Uint16(inPCM[off:]))
 			}
 		}
 	}

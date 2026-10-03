@@ -60,6 +60,19 @@ type portaudioInput struct {
 	isRealPA     bool
 }
 
+func buildRateCandidates(requested, defaultRate int) []int {
+	raw := []int{requested, defaultRate, 48000, 44100, 96000}
+	candidates := make([]int, 0, len(raw))
+	seen := make(map[int]bool, len(raw))
+	for _, r := range raw {
+		if r > 0 && !seen[r] {
+			seen[r] = true
+			candidates = append(candidates, r)
+		}
+	}
+	return candidates
+}
+
 func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
 	return withSuppressedStderr(func() (*portaudio.DeviceInfo, error) {
 		if deviceID < 0 {
@@ -113,39 +126,68 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 		latency = 40 * time.Millisecond
 	}
 	log.Printf("[AUDIO:IO] Opening PortAudio input: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
-	buf := make([]int16, blocksPerBuffer*channels)
-	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
-		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
-			Input: portaudio.StreamDeviceParameters{
-				Device:   dev,
-				Channels: channels,
-				Latency:  latency,
-			},
-			SampleRate:      float64(sampleRate),
-			FramesPerBuffer: blocksPerBuffer,
-		}, &buf)
-		if oErr != nil {
-			return nil, oErr
+
+	candidates := buildRateCandidates(sampleRate, int(dev.DefaultSampleRate))
+	var actualRate int
+	var st *portaudio.Stream
+	var buf []int16
+	var lastErr error
+
+	for _, candidateRate := range candidates {
+		candidateBuf := make([]int16, blocksPerBuffer*channels)
+		s, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
+			ps, oErr := portaudio.OpenStream(portaudio.StreamParameters{
+				Input: portaudio.StreamDeviceParameters{
+					Device:   dev,
+					Channels: channels,
+					Latency:  latency,
+				},
+				SampleRate:      float64(candidateRate),
+				FramesPerBuffer: blocksPerBuffer,
+			}, &candidateBuf)
+			if oErr != nil {
+				return nil, oErr
+			}
+			if sErr := ps.Start(); sErr != nil {
+				_ = ps.Close()
+				return nil, sErr
+			}
+			return ps, nil
+		})
+		if err == nil {
+			st = s
+			buf = candidateBuf
+			actualRate = candidateRate
+			break
 		}
-		if sErr := s.Start(); sErr != nil {
-			s.Close()
-			return nil, sErr
-		}
-		return s, nil
-	})
-	if err != nil {
-		log.Printf("[AUDIO:IO] ERROR opening PortAudio input device %q: %v", dev.Name, err)
-		termPortAudio()
-		return nil, err
+		lastErr = err
 	}
-	log.Printf("[AUDIO:IO] PortAudio input online: device=%q channels=%d sampleRate=%d", dev.Name, channels, sampleRate)
-	return &portaudioInput{
+
+	if st == nil {
+		log.Printf("[AUDIO:IO] ERROR opening PortAudio input device %q across candidate rates %v: %v", dev.Name, candidates, lastErr)
+		termPortAudio()
+		return nil, lastErr
+	}
+
+	log.Printf("[AUDIO:IO] PortAudio input online: device=%q channels=%d sampleRate=%d (actual=%d)", dev.Name, channels, sampleRate, actualRate)
+	var baseStream AudioStream = &portaudioInput{
 		stream:   st,
 		buf:      buf,
 		rawBuf:   make([]byte, len(buf)*2),
 		spill:    make([]byte, 0, len(buf)*2),
 		isRealPA: true,
-	}, nil
+	}
+
+	if actualRate != sampleRate {
+		log.Printf("[AUDIO:IO] Wrapping input %q with ASRC resampler (%d -> %d Hz)", dev.Name, actualRate, sampleRate)
+		resampled, err := NewResampleInputStream(baseStream, actualRate, sampleRate, channels)
+		if err != nil {
+			_ = baseStream.Close()
+			return nil, err
+		}
+		return resampled, nil
+	}
+	return baseStream, nil
 }
 
 // NewPortaudioInputForTest instantiates a portaudioInput with a custom stream reader for unit testing.
@@ -290,38 +332,67 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 		latency = 40 * time.Millisecond
 	}
 	log.Printf("[AUDIO:IO] Opening PortAudio output: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
-	buf := make([]int16, blocksPerBuffer*channels)
-	st, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
-		s, oErr := portaudio.OpenStream(portaudio.StreamParameters{
-			Output: portaudio.StreamDeviceParameters{
-				Device:   dev,
-				Channels: channels,
-				Latency:  latency,
-			},
-			SampleRate:      float64(sampleRate),
-			FramesPerBuffer: blocksPerBuffer,
-		}, &buf)
-		if oErr != nil {
-			return nil, oErr
+
+	candidates := buildRateCandidates(sampleRate, int(dev.DefaultSampleRate))
+	var actualRate int
+	var st *portaudio.Stream
+	var buf []int16
+	var lastErr error
+
+	for _, candidateRate := range candidates {
+		candidateBuf := make([]int16, blocksPerBuffer*channels)
+		s, err := withSuppressedStderr(func() (*portaudio.Stream, error) {
+			ps, oErr := portaudio.OpenStream(portaudio.StreamParameters{
+				Output: portaudio.StreamDeviceParameters{
+					Device:   dev,
+					Channels: channels,
+					Latency:  latency,
+				},
+				SampleRate:      float64(candidateRate),
+				FramesPerBuffer: blocksPerBuffer,
+			}, &candidateBuf)
+			if oErr != nil {
+				return nil, oErr
+			}
+			if sErr := ps.Start(); sErr != nil {
+				_ = ps.Close()
+				return nil, sErr
+			}
+			return ps, nil
+		})
+		if err == nil {
+			st = s
+			buf = candidateBuf
+			actualRate = candidateRate
+			break
 		}
-		if sErr := s.Start(); sErr != nil {
-			s.Close()
-			return nil, sErr
-		}
-		return s, nil
-	})
-	if err != nil {
-		log.Printf("[AUDIO:IO] ERROR opening PortAudio output device %q: %v", dev.Name, err)
-		termPortAudio()
-		return nil, err
+		lastErr = err
 	}
-	log.Printf("[AUDIO:IO] PortAudio output online: device=%q channels=%d sampleRate=%d", dev.Name, channels, sampleRate)
-	return &portaudioOutput{
+
+	if st == nil {
+		log.Printf("[AUDIO:IO] ERROR opening PortAudio output device %q across candidate rates %v: %v", dev.Name, candidates, lastErr)
+		termPortAudio()
+		return nil, lastErr
+	}
+
+	log.Printf("[AUDIO:IO] PortAudio output online: device=%q channels=%d sampleRate=%d (actual=%d)", dev.Name, channels, sampleRate, actualRate)
+	var baseStream AudioStream = &portaudioOutput{
 		stream:     st,
 		buf:        buf,
 		frameSize:  channels * 2,
 		blockBytes: len(buf) * 2,
-	}, nil
+	}
+
+	if actualRate != sampleRate {
+		log.Printf("[AUDIO:IO] Wrapping output %q with ASRC resampler (%d -> %d Hz)", dev.Name, sampleRate, actualRate)
+		resampled, err := NewResampleOutputStream(baseStream, sampleRate, actualRate, channels)
+		if err != nil {
+			_ = baseStream.Close()
+			return nil, err
+		}
+		return resampled, nil
+	}
+	return baseStream, nil
 }
 
 func (o *portaudioOutput) Write(p []byte) (int, error) {
