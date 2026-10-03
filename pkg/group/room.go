@@ -240,23 +240,52 @@ func (r *Room) IsLocalOnly() bool {
 	return r.isLocalOnlyLocked()
 }
 
-func (r *Room) isLocalOnlyLocked() bool {
-	if len(r.inputs) == 0 && len(r.outputs) == 0 {
-		return false
+// canonicalNodeIDLocked returns the effective node identifier, normalizing "local" or empty
+// strings to r.localID when available, or "local" as a fallback sentinel.
+func (r *Room) canonicalNodeIDLocked(nodeID string) string {
+	if nodeID == "" || nodeID == "local" {
+		if r.localID != "" {
+			return r.localID
+		}
+		return "local"
 	}
+	return nodeID
+}
+
+// isLocalNodeLocked reports whether nodeID represents the local node.
+func (r *Room) isLocalNodeLocked(nodeID string) bool {
+	return nodeID == "local" || (r.localID != "" && nodeID == r.localID)
+}
+
+func (r *Room) singleOwningNodeLocked() (string, bool) {
+	if len(r.inputs) == 0 && len(r.outputs) == 0 {
+		return "", false
+	}
+	var owner string
 	for _, dev := range r.inputs {
-		nodeID, _ := r.resolveDeviceEndpointLocked(dev)
-		if nodeID != "local" && nodeID != "" && (r.localID == "" || nodeID != r.localID) {
-			return false
+		rawNode, _ := r.resolveDeviceEndpointLocked(dev)
+		nodeID := r.canonicalNodeIDLocked(rawNode)
+		if owner == "" {
+			owner = nodeID
+		} else if nodeID != owner {
+			return "", false
 		}
 	}
 	for _, dev := range r.outputs {
-		nodeID, _ := r.resolveDeviceEndpointLocked(dev)
-		if nodeID != "local" && nodeID != "" && (r.localID == "" || nodeID != r.localID) {
-			return false
+		rawNode, _ := r.resolveDeviceEndpointLocked(dev)
+		nodeID := r.canonicalNodeIDLocked(rawNode)
+		if owner == "" {
+			owner = nodeID
+		} else if nodeID != owner {
+			return "", false
 		}
 	}
-	return true
+	return owner, true
+}
+
+func (r *Room) isLocalOnlyLocked() bool {
+	owner, ok := r.singleOwningNodeLocked()
+	return ok && r.isLocalNodeLocked(owner)
 }
 
 // Transport returns the streamer transport configured for this room.
@@ -1072,48 +1101,35 @@ func (r *Room) removeMember(id string) bool {
 		delete(r.members, id)
 	}
 	// Any membership change re-enters the Election phase until the next
-	// recompute converges on a leader again. Local-only rooms are immune.
-	if left != nil && !r.isLocalOnlyLocked() {
+	// recompute converges on a leader again. Single-node rooms are immune unless the owner leaves.
+	owner, isSingleNode := r.singleOwningNodeLocked()
+	ownerLeaves := !isSingleNode || id == owner || (owner == "local" && id == r.localID)
+	if left != nil && ownerLeaves {
 		r.state.Store(RoomState(RoomStateElection))
 	}
+
+	cbState := r.onStateChange
+	cbLeave := r.onMemberLeave
 	r.mu.Unlock()
 
 	// Only fire the member/state events after the mutation is visible.
 	if left != nil && id != r.localID {
-		if r.onStateChange != nil && !r.IsLocalOnly() {
-			r.onStateChange(RoomStateElection)
+		if cbState != nil && ownerLeaves {
+			cbState(RoomStateElection)
 		}
-		if r.onMemberLeave != nil {
-			r.onMemberLeave(left)
+		if cbLeave != nil {
+			cbLeave(left)
 		}
 	}
 	return left != nil
 }
 
-// recomputeLeader implements the deterministic lowest-ID rule.
-// The minimum peer ID among the converged member set is always the leader.
-// Every node runs this same function on the same member set, so all nodes
-// agree on a single leader; no network election is required and no
-// split-brain is possible (peer IDs are unique).
+// recomputeLeader implements deterministic leader convergence.
 //
-// When a room contains only local inputs and outputs (IsLocalOnly() == true):
-// The leader is unconditionally set to the local node and room state to Active.
-// Remote peers or their unhealthiness do not affect local bus operation.
+// When a room contains endpoints belonging to a single node:
+// The leader is unconditionally set to that owning node and room state to Active,
+// provided the owning node is local or verified healthy in discovery.
 func (r *Room) recomputeLeader() {
-	if r.IsLocalOnly() {
-		old := r.Leader()
-		r.leader.Store(r.localID)
-		r.state.Store(RoomState(RoomStateActive))
-		log.Printf("room %s: recomputeLeader (local-only) -> leader=%s", r.id, r.localID)
-		if old != "" && old != r.localID {
-			log.Printf("room %s: leader change %q -> %q", r.id, old, r.localID)
-			if r.onLeaderChange != nil {
-				r.onLeaderChange(r.localID)
-			}
-		}
-		return
-	}
-
 	if r.disc != nil {
 		r.syncMembersFromDiscovery()
 	}
@@ -1130,6 +1146,51 @@ func (r *Room) recomputeLeader() {
 	}
 
 	r.mu.RLock()
+	owner, isSingleNode := r.singleOwningNodeLocked()
+	cbLeader := r.onLeaderChange
+
+	if isSingleNode && owner != "" {
+		isLocal := r.isLocalNodeLocked(owner)
+		var isOwnerHealthy bool
+		if isLocal {
+			isOwnerHealthy = true
+		} else {
+			m, exists := r.members[owner]
+			isOwnerHealthy = exists &&
+				now.Sub(m.LastSeen) <= peerTTL &&
+				(r.disc == nil || present[owner])
+		}
+
+		if isOwnerHealthy {
+			r.mu.RUnlock()
+			leaderID := owner
+			if leaderID == "local" && r.localID != "" {
+				leaderID = r.localID
+			}
+
+			old := r.Leader()
+			r.leader.Store(leaderID)
+			r.state.Store(RoomState(RoomStateActive))
+			if isLocal {
+				log.Printf("room %s: recomputeLeader (local-only) -> leader=%s", r.id, leaderID)
+			} else {
+				log.Printf("room %s: recomputeLeader (single-node) -> leader=%s (localID=%s)", r.id, leaderID, r.localID)
+			}
+			if old != "" && old != leaderID {
+				log.Printf("room %s: leader change %q -> %q", r.id, old, leaderID)
+				if cbLeader != nil {
+					cbLeader(leaderID)
+				}
+			}
+			return
+		}
+
+		// Remote owner is absent or unhealthy: defer assertion and remain in Election
+		r.mu.RUnlock()
+		log.Printf("room %s: single owning node %s is absent or unhealthy, deferring active leader assertion", r.id, owner)
+		return
+	}
+
 	var lowest string
 	for id := range r.members {
 		if lowest == "" || id < lowest {
@@ -1173,8 +1234,8 @@ func (r *Room) recomputeLeader() {
 	// integration oracles rely on (shared event channel ordering).
 	if old != "" && r.Leader() != old {
 		log.Printf("room %s: leader change %q -> %q", r.id, old, r.Leader())
-		if r.onLeaderChange != nil {
-			r.onLeaderChange(r.Leader())
+		if cbLeader != nil {
+			cbLeader(r.Leader())
 		}
 	}
 }

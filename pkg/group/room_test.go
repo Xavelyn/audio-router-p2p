@@ -894,3 +894,193 @@ func TestRoomCrossNodeSymmetricRouteIDSynthesis(t *testing.T) {
 		t.Fatalf("Route ID %q does not match expected canonical format %q", routes1[0], expectedID)
 	}
 }
+
+func TestRoomSingleNodeEndpointLeaderConsensus(t *testing.T) {
+	node1ID := "983d45fc200dbad1ead6cb5a69c6281f"
+	node2ID := "de1c65acdf9893492d461bbc809d699d"
+
+	disc1 := &mockDiscoveryProvider{
+		nodeID: node1ID,
+		peers: []discovery.Peer{
+			{ID: node2ID, Addr: "10.1.11.11:45401", LastSeen: time.Now()},
+		},
+		livePeers: []discovery.Peer{
+			{ID: node2ID, Addr: "10.1.11.11:45401", LastSeen: time.Now()},
+		},
+	}
+	disc2 := &mockDiscoveryProvider{
+		nodeID: node2ID,
+		peers: []discovery.Peer{
+			{ID: node1ID, Addr: "10.1.10.160:45401", LastSeen: time.Now()},
+		},
+		livePeers: []discovery.Peer{
+			{ID: node1ID, Addr: "10.1.10.160:45401", LastSeen: time.Now()},
+		},
+	}
+
+	room1 := NewRoom(RoomConfig{
+		ID:          "room-742",
+		LocalPeerID: node1ID,
+		Discovery:   disc1,
+	})
+	room2 := NewRoom(RoomConfig{
+		ID:          "room-742",
+		LocalPeerID: node2ID,
+		Discovery:   disc2,
+	})
+
+	inputEndpoint := node2ID + "/urn:audio:hw:alsa:c=Loopback:d=1"
+	if err := room1.AddInput(inputEndpoint); err != nil {
+		t.Fatalf("room1.AddInput: %v", err)
+	}
+	if err := room2.AddInput(inputEndpoint); err != nil {
+		t.Fatalf("room2.AddInput: %v", err)
+	}
+
+	room1.recomputeLeader()
+	room2.recomputeLeader()
+
+	leader1 := room1.Leader()
+	leader2 := room2.Leader()
+
+	if leader1 != leader2 {
+		t.Fatalf("Split-brain leader election loop detected! Node 1 leader=%s, Node 2 leader=%s", leader1, leader2)
+	}
+	if leader1 != node2ID {
+		t.Fatalf("Expected leader to be owning node %s, got %s", node2ID, leader1)
+	}
+
+	// Step 2: Add output on Node 1 -> multi-node room!
+	// Both nodes must transition to deterministic lowest ID ("983d..." < "de1c...")
+	outputEndpoint := node1ID + "/urn:audio:hw:name:default:37a8eec1"
+	if err := room1.AddOutput(outputEndpoint); err != nil {
+		t.Fatalf("room1.AddOutput: %v", err)
+	}
+	if err := room2.AddOutput(outputEndpoint); err != nil {
+		t.Fatalf("room2.AddOutput: %v", err)
+	}
+
+	room1.recomputeLeader()
+	room2.recomputeLeader()
+
+	leader1 = room1.Leader()
+	leader2 = room2.Leader()
+	if leader1 != leader2 {
+		t.Fatalf("Multi-node split brain: Node 1 leader=%s, Node 2 leader=%s", leader1, leader2)
+	}
+	if leader1 != node1ID {
+		t.Fatalf("Expected multi-node leader to be lowest ID %s, got %s", node1ID, leader1)
+	}
+
+	// Step 3: Remove output from Node 1 -> reverts back to single-node room on Node 2!
+	if err := room1.RemoveOutput(outputEndpoint); err != nil {
+		t.Fatalf("room1.RemoveOutput: %v", err)
+	}
+	if err := room2.RemoveOutput(outputEndpoint); err != nil {
+		t.Fatalf("room2.RemoveOutput: %v", err)
+	}
+
+	room1.recomputeLeader()
+	room2.recomputeLeader()
+
+	leader1 = room1.Leader()
+	leader2 = room2.Leader()
+	if leader1 != leader2 {
+		t.Fatalf("Reverted split brain: Node 1 leader=%s, Node 2 leader=%s", leader1, leader2)
+	}
+	if leader1 != node2ID {
+		t.Fatalf("Expected reverted leader to be owning node %s, got %s", node2ID, leader1)
+	}
+
+	// Step 4: Remove input from Node 2 -> room has no endpoints!
+	if err := room1.RemoveInput(inputEndpoint); err != nil {
+		t.Fatalf("room1.RemoveInput: %v", err)
+	}
+	if err := room2.RemoveInput(inputEndpoint); err != nil {
+		t.Fatalf("room2.RemoveInput: %v", err)
+	}
+
+	room1.recomputeLeader()
+	room2.recomputeLeader()
+
+	leader1 = room1.Leader()
+	leader2 = room2.Leader()
+	if leader1 != leader2 {
+		t.Fatalf("Empty room split brain: Node 1 leader=%s, Node 2 leader=%s", leader1, leader2)
+	}
+	if leader1 != node1ID {
+		t.Fatalf("Expected empty room leader to be lowest ID %s, got %s", node1ID, leader1)
+	}
+}
+
+func TestRoomSingleOwningNodeEdgeCases(t *testing.T) {
+	// Case 1: localID == "" with remote endpoint must NOT be LocalOnly
+	r1 := NewRoom(RoomConfig{
+		ID:          "empty-local-remote-dev",
+		LocalPeerID: "",
+	})
+	if err := r1.AddInput("remote-node/mic"); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	if r1.IsLocalOnly() {
+		t.Fatal("expected room with remote endpoint to NOT be local-only when LocalPeerID is empty")
+	}
+
+	// Case 2: localID == "" with mixed local and remote endpoints must NOT be single-node
+	r2 := NewRoom(RoomConfig{
+		ID:          "empty-local-mixed-devs",
+		LocalPeerID: "",
+	})
+	if err := r2.AddInput("urn:audio:hw:alsa:c=0:d=0"); err != nil {
+		t.Fatalf("AddInput local: %v", err)
+	}
+	if err := r2.AddInput("remote-node/mic"); err != nil {
+		t.Fatalf("AddInput remote: %v", err)
+	}
+	r2.mu.RLock()
+	owner, isSingle := r2.singleOwningNodeLocked()
+	r2.mu.RUnlock()
+	if isSingle {
+		t.Fatalf("expected mixed room to not be single-node, got owner=%q", owner)
+	}
+
+	// Case 3: Owning remote node departure prevents active leader assertion
+	node1 := "node-1"
+	node2 := "node-2"
+	disc := &mockDiscoveryProvider{
+		nodeID: node1,
+		livePeers: []discovery.Peer{
+			{ID: node2, Addr: "127.0.0.1:4002", LastSeen: time.Now()},
+		},
+		peers: []discovery.Peer{
+			{ID: node2, Addr: "127.0.0.1:4002", LastSeen: time.Now()},
+		},
+	}
+	r3 := NewRoom(RoomConfig{
+		ID:          "remote-departure-room",
+		LocalPeerID: node1,
+		Discovery:   disc,
+	})
+	if err := r3.AddInput(node2 + "/urn:audio:hw:alsa:c=0:d=0"); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	r3.recomputeLeader()
+	if r3.Leader() != node2 || r3.State() != RoomStateActive {
+		t.Fatalf("expected active room with leader %s, got leader=%s state=%v", node2, r3.Leader(), r3.State())
+	}
+
+	// Remote node leaves
+	disc.livePeers = nil
+	if !r3.removeMember(node2) {
+		t.Fatal("expected removeMember to succeed")
+	}
+	if r3.State() != RoomStateElection {
+		t.Fatalf("expected state to be Election after owner left, got %v", r3.State())
+	}
+
+	// Recompute must NOT revert to Active
+	r3.recomputeLeader()
+	if r3.State() == RoomStateActive {
+		t.Fatal("expected room to remain non-active after owner departed, but state was set to Active")
+	}
+}
