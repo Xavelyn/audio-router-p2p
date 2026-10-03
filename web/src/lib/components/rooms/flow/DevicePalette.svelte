@@ -164,7 +164,7 @@
 
   const stagedClusterDevices = $derived(
     groupedNodes.reduce((acc, n) => {
-      return acc + n.devices.filter((d) => flowLayoutStore.isDeviceEnabled(d.id)).length;
+      return acc + n.devices.filter((d) => flowLayoutStore.isDeviceEnabled(d.id, n.id)).length;
     }, 0)
   );
 </script>
@@ -339,7 +339,7 @@
               </div>
             {:else}
               {#each matchingDevices as device (device.id)}
-                {@const isStaged = flowLayoutStore.isDeviceEnabled(device.id)}
+                {@const isStaged = flowLayoutStore.isDeviceEnabled(device.id, node.id)}
                 {@const isInput = device.max_input > 0 && device.max_output === 0}
                 {@const isOutput = device.max_output > 0 && device.max_input === 0}
                 {@const isDuplex = device.max_input > 0 && device.max_output > 0}
@@ -411,7 +411,7 @@
                     {:else}
                       <button
                         type="button"
-                        onclick={() => onAddDevice?.(device, isOutput ? 'output' : 'input')}
+                        onclick={() => onAddDevice?.({ ...device, node_id: (device as any).node_id || node.id }, isOutput ? 'output' : 'input')}
                         class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all shadow-sm cursor-pointer"
                         title={isDuplex ? "Add duplex device (both input and output) to canvas" : "Add to canvas"}
                         aria-label="Add {device.name} to canvas"

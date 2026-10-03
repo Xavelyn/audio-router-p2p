@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
+
+	"github.com/audio-router-p2p/pkg/cluster"
 )
 
 type mockV1RoomManager struct {
@@ -298,8 +301,8 @@ func TestV1RoomBindingsAndSync(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(room.Inputs) != 1 || room.Inputs[0] != "mic-1" {
-		t.Fatalf("expected input 'mic-1', got %+v", room.Inputs)
+	if len(room.Inputs) != 1 || room.Inputs[0] != "test-node-1/mic-1" {
+		t.Fatalf("expected input 'test-node-1/mic-1', got %+v", room.Inputs)
 	}
 
 	// Add second input
@@ -324,8 +327,8 @@ func TestV1RoomBindingsAndSync(t *testing.T) {
 		t.Fatalf("expected 200 for add output, got %d: %s", w.Code, w.Body.String())
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &room)
-	if len(room.Outputs) != 1 || room.Outputs[0] != "spk-1" {
-		t.Fatalf("expected output 'spk-1', got %+v", room.Outputs)
+	if len(room.Outputs) != 1 || room.Outputs[0] != "test-node-1/spk-1" {
+		t.Fatalf("expected output 'test-node-1/spk-1', got %+v", room.Outputs)
 	}
 
 	// 4. DELETE /api/v1/rooms/{id}/inputs/{devId} (remove mic-1)
@@ -334,8 +337,8 @@ func TestV1RoomBindingsAndSync(t *testing.T) {
 		t.Fatalf("expected 200 for delete input, got %d: %s", w.Code, w.Body.String())
 	}
 	_ = json.Unmarshal(w.Body.Bytes(), &room)
-	if len(room.Inputs) != 1 || room.Inputs[0] != "mic-2" {
-		t.Fatalf("expected input mic-2 remaining, got %+v", room.Inputs)
+	if len(room.Inputs) != 1 || room.Inputs[0] != "test-node-1/mic-2" {
+		t.Fatalf("expected input test-node-1/mic-2 remaining, got %+v", room.Inputs)
 	}
 
 	// 5. DELETE /api/v1/rooms/{id}/outputs/{devId} (remove spk-1)
@@ -418,5 +421,177 @@ func TestV1RoomErrorCases(t *testing.T) {
 	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/valid-room/outputs", RoomDeviceBindingRequest{DeviceID: ""}, "Bearer test-v1-token")
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for empty output device_id, got %d", w.Code)
+	}
+}
+
+func TestV1RoomEndpointDisambiguationAndNormalization(t *testing.T) {
+	s, mux := newTestV1Server(t)
+	mockRM := newMockV1RoomManager()
+	s.roomMgr = mockRM
+
+	// Cluster snapshot contains:
+	// - "remote-synth" exclusively on "node-beta"
+	// - "usb-interface" on both "node-alpha" and "node-beta"
+	clusterNode := &mockClusterLocalNode{
+		nodeID: "test-node-1",
+		devices: []cluster.AudioDeviceSummary{
+			{
+				ID:       "remote-synth",
+				DeviceID: "remote-synth",
+				NodeID:   "node-beta",
+			},
+			{
+				ID:       "usb-interface",
+				DeviceID: "usb-interface",
+				NodeID:   "node-alpha",
+			},
+			{
+				ID:       "usb-interface",
+				DeviceID: "usb-interface",
+				NodeID:   "node-beta",
+			},
+		},
+	}
+	cm := cluster.NewManager(cluster.Config{AuthToken: "test-v1-token"}, clusterNode, nil, nil)
+	defer cm.Close()
+	s.SetClusterManager(cm)
+
+	_, err := mockRM.CreateRoom("room-endpoints", "Endpoint Test Room")
+	if err != nil {
+		t.Fatalf("failed to create room: %v", err)
+	}
+
+	// 1. Unambiguous auto-prefixing: "remote-synth" only exists on "node-beta"
+	w := doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/inputs", RoomDeviceBindingRequest{
+		DeviceID: "remote-synth",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for unambiguous device, got %d: %s", w.Code, w.Body.String())
+	}
+	var room RoomInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(room.Inputs) != 1 || room.Inputs[0] != "node-beta/remote-synth" {
+		t.Fatalf("expected input 'node-beta/remote-synth', got %+v", room.Inputs)
+	}
+
+	// 2. Ambiguous endpoint rejection: "usb-interface" exists on node-alpha and node-beta
+	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/inputs", RoomDeviceBindingRequest{
+		DeviceID: "usb-interface",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 Unprocessable Entity for ambiguous device, got %d: %s", w.Code, w.Body.String())
+	}
+	var errResp map[string]string
+	_ = json.Unmarshal(w.Body.Bytes(), &errResp)
+	if errResp["code"] != "ERR_AMBIGUOUS_ENDPOINT" {
+		t.Fatalf("expected error code ERR_AMBIGUOUS_ENDPOINT, got %q", errResp["code"])
+	}
+	if !strings.Contains(errResp["error"], "node-alpha") || !strings.Contains(errResp["error"], "node-beta") {
+		t.Fatalf("expected error message to list ambiguous nodes, got %q", errResp["error"])
+	}
+
+	// 3. Ambiguous device resolved with explicit node_id parameter
+	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/inputs", RoomDeviceBindingRequest{
+		DeviceID: "usb-interface",
+		NodeID:   "node-alpha",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 with explicit node_id, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &room)
+	foundAlpha := false
+	for _, in := range room.Inputs {
+		if in == "node-alpha/usb-interface" {
+			foundAlpha = true
+			break
+		}
+	}
+	if !foundAlpha {
+		t.Fatalf("expected 'node-alpha/usb-interface' in inputs, got %+v", room.Inputs)
+	}
+
+	// 4. Output endpoint ambiguous rejection & explicit resolution
+	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/outputs", RoomDeviceBindingRequest{
+		DeviceID: "usb-interface",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for ambiguous output, got %d: %s", w.Code, w.Body.String())
+	}
+
+	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/outputs", RoomDeviceBindingRequest{
+		DeviceID: "usb-interface",
+		NodeID:   "node-beta",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for explicit output, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &room)
+	if len(room.Outputs) != 1 || room.Outputs[0] != "node-beta/usb-interface" {
+		t.Fatalf("expected 'node-beta/usb-interface' in outputs, got %+v", room.Outputs)
+	}
+
+	// 5. Slash prefix bypasses lookup: "custom-node/arbitrary-mic"
+	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/inputs", RoomDeviceBindingRequest{
+		DeviceID: "custom-node/arbitrary-mic",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for canonical prefix, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &room)
+	foundCustom := false
+	for _, in := range room.Inputs {
+		if in == "custom-node/arbitrary-mic" {
+			foundCustom = true
+			break
+		}
+	}
+	if !foundCustom {
+		t.Fatalf("expected 'custom-node/arbitrary-mic' in inputs, got %+v", room.Inputs)
+	}
+
+	// 6. RFC 8141 URN format: "urn:audio:node:node-gamma:dev:line-in"
+	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/room-endpoints/inputs", RoomDeviceBindingRequest{
+		DeviceID: "urn:audio:node:node-gamma:dev:line-in",
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for RFC 8141 URN, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &room)
+	foundGamma := false
+	for _, in := range room.Inputs {
+		if in == "node-gamma/line-in" {
+			foundGamma = true
+			break
+		}
+	}
+	if !foundGamma {
+		t.Fatalf("expected 'node-gamma/line-in' in inputs, got %+v", room.Inputs)
+	}
+
+	// 7. Bulk bindings with ambiguous input fails with 422
+	w = doV1Request(mux, http.MethodPut, "/api/v1/rooms/room-endpoints/bindings", UpdateRoomBindingsRequest{
+		Inputs:  []string{"usb-interface"},
+		Outputs: []string{"node-beta/usb-interface"},
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 for ambiguous bulk binding, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 8. Bulk bindings with canonical and auto-resolvable endpoints succeeds
+	w = doV1Request(mux, http.MethodPut, "/api/v1/rooms/room-endpoints/bindings", UpdateRoomBindingsRequest{
+		Inputs:  []string{"remote-synth", "node-alpha/usb-interface"},
+		Outputs: []string{"node-beta/usb-interface"},
+	}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for valid bulk bindings, got %d: %s", w.Code, w.Body.String())
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &room)
+	if len(room.Inputs) != 2 || room.Inputs[0] != "node-beta/remote-synth" || room.Inputs[1] != "node-alpha/usb-interface" {
+		t.Fatalf("unexpected inputs after bulk bindings: %+v", room.Inputs)
+	}
+	if len(room.Outputs) != 1 || room.Outputs[0] != "node-beta/usb-interface" {
+		t.Fatalf("unexpected outputs after bulk bindings: %+v", room.Outputs)
 	}
 }

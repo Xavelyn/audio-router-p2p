@@ -178,8 +178,15 @@ export class FlowLayoutStore {
   /**
    * Check if device is currently staged on canvas
    */
-  isDeviceEnabled(deviceId: string): boolean {
-    return this.enabledDevices.has(deviceId);
+  isDeviceEnabled(deviceId: string, nodeId?: string): boolean {
+    if (this.enabledDevices.has(deviceId)) return true;
+    if (nodeId && this.enabledDevices.has(`${nodeId}/${deviceId}`)) return true;
+    for (const d of this.enabledDevices) {
+      if (d === deviceId) return true;
+      if (nodeId && d === `${nodeId}/${deviceId}`) return true;
+      if (!nodeId && d.endsWith(`/${deviceId}`)) return true;
+    }
+    return false;
   }
 
   /**
@@ -203,15 +210,29 @@ export class FlowLayoutStore {
   /**
    * Remove a device from the canvas staging and clean up associated positions
    */
-  disableDevice(deviceId: string) {
+  disableDevice(deviceId: string, nodeId?: string) {
     const next = new Set(this.enabledDevices);
     next.delete(deviceId);
+    if (nodeId) {
+      next.delete(`${nodeId}/${deviceId}`);
+    }
+    // Also delete any entries ending with /deviceId if unqualified
+    for (const d of this.enabledDevices) {
+      if (d === deviceId || (nodeId && d === `${nodeId}/${deviceId}`)) {
+        next.delete(d);
+      }
+    }
     this.enabledDevices = next;
 
     const nextPositions = new Map(this.positions);
     nextPositions.delete(deviceId);
     nextPositions.delete(`input-${deviceId}`);
     nextPositions.delete(`output-${deviceId}`);
+    if (nodeId) {
+      nextPositions.delete(`${nodeId}/${deviceId}`);
+      nextPositions.delete(`input-${nodeId}/${deviceId}`);
+      nextPositions.delete(`output-${nodeId}/${deviceId}`);
+    }
     this.positions = nextPositions;
 
     this.persistNow();

@@ -700,20 +700,66 @@ func (r *Room) clearCompiledRoutesLocked() {
 	r.compiledRoutes = make(map[string]struct{})
 }
 
-func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+func (r *Room) resolveDeviceEndpointLocked(devRef string) (nodeID, cleanDevID string) {
 	devRef = strings.TrimSpace(devRef)
 	if devRef == "" {
 		return "local", ""
 	}
 
-	// 1. Explicit node prefix: "nodeID/urn:..."
+	// Step 1: Explicit canonical slash prefix "<node_id>/<device_id>"
 	if slash := strings.Index(devRef, "/"); slash > 0 {
 		return devRef[:slash], devRef[slash+1:]
 	}
 
+	// Step 2: RFC 8141 node URN "urn:audio:node:<nodeID>:dev:<devID>"
+	const nodePrefix = "urn:audio:node:"
+	if strings.HasPrefix(devRef, nodePrefix) {
+		remainder := strings.TrimPrefix(devRef, nodePrefix)
+		if idx := strings.Index(remainder, ":dev:"); idx > 0 {
+			return remainder[:idx], remainder[idx+5:]
+		}
+	}
+
 	cleanDevID = devRef
 
-	// 2. Check local hardware / virtual resolver
+	// Step 3: Cluster snapshot consensus (prioritized over local)
+	if r.clusterMgr != nil {
+		if snap := r.clusterMgr.GetSnapshot(); snap != nil {
+			var matchingNodes []string
+			seenNodes := make(map[string]bool)
+			for _, cd := range snap.ClusterDevices {
+				if cd.URN == cleanDevID || cd.ID == cleanDevID || cd.DeviceID == cleanDevID {
+					if cd.NodeID != "" && !seenNodes[cd.NodeID] {
+						seenNodes[cd.NodeID] = true
+						matchingNodes = append(matchingNodes, cd.NodeID)
+					}
+				}
+			}
+			if len(matchingNodes) == 1 {
+				return matchingNodes[0], cleanDevID
+			} else if len(matchingNodes) > 1 {
+				// Deterministic tie-breaker: check if local node is an explicit cluster owner
+				hasLocal := false
+				for _, n := range matchingNodes {
+					if n == r.localID {
+						hasLocal = true
+						break
+					}
+				}
+				if hasLocal {
+					if r.localID != "" {
+						return r.localID, cleanDevID
+					}
+					return "local", cleanDevID
+				}
+				// If local node does not own it, select lowest lexicographical remote node
+				sort.Strings(matchingNodes)
+				return matchingNodes[0], cleanDevID
+			}
+		}
+	}
+
+	// Step 4: Local device resolver (r.devResolver / audio.GlobalResolver())
 	if r.devResolver != nil {
 		if _, ok := r.devResolver.Resolve(cleanDevID); ok {
 			if r.localID != "" {
@@ -730,20 +776,7 @@ func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) 
 		}
 	}
 
-	// 3. Check cluster snapshot from ClusterManager
-	if r.clusterMgr != nil {
-		if snap := r.clusterMgr.GetSnapshot(); snap != nil {
-			for _, cd := range snap.ClusterDevices {
-				if cd.URN == cleanDevID || cd.ID == cleanDevID || cd.DeviceID == cleanDevID {
-					if cd.NodeID != "" {
-						return cd.NodeID, cleanDevID
-					}
-				}
-			}
-		}
-	}
-
-	// 4. Fallback: if single live discovery peer exists, it must belong to that peer
+	// Step 5: Fallback to single live peer in discovery (if 1 live peer exists), else r.localID, cleanDevID
 	if r.disc != nil {
 		live := r.disc.LivePeers()
 		if len(live) == 1 && live[0].ID != "" {
@@ -751,11 +784,17 @@ func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) 
 		}
 	}
 
-	// 5. Fallback to local
 	if r.localID != "" {
 		return r.localID, cleanDevID
 	}
 	return "local", cleanDevID
+}
+
+// resolveDeviceEndpoint resolves devRef to its owning nodeID and clean device ID.
+func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.resolveDeviceEndpointLocked(devRef)
 }
 
 func (r *Room) recompileRoutesLocked() {
@@ -765,32 +804,55 @@ func (r *Room) recompileRoutesLocked() {
 
 	log.Printf("[ROOM:ROUTE] Recompiling routes for room=%s (inputs=%v, outputs=%v)", r.id, r.inputs, r.outputs)
 
-	desired := make(map[string]router.MatrixRoute)
-	for _, inDev := range r.inputs {
-		for _, outDev := range r.outputs {
-			srcNodeID, cleanInDev := r.resolveDeviceEndpoint(inDev)
-			dstNodeID, cleanOutDev := r.resolveDeviceEndpoint(outDev)
+	type endpoint struct {
+		raw        string
+		nodeID     string
+		cleanDevID string
+		key        string
+	}
 
-			inKey := cleanInDev
-			if strings.Contains(cleanInDev, ":") {
-				inKey = urn.Checksum(cleanInDev)
-			}
-			outKey := cleanOutDev
-			if strings.Contains(cleanOutDev, ":") {
-				outKey = urn.Checksum(cleanOutDev)
-			}
-			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, inKey, outKey)
+	// Pre-resolve endpoints: O(M + N) instead of O(M * N) inside the crossbar loop
+	resolvedInputs := make([]endpoint, len(r.inputs))
+	for i, inDev := range r.inputs {
+		nodeID, cleanDev := r.resolveDeviceEndpointLocked(inDev)
+		key := cleanDev
+		if strings.Contains(cleanDev, ":") {
+			key = urn.Checksum(cleanDev)
+		}
+		if nodeID != "" && nodeID != "local" && nodeID != r.localID {
+			key = nodeID + "-" + key
+		}
+		resolvedInputs[i] = endpoint{raw: inDev, nodeID: nodeID, cleanDevID: cleanDev, key: key}
+	}
+
+	resolvedOutputs := make([]endpoint, len(r.outputs))
+	for i, outDev := range r.outputs {
+		nodeID, cleanDev := r.resolveDeviceEndpointLocked(outDev)
+		key := cleanDev
+		if strings.Contains(cleanDev, ":") {
+			key = urn.Checksum(cleanDev)
+		}
+		if nodeID != "" && nodeID != "local" && nodeID != r.localID {
+			key = nodeID + "-" + key
+		}
+		resolvedOutputs[i] = endpoint{raw: outDev, nodeID: nodeID, cleanDevID: cleanDev, key: key}
+	}
+
+	desired := make(map[string]router.MatrixRoute, len(resolvedInputs)*len(resolvedOutputs))
+	for _, in := range resolvedInputs {
+		for _, out := range resolvedOutputs {
+			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, in.key, out.key)
 
 			inGain := 1.0
-			if g, ok := r.inputGains[inDev]; ok {
+			if g, ok := r.inputGains[in.raw]; ok {
 				inGain = g
-			} else if g, ok := r.inputGains[cleanInDev]; ok {
+			} else if g, ok := r.inputGains[in.cleanDevID]; ok {
 				inGain = g
 			}
 			outGain := 1.0
-			if g, ok := r.outputGains[outDev]; ok {
+			if g, ok := r.outputGains[out.raw]; ok {
 				outGain = g
-			} else if g, ok := r.outputGains[cleanOutDev]; ok {
+			} else if g, ok := r.outputGains[out.cleanDevID]; ok {
 				outGain = g
 			}
 			totalGain := inGain * outGain
@@ -803,20 +865,20 @@ func (r *Room) recompileRoutesLocked() {
 			coeffs := []float64{totalGain, 0.0, 0.0, totalGain}
 
 			log.Printf("[ROOM:ROUTE] Synthesized intra-room route=%s in=%s (%s) out=%s (%s) gain=%.2f",
-				routeID, cleanInDev, srcNodeID, cleanOutDev, dstNodeID, totalGain)
+				routeID, in.cleanDevID, in.nodeID, out.cleanDevID, out.nodeID, totalGain)
 
 			desired[routeID] = router.MatrixRoute{
 				ID:   routeID,
-				Name: fmt.Sprintf("room-%s-%s-%s", r.id, cleanInDev, cleanOutDev),
+				Name: fmt.Sprintf("room-%s-%s-%s", r.id, in.cleanDevID, out.cleanDevID),
 				Source: router.MatrixEndpoint{
-					NodeID:   srcNodeID,
-					DeviceID: cleanInDev,
+					NodeID:   in.nodeID,
+					DeviceID: in.cleanDevID,
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},
 				Destination: router.MatrixEndpoint{
-					NodeID:   dstNodeID,
-					DeviceID: cleanOutDev,
+					NodeID:   out.nodeID,
+					DeviceID: out.cleanDevID,
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},

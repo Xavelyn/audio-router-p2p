@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/audio"
+	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 )
@@ -507,5 +509,193 @@ func TestRoomDynamicEndpointLocalityTransitions(t *testing.T) {
 	}
 	if room.State() != RoomStateActive {
 		t.Fatalf("expected RoomStateActive, got %v", room.State())
+	}
+}
+
+type mockClusterProvider struct {
+	snapshot *cluster.ClusterSnapshot
+}
+
+func (m *mockClusterProvider) GetSnapshot() *cluster.ClusterSnapshot {
+	return m.snapshot
+}
+
+type mockDeviceResolver struct {
+	devices map[string]audio.Device
+}
+
+func (m *mockDeviceResolver) Resolve(ref string) (audio.Device, bool) {
+	d, ok := m.devices[ref]
+	return d, ok
+}
+
+func TestRoom_ResolveDeviceEndpointWaterfall(t *testing.T) {
+	const localNode = "local-node-1"
+
+	clusterSnap := &cluster.ClusterSnapshot{
+		ClusterDevices: []cluster.AudioDeviceSummary{
+			{
+				ID:     "remote-mic",
+				URN:    "urn:audio:hw:remote-mic",
+				NodeID: "remote-node-A",
+			},
+			{
+				ID:     "collision-dev",
+				URN:    "urn:audio:hw:collision-dev",
+				NodeID: localNode,
+			},
+			{
+				ID:     "collision-dev",
+				URN:    "urn:audio:hw:collision-dev",
+				NodeID: "remote-node-B",
+			},
+			{
+				ID:     "multi-remote",
+				URN:    "urn:audio:hw:multi-remote",
+				NodeID: "node-z",
+			},
+			{
+				ID:     "multi-remote",
+				URN:    "urn:audio:hw:multi-remote",
+				NodeID: "node-b",
+			},
+		},
+	}
+
+	cm := &mockClusterProvider{snapshot: clusterSnap}
+	devRes := &mockDeviceResolver{
+		devices: map[string]audio.Device{
+			"urn:audio:hw:remote-mic": {URN: "urn:audio:hw:remote-mic", Name: "Hijack Attempt"},
+			"urn:audio:hw:local-dev":  {URN: "urn:audio:hw:local-dev", Name: "Local Card"},
+		},
+	}
+
+	disc := &mockDiscoveryProvider{
+		nodeID: localNode,
+		livePeers: []discovery.Peer{
+			{ID: "single-live-peer"},
+		},
+	}
+
+	room := NewRoom(RoomConfig{
+		ID:             "room-waterfall",
+		LocalPeerID:    localNode,
+		ClusterManager: cm,
+		DeviceResolver: devRes,
+		Discovery:      disc,
+	})
+
+	tests := []struct {
+		name        string
+		input       string
+		wantNode    string
+		wantCleanID string
+	}{
+		{
+			name:        "Step 1: explicit canonical prefix with slash",
+			input:       "custom-node/urn:audio:hw:card",
+			wantNode:    "custom-node",
+			wantCleanID: "urn:audio:hw:card",
+		},
+		{
+			name:        "Step 2: RFC 8141 node-scoped URN",
+			input:       "urn:audio:node:stage-box:dev:urn:audio:hw:alsa:c=USB:d=0",
+			wantNode:    "stage-box",
+			wantCleanID: "urn:audio:hw:alsa:c=USB:d=0",
+		},
+		{
+			name:        "Step 3: Cluster consensus takes precedence over local resolver (anti-hijacking)",
+			input:       "urn:audio:hw:remote-mic",
+			wantNode:    "remote-node-A",
+			wantCleanID: "urn:audio:hw:remote-mic",
+		},
+		{
+			name:        "Step 3: Cluster multi-node collision prefers local node if owned",
+			input:       "urn:audio:hw:collision-dev",
+			wantNode:    localNode,
+			wantCleanID: "urn:audio:hw:collision-dev",
+		},
+		{
+			name:        "Step 3: Cluster multi-node collision picks deterministic lowest remote node if local does not own",
+			input:       "urn:audio:hw:multi-remote",
+			wantNode:    "node-b",
+			wantCleanID: "urn:audio:hw:multi-remote",
+		},
+		{
+			name:        "Step 4: Local device resolver fallback when not in cluster snapshot",
+			input:       "urn:audio:hw:local-dev",
+			wantNode:    localNode,
+			wantCleanID: "urn:audio:hw:local-dev",
+		},
+		{
+			name:        "Step 5: Single live peer fallback for unknown device",
+			input:       "unknown-device-123",
+			wantNode:    "single-live-peer",
+			wantCleanID: "unknown-device-123",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotNode, gotClean := room.resolveDeviceEndpoint(tc.input)
+			if gotNode != tc.wantNode || gotClean != tc.wantCleanID {
+				t.Errorf("resolveDeviceEndpoint(%q) = (%q, %q), want (%q, %q)",
+					tc.input, gotNode, gotClean, tc.wantNode, tc.wantCleanID)
+			}
+		})
+	}
+}
+
+func TestRoomRouteCompiler_MultiNodeIdenticalHardwareNoCollision(t *testing.T) {
+	routesFile := t.TempDir() + "/test_routes.json"
+	rt, err := router.New(routesFile)
+	if err != nil {
+		t.Fatalf("router.New: %v", err)
+	}
+
+	room := NewRoom(RoomConfig{
+		ID:          "room-multi-hw",
+		Name:        "Multi HW Test",
+		LocalPeerID: "local-node",
+		Router:      rt,
+	})
+
+	// Inputs from two different nodes with identical soundcard device IDs
+	in1 := "node-alpha/urn:audio:hw:name:default:37a8eec1"
+	in2 := "node-beta/urn:audio:hw:name:default:37a8eec1"
+	out1 := "node-alpha/urn:audio:hw:name:speaker:9999"
+
+	if err := room.AddInput(in1); err != nil {
+		t.Fatalf("AddInput(in1): %v", err)
+	}
+	if err := room.AddInput(in2); err != nil {
+		t.Fatalf("AddInput(in2): %v", err)
+	}
+	if err := room.AddOutput(out1); err != nil {
+		t.Fatalf("AddOutput(out1): %v", err)
+	}
+
+	room.mu.RLock()
+	compiledCount := len(room.compiledRoutes)
+	routes := make([]string, 0, compiledCount)
+	for rID := range room.compiledRoutes {
+		routes = append(routes, rID)
+	}
+	room.mu.RUnlock()
+
+	// Both distinct node inputs must synthesize separate matrix routes without colliding
+	if compiledCount != 2 {
+		t.Fatalf("expected 2 distinct compiled routes for multi-node identical hardware, got %d: %v", compiledCount, routes)
+	}
+
+	for _, rID := range routes {
+		mr, ok := rt.GetMatrix(rID)
+		if !ok {
+			t.Errorf("route %s not found in router", rID)
+			continue
+		}
+		if mr.Destination.DeviceID != "urn:audio:hw:name:speaker:9999" {
+			t.Errorf("unexpected destination device: %s", mr.Destination.DeviceID)
+		}
 	}
 }

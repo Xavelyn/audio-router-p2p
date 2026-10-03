@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -133,7 +134,8 @@ type DefaultRoomManager struct {
 	streamMgr   StreamManager
 	devProvider DeviceProvider
 
-	clusterMgr ClusterDeviceProvider
+	clusterMgr  ClusterDeviceProvider
+	devResolver LocalDeviceResolver
 
 	roomsFile string
 	rooms     map[string]*managedRoom
@@ -251,6 +253,71 @@ func (m *DefaultRoomManager) SetClusterManager(cm ClusterDeviceProvider) {
 	}
 }
 
+// SetDeviceResolver sets the local device resolver and updates all rooms.
+func (m *DefaultRoomManager) SetDeviceResolver(res LocalDeviceResolver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.devResolver = res
+	for _, mr := range m.rooms {
+		if mr.room != nil {
+			mr.room.SetDeviceResolver(res)
+		}
+	}
+}
+
+// newRoomInstanceLocked is the authoritative factory for all Room instances.
+// Must be called with m.mu held.
+func (m *DefaultRoomManager) newRoomInstanceLocked(id RoomID, name, leader string) *Room {
+	localPeerID := ""
+	var disc DiscoveryProvider
+	if m.disc != nil {
+		localPeerID = m.disc.NodeID()
+		disc = m.disc
+	}
+
+	var devRes LocalDeviceResolver
+	if m.devResolver != nil {
+		devRes = m.devResolver
+	} else if m.devProvider != nil {
+		if lr, ok := m.devProvider.(LocalDeviceResolver); ok {
+			devRes = lr
+		}
+	}
+	if devRes == nil {
+		devRes = audio.GlobalResolver()
+	}
+
+	room := NewRoom(RoomConfig{
+		ID:             id,
+		Name:           name,
+		LocalPeerID:    localPeerID,
+		Config:         m.cfg,
+		Discovery:      disc,
+		SyncManager:    m.syncMgr,
+		Transport:      m.trans,
+		Router:         m.router,
+		StreamManager:  m.streamMgr,
+		ClusterManager: m.clusterMgr,
+		DeviceResolver: devRes,
+	})
+
+	roomID := room.ID()
+	room.SetCallbacks(
+		nil,
+		nil,
+		func(newLeader string) {
+			go m.handleLeaderChange(roomID, newLeader)
+		},
+		nil,
+	)
+
+	if leader != "" {
+		room.SetLeader(leader)
+	}
+
+	return room
+}
+
 // ListRooms lists all known rooms and their current statuses.
 func (m *DefaultRoomManager) ListRooms() []api.RoomInfo {
 	m.mu.RLock()
@@ -308,34 +375,7 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 		return info, nil
 	}
 
-	localPeerID := ""
-	var disc DiscoveryProvider
-	if m.disc != nil {
-		localPeerID = m.disc.NodeID()
-		disc = m.disc
-	}
-
-	room := NewRoom(RoomConfig{
-		ID:            RoomID(id),
-		Name:          name,
-		LocalPeerID:   localPeerID,
-		Config:        m.cfg,
-		Discovery:     disc,
-		SyncManager:   m.syncMgr,
-		Transport:     m.trans,
-		Router:        m.router,
-		StreamManager: m.streamMgr,
-	})
-
-	roomID := room.ID()
-	room.SetCallbacks(
-		nil,
-		nil,
-		func(newLeader string) {
-			m.handleLeaderChange(roomID, newLeader)
-		},
-		nil,
-	)
+	room := m.newRoomInstanceLocked(RoomID(id), name, "")
 
 	mr := &managedRoom{
 		room: room,
@@ -695,35 +735,7 @@ func (m *DefaultRoomManager) applyRecordLocked(rec RoomRecord) (*GroupStreamer, 
 
 	mr, exists := m.rooms[rec.ID]
 	if !exists {
-		localPeerID := ""
-		var disc DiscoveryProvider
-		if m.disc != nil {
-			localPeerID = m.disc.NodeID()
-			disc = m.disc
-		}
-		room := NewRoom(RoomConfig{
-			ID:            RoomID(rec.ID),
-			Name:          rec.Name,
-			LocalPeerID:   localPeerID,
-			Config:        m.cfg,
-			Discovery:     disc,
-			SyncManager:   m.syncMgr,
-			Transport:     m.trans,
-			Router:        m.router,
-			StreamManager: m.streamMgr,
-		})
-		roomID := room.ID()
-		room.SetCallbacks(
-			nil,
-			nil,
-			func(newLeader string) {
-				go m.handleLeaderChange(roomID, newLeader)
-			},
-			nil,
-		)
-		if rec.Leader != "" {
-			room.SetLeader(rec.Leader)
-		}
+		room := m.newRoomInstanceLocked(RoomID(rec.ID), rec.Name, rec.Leader)
 		for dev, gain := range rec.InputGains {
 			room.SetInputGain(dev, gain)
 		}
@@ -946,10 +958,62 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 	defer m.mu.Unlock()
 
 	localPeerID := ""
-	var disc DiscoveryProvider
 	if m.disc != nil {
 		localPeerID = m.disc.NodeID()
-		disc = m.disc
+	}
+	localNodeID := localPeerID
+	if localNodeID == "" {
+		localNodeID = "local"
+	}
+
+	normalizeLoadedDev := func(dev string) string {
+		dev = strings.TrimSpace(dev)
+		if dev == "" {
+			return ""
+		}
+		if strings.Contains(dev, "/") || strings.HasPrefix(dev, "urn:audio:node:") {
+			return dev
+		}
+		return localNodeID + "/" + dev
+	}
+	normalizeSlice := func(devs []string) []string {
+		if devs == nil {
+			return nil
+		}
+		out := make([]string, 0, len(devs))
+		for _, dev := range devs {
+			norm := normalizeLoadedDev(dev)
+			if norm != "" {
+				out = append(out, norm)
+			}
+		}
+		return out
+	}
+	normalizeMapHLT := func(m map[string]HLT) map[string]HLT {
+		if m == nil {
+			return nil
+		}
+		out := make(map[string]HLT, len(m))
+		for k, v := range m {
+			norm := normalizeLoadedDev(k)
+			if norm != "" {
+				out[norm] = v
+			}
+		}
+		return out
+	}
+	normalizeMapFloat := func(m map[string]float64) map[string]float64 {
+		if m == nil {
+			return nil
+		}
+		out := make(map[string]float64, len(m))
+		for k, v := range m {
+			norm := normalizeLoadedDev(k)
+			if norm != "" {
+				out[norm] = v
+			}
+		}
+		return out
 	}
 
 	var records []RoomRecord
@@ -958,18 +1022,18 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 			ID:            id,
 			Name:          pr.Name,
 			Leader:        pr.Leader,
-			Inputs:        pr.Inputs,
-			Outputs:       pr.Outputs,
+			Inputs:        normalizeSlice(pr.Inputs),
+			Outputs:       normalizeSlice(pr.Outputs),
 			Synced:        pr.Synced,
-			InputGains:    pr.InputGains,
-			OutputGains:   pr.OutputGains,
+			InputGains:    normalizeMapFloat(pr.InputGains),
+			OutputGains:   normalizeMapFloat(pr.OutputGains),
 			Timestamp:     pr.Timestamp,
 			Deleted:       pr.Deleted,
 			DeletedAt:     pr.DeletedAt,
-			InputAdds:     pr.InputAdds,
-			InputRemoves:  pr.InputRemoves,
-			OutputAdds:    pr.OutputAdds,
-			OutputRemoves: pr.OutputRemoves,
+			InputAdds:     normalizeMapHLT(pr.InputAdds),
+			InputRemoves:  normalizeMapHLT(pr.InputRemoves),
+			OutputAdds:    normalizeMapHLT(pr.OutputAdds),
+			OutputRemoves: normalizeMapHLT(pr.OutputRemoves),
 		}
 		if rec.Timestamp.IsZero() {
 			rec.Timestamp = HLT{WallTime: time.Now().UnixNano(), Counter: 1, NodeID: localPeerID}
@@ -984,31 +1048,8 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 			continue
 		}
 
-		room := NewRoom(RoomConfig{
-			ID:            RoomID(id),
-			Name:          pr.Name,
-			LocalPeerID:   localPeerID,
-			Config:        m.cfg,
-			Discovery:     disc,
-			SyncManager:   m.syncMgr,
-			Transport:     m.trans,
-			Router:        m.router,
-			StreamManager: m.streamMgr,
-		})
+		room := m.newRoomInstanceLocked(RoomID(id), pr.Name, pr.Leader)
 
-		roomID := room.ID()
-		room.SetCallbacks(
-			nil,
-			nil,
-			func(newLeader string) {
-				go m.handleLeaderChange(roomID, newLeader)
-			},
-			nil,
-		)
-
-		if pr.Leader != "" {
-			room.SetLeader(pr.Leader)
-		}
 		for dev, gain := range pr.InputGains {
 			room.SetInputGain(dev, gain)
 		}
