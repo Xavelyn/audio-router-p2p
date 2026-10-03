@@ -340,7 +340,43 @@ func (reg *DeviceRegistry) CreateVirtualDevice(req CreateVirtualDeviceRequest) (
 		reg.deviceStates[legacyID] = state
 	}
 
+	// Register and rebind to audio resolver so routes can stream real audio through this device
+	resolver := audio.GlobalResolver()
+	if resolver != nil {
+		resolver.Register(audio.Device{
+			ID:                virtURN,
+			URN:               virtURN,
+			LegacyID:          legacyID,
+			Name:              req.Name,
+			MaxInput:          maxIn,
+			MaxOutput:         maxOut,
+			DefaultSampleRate: float64(req.SampleRate),
+			IsVirtual:         true,
+			Status:            "active",
+		})
+		resolver.Rebind(virtURN, vDev)
+		if legacyID != "" {
+			resolver.Rebind(legacyID, vDev)
+		}
+	}
+
 	return dev, nil
+}
+
+// GetVirtualDeviceStream returns the underlying VirtualAudioDevice stream for testing and telemetry.
+func (reg *DeviceRegistry) GetVirtualDeviceStream(id string) (*audio.VirtualAudioDevice, bool) {
+	reg.mu.RLock()
+	defer reg.mu.RUnlock()
+	entry, ok := reg.virtualDevs[id]
+	if !ok {
+		for _, vd := range reg.virtualDevs {
+			if vd.Device.LegacyID == id || vd.Device.URN == id || vd.Device.ID == id {
+				return vd.Dev, true
+			}
+		}
+		return nil, false
+	}
+	return entry.Dev, true
 }
 
 // DeleteVirtualDevice removes and closes an in-memory loopback device by URN or legacy ID.
@@ -367,6 +403,14 @@ func (reg *DeviceRegistry) DeleteVirtualDevice(id string) bool {
 
 	if !ok {
 		return false
+	}
+
+	resolver := audio.GlobalResolver()
+	if resolver != nil {
+		resolver.Quarantine(entry.Device.URN)
+		if entry.Device.LegacyID != "" {
+			resolver.Quarantine(entry.Device.LegacyID)
+		}
 	}
 
 	entry.Dev.Close()

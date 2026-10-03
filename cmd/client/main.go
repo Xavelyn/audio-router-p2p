@@ -347,6 +347,12 @@ func (m *streamManager) SetHub(hub *apiTelemetry.TelemetryHub) {
 	}
 }
 
+func (m *streamManager) SetResolver(res *audio.DeviceResolver) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resolver = res
+}
+
 // StartRoute opens the source device and begins streaming per the route.
 func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	m.mu.Lock()
