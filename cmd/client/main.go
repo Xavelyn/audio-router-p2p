@@ -5,11 +5,13 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"log"
 	"math/big"
 	"net"
@@ -17,6 +19,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -32,8 +36,6 @@ import (
 	syncmgr "github.com/audio-router-p2p/pkg/sync"
 	"github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/audio-router-p2p/pkg/transport"
-	"strconv"
-	"strings"
 )
 
 func main() {
@@ -358,7 +360,10 @@ func (m *streamManager) SetResolver(res *audio.DeviceResolver) {
 func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.startLocked(route)
+}
 
+func (m *streamManager) startLocked(route router.StreamRoute) error {
 	sr := route
 	if sr.SampleRate <= 0 {
 		sr.SampleRate = 44100
@@ -382,6 +387,9 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 
 	isRemoteSource := sr.SourceNodeID != "" && sr.SourceNodeID != "local" && (localNodeID == "" || sr.SourceNodeID != localNodeID)
 	isLocalDest := sr.PeerID == "" || sr.PeerID == "local" || (localNodeID != "" && sr.PeerID == localNodeID)
+
+	tokenHash := sha256.Sum256([]byte(m.cfg.AuthToken))
+	authFp := fmt.Sprintf("%x", tokenHash[:4])
 
 	// Ingress route: remote audio source sending to our local output device.
 	if isRemoteSource && isLocalDest {
@@ -419,7 +427,10 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 
 		// Bind deterministic StreamID derived from auth token and route ID so incoming packets match
-		st.SetStreamID(streamer.DeriveStreamID(m.cfg.AuthToken, sr.ID))
+		streamID := streamer.DeriveStreamID(m.cfg.AuthToken, sr.ID)
+		st.SetStreamID(streamID)
+		log.Printf("[ROUTE:DEST] ingress route=%s expecting streamID=%x authFp=%s sourceNode=%s -> local output=%s (sr=%d, ch=%d)",
+			sr.ID, streamID, authFp, sr.SourceNodeID, dstRef, sampleRate, chans)
 
 		if err := st.Start(nil, nil, out); err != nil {
 			if out != nil {
@@ -481,6 +492,8 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		if err == nil && resolved != "" {
 			destAddrs = append(destAddrs, resolved)
 			sr.PeerAddr = resolved
+			log.Printf("[ROUTE:RESOLVE] route=%s peer=%s resolved_addr=%s (defaultPort=%s)",
+				sr.ID, sr.PeerID, resolved, m.cfg.StreamPort)
 		} else {
 			log.Printf("[STREAM:MGR] WARN: could not resolve peer %s: %v", sr.PeerID, err)
 		}
@@ -573,7 +586,17 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		log.Printf("[STREAM:MGR] ERROR creating Streamer for route=%s: %v", sr.ID, err)
 		return err
 	}
-	st.SetStreamID(streamer.DeriveStreamID(m.cfg.AuthToken, sr.ID))
+	streamID := streamer.DeriveStreamID(m.cfg.AuthToken, sr.ID)
+	st.SetStreamID(streamID)
+	if len(destAddrs) == 0 {
+		log.Printf("[ROUTE:DEST] route=%s dest=none streamID=%x authFp=%s sr=%d ch=%d",
+			sr.ID, streamID, authFp, srcRate, srcChans)
+	} else {
+		for _, dest := range destAddrs {
+			log.Printf("[ROUTE:DEST] route=%s dest=%s streamID=%x authFp=%s sr=%d ch=%d",
+				sr.ID, dest, streamID, authFp, srcRate, srcChans)
+		}
+	}
 	if err := st.Start(in, destAddrs, out); err != nil {
 		if in != nil {
 			_ = in.Close()

@@ -94,6 +94,24 @@ type RemotePeer struct {
 	lastRateCalc  atomic.Int64 // unix nano
 	lastRateBytes atomic.Uint64
 	effectiveKbps atomic.Uint64 // bits representation of float64
+
+	// ADR 0021 Observability & Telemetry Primitives
+	firstSendOnce         sync.Once
+	totalUnderruns        atomic.Uint64
+	consecutiveUnderruns  atomic.Uint64
+	lastUnderrunLogNano   atomic.Int64
+	playoutFrames         atomic.Uint64
+	lastWriteErrorLogNano atomic.Int64
+}
+
+// TotalUnderruns returns cumulative jitter buffer underruns for this peer.
+func (p *RemotePeer) TotalUnderruns() uint64 {
+	return p.totalUnderruns.Load()
+}
+
+// ConsecutiveUnderruns returns the current streak of jitter buffer underruns.
+func (p *RemotePeer) ConsecutiveUnderruns() uint64 {
+	return p.consecutiveUnderruns.Load()
 }
 
 // FECConfig configures RFC 5109 1-D XOR Parity Matrix Forward Error Correction.
@@ -171,6 +189,35 @@ type Streamer struct {
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.
 	unregister func()
+
+	// ADR 0021 Observability & Telemetry Primitives
+	firstRecvOnce            sync.Once
+	demuxDropsUnmarshal      atomic.Uint64
+	demuxDropsStreamID       atomic.Uint64
+	demuxDropsNilOutput      atomic.Uint64
+	lastUnmarshalDropLogNano atomic.Int64
+	lastStreamIDDropLogNano  atomic.Int64
+	lastNilOutputDropLogNano atomic.Int64
+}
+
+// AtomicShouldLogRateLimited forwards to transport.ShouldLogRateLimited for backward compatibility.
+func AtomicShouldLogRateLimited(lastLogNano *atomic.Int64, intervalNs int64) bool {
+	return transport.ShouldLogRateLimited(lastLogNano, intervalNs)
+}
+
+// DemuxDropsStreamID returns cumulative drops due to StreamID mismatch.
+func (s *Streamer) DemuxDropsStreamID() uint64 {
+	return s.demuxDropsStreamID.Load()
+}
+
+// DemuxDropsNilOutput returns cumulative drops due to unassigned local output sink.
+func (s *Streamer) DemuxDropsNilOutput() uint64 {
+	return s.demuxDropsNilOutput.Load()
+}
+
+// DemuxDropsUnmarshal returns cumulative drops due to corrupt or unmarshalable datagrams.
+func (s *Streamer) DemuxDropsUnmarshal() uint64 {
+	return s.demuxDropsUnmarshal.Load()
 }
 
 // DeriveStreamID deterministically computes a 16-byte stream identifier using
@@ -428,6 +475,12 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		if frameCount%50 == 0 {
 			log.Printf("[AUDIO:LEVEL] stream=%s frame=%d RMS=%.2f dBFS Peak=%.2f dBFS DTX=%s clipped=%t",
 				streamIDShort, frameCount, metrics.RMSdBFS, metrics.PeakdBFS, currentState.String(), clipped)
+			s.peersMu.RLock()
+			for _, peer := range s.peers {
+				log.Printf("[UDP:SEND] stream=%s dest=%s pkts_sent=%d bytes_sent=%d",
+					hex.EncodeToString(s.streamID[:]), peer.Addr, peer.packetsSent.Load(), peer.bytesSent.Load())
+			}
+			s.peersMu.RUnlock()
 		}
 		if currentState != lastDTXState {
 			log.Printf("[AUDIO:LEVEL] stream=%s DTX transition %s -> %s (RMS=%.2f dBFS, Peak=%.2f dBFS)",
@@ -510,6 +563,10 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 				} else {
 					peer.packetsSent.Add(1)
 					peer.bytesSent.Add(uint64(len(pkt)))
+					peer.firstSendOnce.Do(func() {
+						log.Printf("[UDP:SEND] first packet transmitted stream=%s to=%s seq=%d",
+							hex.EncodeToString(sid[:]), peer.Addr, seq)
+					})
 				}
 			}
 		}
@@ -575,18 +632,48 @@ func (s *Streamer) playout() {
 		if peer.JitterBuf == nil {
 			continue
 		}
+
+		ratio := 1.0
+		if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
+			ratio = jb.driftCtrl.Ratio()
+		}
+
 		data, _, err := peer.JitterBuf.PopNonBlock()
 		if err != nil {
+			peer.totalUnderruns.Add(1)
+			consec := peer.consecutiveUnderruns.Add(1)
+			if transport.ShouldLogRateLimited(&peer.lastUnderrunLogNano, int64(time.Second)) {
+				s.mu.Lock()
+				sid := s.streamID
+				s.mu.Unlock()
+				curStreamIDHex := hex.EncodeToString(sid[:])
+				if sid == [16]byte{} && peer.StreamID != [16]byte{} {
+					curStreamIDHex = hex.EncodeToString(peer.StreamID[:])
+				}
+				log.Printf("[AUDIO:UNDERRUN] stream=%s peer=%s consecutive_underruns=%d drift_ratio=%.6f",
+					curStreamIDHex, peer.Addr, consec, ratio)
+			}
 			continue // underrun, silence
+		}
+		peer.consecutiveUnderruns.Store(0)
+
+		frames := peer.playoutFrames.Add(1)
+		if frames%50 == 0 {
+			s.mu.Lock()
+			sid := s.streamID
+			s.mu.Unlock()
+			curStreamIDHex := hex.EncodeToString(sid[:])
+			if sid == [16]byte{} && peer.StreamID != [16]byte{} {
+				curStreamIDHex = hex.EncodeToString(peer.StreamID[:])
+			}
+			metrics := dsp.AnalyzeLoudness(data, s.config.Channels)
+			log.Printf("[AUDIO:PLAY] stream=%s frame=%d RMS=%.2f dBFS Peak=%.2f dBFS underruns=%d driftRatio=%.6f peer=%s",
+				curStreamIDHex, frames, metrics.RMSdBFS, metrics.PeakdBFS, peer.totalUnderruns.Load(), ratio, peer.Addr)
 		}
 
 		if peer.Output != nil {
 			playData := data
 			if peer.ASRC != nil {
-				ratio := 1.0
-				if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
-					ratio = jb.driftCtrl.Ratio()
-				}
 				// Deadband: engage ASRC resampling when ratio diverges by > 1.0 ppm (1.0e-6).
 				// Preserves exact byte nominal passthrough under negligible jitter/noise.
 				if math.Abs(ratio-1.0) > 1.0e-6 {
@@ -602,7 +689,9 @@ func (s *Streamer) playout() {
 			}
 
 			if _, err := peer.Output.Write(playData); err != nil {
-				log.Printf("streamer: output write error: %v", err)
+				if transport.ShouldLogRateLimited(&peer.lastWriteErrorLogNano, int64(time.Second)) {
+					log.Printf("[AUDIO:PLAY] ERROR: output.Write failed: %v", err)
+				}
 			}
 		}
 	}
@@ -611,9 +700,14 @@ func (s *Streamer) playout() {
 func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	hdr, payload, err := transport.Unmarshal(data)
 	if err != nil {
-		log.Printf("streamer: unmarshal error: %v", err)
+		drops := s.demuxDropsUnmarshal.Add(1)
+		if transport.ShouldLogRateLimited(&s.lastUnmarshalDropLogNano, int64(time.Second)) {
+			log.Printf("[STREAM:DROP] reason=\"unmarshal_error\" from=%s len=%d err=%v cumulative_drops=%d", addr.String(), len(data), err, drops)
+		}
 		return
 	}
+
+	peerAddr := addr.String()
 
 	var emptyID [16]byte
 	s.mu.Lock()
@@ -621,7 +715,6 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	outStream := s.output
 	s.mu.Unlock()
 
-	peerAddr := addr.String()
 	s.peersMu.RLock()
 	peer, ok := s.peers[peerAddr]
 	s.peersMu.RUnlock()
@@ -629,6 +722,11 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	// Accept packets whose hdr.StreamID == s.streamID OR if s.streamID == [16]byte{}
 	// (promiscuous/accept-all) OR if peer exists in s.peers.
 	if hdr.StreamID != sid && sid != emptyID && !ok {
+		drops := s.demuxDropsStreamID.Add(1)
+		if transport.ShouldLogRateLimited(&s.lastStreamIDDropLogNano, int64(time.Second)) {
+			log.Printf("[STREAM:DROP] reason=\"stream_id_mismatch\" got_sid=%x expected_sid=%x from=%s seq=%d cumulative_drops=%d",
+				hdr.StreamID, sid, peerAddr, hdr.Seq, drops)
+		}
 		return // not for us
 	}
 
@@ -636,6 +734,11 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		// If peer not in s.peers but output exists on the streamer,
 		// dynamically register or accept peer so that receiver nodes can receive incoming streams!
 		if outStream == nil {
+			drops := s.demuxDropsNilOutput.Add(1)
+			if transport.ShouldLogRateLimited(&s.lastNilOutputDropLogNano, int64(time.Second)) {
+				log.Printf("[STREAM:DROP] reason=\"nil_local_output\" stream_id=%x from=%s seq=%d cumulative_drops=%d",
+					hdr.StreamID, peerAddr, hdr.Seq, drops)
+			}
 			return
 		}
 		packetBytes := s.packetBytes()
@@ -690,9 +793,16 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 				return
 			}
 			s.peers[peerAddr] = peer
+			log.Printf("[STREAM:RECV] dynamic peer registered: addr=%s stream_id=%s out_device=%t",
+				peerAddr, hex.EncodeToString(hdr.StreamID[:]), outStream != nil)
 		}
 		s.peersMu.Unlock()
 	}
+
+	s.firstRecvOnce.Do(func() {
+		log.Printf("[STREAM:RECV] first packet accepted stream=%s from=%s seq=%d (sr=%d, ch=%d)",
+			hex.EncodeToString(hdr.StreamID[:]), peerAddr, hdr.Seq, hdr.SampleRate, hdr.Channels)
+	})
 
 	s.packetsRecv.Add(1)
 	peer.packetsRecv.Add(1)
