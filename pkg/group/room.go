@@ -824,30 +824,29 @@ func (r *Room) recompileRoutesLocked() {
 		key        string
 	}
 
-	// Pre-resolve endpoints: O(M + N) instead of O(M * N) inside the crossbar loop
-	resolvedInputs := make([]endpoint, len(r.inputs))
-	for i, inDev := range r.inputs {
-		nodeID, cleanDev := r.resolveDeviceEndpointLocked(inDev)
+	endpointKey := func(nodeID, cleanDev string) string {
 		key := cleanDev
 		if strings.Contains(cleanDev, ":") {
 			key = urn.Checksum(cleanDev)
 		}
-		if nodeID != "" && nodeID != "local" && nodeID != r.localID {
+		if nodeID != "" && nodeID != "local" {
 			key = nodeID + "-" + key
 		}
+		return key
+	}
+
+	// Pre-resolve endpoints: O(M + N) instead of O(M * N) inside the crossbar loop
+	resolvedInputs := make([]endpoint, len(r.inputs))
+	for i, inDev := range r.inputs {
+		nodeID, cleanDev := r.resolveDeviceEndpointLocked(inDev)
+		key := endpointKey(nodeID, cleanDev)
 		resolvedInputs[i] = endpoint{raw: inDev, nodeID: nodeID, cleanDevID: cleanDev, key: key}
 	}
 
 	resolvedOutputs := make([]endpoint, len(r.outputs))
 	for i, outDev := range r.outputs {
 		nodeID, cleanDev := r.resolveDeviceEndpointLocked(outDev)
-		key := cleanDev
-		if strings.Contains(cleanDev, ":") {
-			key = urn.Checksum(cleanDev)
-		}
-		if nodeID != "" && nodeID != "local" && nodeID != r.localID {
-			key = nodeID + "-" + key
-		}
+		key := endpointKey(nodeID, cleanDev)
 		resolvedOutputs[i] = endpoint{raw: outDev, nodeID: nodeID, cleanDevID: cleanDev, key: key}
 	}
 
@@ -1014,8 +1013,9 @@ func (r *Room) roomLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// immediately announce + recompute
+	// immediately announce + sync + recompute
 	r.announcePresence()
+	r.syncMembersFromDiscovery()
 	r.recomputeLeader()
 
 	for {
@@ -1112,6 +1112,10 @@ func (r *Room) recomputeLeader() {
 			}
 		}
 		return
+	}
+
+	if r.disc != nil {
+		r.syncMembersFromDiscovery()
 	}
 
 	const peerTTL = 10 * time.Second

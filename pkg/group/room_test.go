@@ -2,6 +2,7 @@ package group
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -821,5 +822,75 @@ func TestRoomCrossNodeConsensusSplitBrainAvoidance(t *testing.T) {
 	// Verify no split-brain: both nodes agree on the exact same leader
 	if room1.Leader() != room2.Leader() {
 		t.Fatalf("Split-brain detected! Node 1 leader=%s, Node 2 leader=%s", room1.Leader(), room2.Leader())
+	}
+}
+
+func TestRoomCrossNodeSymmetricRouteIDSynthesis(t *testing.T) {
+	node1ID := "04cc7811749986e30a7e0b2c3a5c2258"
+	node2ID := "9ebcea3a27888455cfda43269684a0c4"
+
+	tmpDir := t.TempDir()
+	rt1, err := router.New(filepath.Join(tmpDir, "routes1.json"))
+	if err != nil {
+		t.Fatalf("router1.New: %v", err)
+	}
+	rt2, err := router.New(filepath.Join(tmpDir, "routes2.json"))
+	if err != nil {
+		t.Fatalf("router2.New: %v", err)
+	}
+
+	room1 := NewRoom(RoomConfig{
+		ID:          "room-645",
+		LocalPeerID: node1ID,
+		Router:      rt1,
+	})
+	room2 := NewRoom(RoomConfig{
+		ID:          "room-645",
+		LocalPeerID: node2ID,
+		Router:      rt2,
+	})
+
+	inputEndpoint := node2ID + "/urn:audio:hw:alsa:c=Loopback:d=1"
+	outputEndpoint := node1ID + "/urn:audio:hw:name:default:37a8eec1"
+
+	if err := room1.AddOutput(outputEndpoint); err != nil {
+		t.Fatalf("room1.AddOutput: %v", err)
+	}
+	if err := room1.AddInput(inputEndpoint); err != nil {
+		t.Fatalf("room1.AddInput: %v", err)
+	}
+
+	if err := room2.AddOutput(outputEndpoint); err != nil {
+		t.Fatalf("room2.AddOutput: %v", err)
+	}
+	if err := room2.AddInput(inputEndpoint); err != nil {
+		t.Fatalf("room2.AddInput: %v", err)
+	}
+
+	room1.mu.RLock()
+	routes1 := make([]string, 0, len(room1.compiledRoutes))
+	for rID := range room1.compiledRoutes {
+		routes1 = append(routes1, rID)
+	}
+	room1.mu.RUnlock()
+
+	room2.mu.RLock()
+	routes2 := make([]string, 0, len(room2.compiledRoutes))
+	for rID := range room2.compiledRoutes {
+		routes2 = append(routes2, rID)
+	}
+	room2.mu.RUnlock()
+
+	if len(routes1) != 1 || len(routes2) != 1 {
+		t.Fatalf("expected 1 route each, got len(routes1)=%d, len(routes2)=%d", len(routes1), len(routes2))
+	}
+
+	if routes1[0] != routes2[0] {
+		t.Fatalf("Asymmetric RouteID mismatch! Node 1 synthesized %q, Node 2 synthesized %q", routes1[0], routes2[0])
+	}
+
+	expectedID := "room-room-645-" + node2ID + "-b5fccb26-" + node1ID + "-da3bb445"
+	if routes1[0] != expectedID {
+		t.Fatalf("Route ID %q does not match expected canonical format %q", routes1[0], expectedID)
 	}
 }

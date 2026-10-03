@@ -539,11 +539,12 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	hasLocalDest := false
 	if isLocalDest && (sr.DestDeviceURN != "" || sr.DestDevice >= 0) {
 		hasLocalDest = true
-	}
-	for _, d := range destAddrs {
-		if destIsLocal(d, m.localIPs) {
-			hasLocalDest = true
-			break
+	} else if sr.PeerID == "" || sr.PeerID == "local" {
+		for _, d := range destAddrs {
+			if destIsLocal(d, m.localIPs) {
+				hasLocalDest = true
+				break
+			}
 		}
 	}
 

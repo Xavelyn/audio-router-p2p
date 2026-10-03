@@ -57,7 +57,7 @@ func spawnClusterNode(t *testing.T, id string, seedAddrs ...string) *testCluster
 	}
 	apiPort := strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
 
-	trans, err := transport.NewUDPTransport("127.0.0.1:0")
+	trans, err := transport.NewUDPTransport(":0")
 	if err != nil {
 		t.Fatalf("[%s] NewUDPTransport: %v", id, err)
 	}
@@ -72,7 +72,7 @@ func spawnClusterNode(t *testing.T, id string, seedAddrs ...string) *testCluster
 		DiscoveryPort:    0,
 		MulticastPort:    0,
 		SyncPort:         0,
-		StreamPort:       fmt.Sprintf("127.0.0.1:%d", streamPort),
+		StreamPort:       fmt.Sprintf(":%d", streamPort),
 		ListenAddr:       fmt.Sprintf("127.0.0.1:%s", apiPort),
 		AnnounceInterval: 150 * time.Millisecond,
 		PeerTTL:          6 * time.Second,
