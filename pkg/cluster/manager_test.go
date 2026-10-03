@@ -108,6 +108,18 @@ func (m *mockDiscovery) Peers() []discovery.Peer {
 	return out
 }
 
+func (m *mockDiscovery) LivePeers() []discovery.Peer {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]discovery.Peer, 0, len(m.peers))
+	for _, p := range m.peers {
+		if s, ok := m.states[p.ID]; !ok || s == "alive" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (m *mockDiscovery) PeerByID(id string) *discovery.Peer {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

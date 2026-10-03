@@ -345,6 +345,13 @@ func (a *clusterDiscoveryAdapter) Peers() []discovery.Peer {
 	return nil
 }
 
+func (a *clusterDiscoveryAdapter) LivePeers() []discovery.Peer {
+	if a.disc != nil {
+		return a.disc.LivePeers()
+	}
+	return nil
+}
+
 func (a *clusterDiscoveryAdapter) PeerByID(id string) *discovery.Peer {
 	if a.disc != nil {
 		return a.disc.PeerByID(id)
@@ -356,7 +363,7 @@ func (a *clusterDiscoveryAdapter) PeerState(id string) string {
 	if a.disc != nil {
 		return a.disc.PeerState(id)
 	}
-	return "alive"
+	return "unknown"
 }
 
 type streamProviderAdapter struct {

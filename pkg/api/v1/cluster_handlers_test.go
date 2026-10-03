@@ -84,6 +84,10 @@ func (m *mockClusterDisc) Peers() []discovery.Peer {
 	return out
 }
 
+func (m *mockClusterDisc) LivePeers() []discovery.Peer {
+	return m.Peers()
+}
+
 func (m *mockClusterDisc) PeerByID(id string) *discovery.Peer {
 	if p, ok := m.peers[id]; ok {
 		cp := p

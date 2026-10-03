@@ -34,6 +34,7 @@ type LocalNodeProvider interface {
 type DiscoveryProvider interface {
 	NodeID() string
 	Peers() []discovery.Peer
+	LivePeers() []discovery.Peer
 	PeerByID(id string) *discovery.Peer
 	PeerState(id string) string
 }
@@ -327,7 +328,7 @@ func (m *Manager) ScrapeCluster(ctx context.Context) *ClusterSnapshot {
 		LastSeen:      time.Now(),
 	}
 
-	// 2. Discover peers
+	// 2. Discover peers: check SWIM state and circuit breaker so dead/unreachable peers don't block worker pools
 	var peers []discovery.Peer
 	if m.disc != nil {
 		peers = m.disc.Peers()
@@ -346,6 +347,48 @@ func (m *Manager) ScrapeCluster(ctx context.Context) *ClusterSnapshot {
 peerLoop:
 	for _, p := range peers {
 		if p.ID == localID {
+			continue
+		}
+
+		// Pre-filter: Check SWIM state so dead peers don't allocate worker pool slots or cause timeouts
+		if m.disc != nil && m.disc.PeerState(p.ID) == "dead" {
+			mu.Lock()
+			peerSummaries = append(peerSummaries, ClusterNodeSummary{
+				ID:          p.ID,
+				NodeID:      p.ID,
+				Name:        p.ID,
+				APIAddr:     p.APIAddr,
+				IsLocal:     false,
+				SWIMState:   "dead",
+				HealthScore: 0.0,
+				HealthGrade: string(telemetry.GradeCritical),
+				LastSeen:    p.LastSeen,
+				ErrorReason: "SWIM failure detector reported dead",
+			})
+			mu.Unlock()
+			continue
+		}
+
+		// Pre-filter: Check circuit breaker without occupying a worker slot
+		if m.isCircuitOpen(p.ID) {
+			swimState := "unknown"
+			if m.disc != nil {
+				swimState = m.disc.PeerState(p.ID)
+			}
+			mu.Lock()
+			peerSummaries = append(peerSummaries, ClusterNodeSummary{
+				ID:          p.ID,
+				NodeID:      p.ID,
+				Name:        p.ID,
+				APIAddr:     p.APIAddr,
+				IsLocal:     false,
+				SWIMState:   swimState,
+				HealthScore: 0.0,
+				HealthGrade: string(telemetry.GradeCritical),
+				LastSeen:    p.LastSeen,
+				ErrorReason: "circuit breaker open (consecutive failures)",
+			})
+			mu.Unlock()
 			continue
 		}
 
@@ -440,7 +483,7 @@ peerLoop:
 }
 
 func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterNodeSummary, map[string]float64) {
-	swimState := "alive"
+	swimState := "unknown"
 	if m.disc != nil {
 		swimState = m.disc.PeerState(peer.ID)
 	}

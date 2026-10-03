@@ -224,6 +224,9 @@ func (gs *GroupStreamer) sendLoop() {
 
 		if gs.jitterBuf != nil {
 			_, _ = gs.jitterBuf.Push(hdr.Seq, int64(hdr.Timestamp), payload)
+		} else if gs.output != nil && gs.room.Transport() == nil {
+			// Direct local route playback when no network transport is attached
+			_, _ = gs.output.Write(payload)
 		}
 	}
 }

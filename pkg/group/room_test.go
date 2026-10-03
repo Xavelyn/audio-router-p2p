@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 )
 
@@ -267,5 +268,244 @@ func TestRoomFanoutAndSumming_MultiRoom(t *testing.T) {
 		if r.Destination.DeviceID == "spk-A" {
 			t.Errorf("Room A route was not cleaned up: %s", r.ID)
 		}
+	}
+}
+
+type mockDiscoveryProvider struct {
+	peers     []discovery.Peer
+	livePeers []discovery.Peer
+	nodeID    string
+}
+
+func (m *mockDiscoveryProvider) Peers() []discovery.Peer     { return m.peers }
+func (m *mockDiscoveryProvider) LivePeers() []discovery.Peer { return m.livePeers }
+func (m *mockDiscoveryProvider) NodeID() string              { return m.nodeID }
+
+func TestRoomLocalityClassification(t *testing.T) {
+	const localNode = "node-alpha"
+
+	tests := []struct {
+		name          string
+		inputs        []string
+		outputs       []string
+		wantLocalOnly bool
+	}{
+		{
+			name:          "hardware endpoints only",
+			inputs:        []string{"urn:audio:hw:alsa:c=0:d=0"},
+			outputs:       []string{"urn:audio:hw:alsa:c=0:d=1"},
+			wantLocalOnly: true,
+		},
+		{
+			name:          "virtual loopback endpoints only",
+			inputs:        []string{"urn:audio:virt:loopback:in"},
+			outputs:       []string{"urn:audio:virt:loopback:out"},
+			wantLocalOnly: true,
+		},
+		{
+			name:          "matching local node prefix",
+			inputs:        []string{"urn:audio:node:node-alpha:dev:mic"},
+			outputs:       []string{"urn:audio:node:node-alpha:dev:speaker"},
+			wantLocalOnly: true,
+		},
+		{
+			name:          "legacy unqualified device names",
+			inputs:        []string{"mic-1"},
+			outputs:       []string{"speaker-out"},
+			wantLocalOnly: true,
+		},
+		{
+			name:          "mixed local hardware and local node prefix",
+			inputs:        []string{"urn:audio:hw:alsa:c=0:d=0", "urn:audio:node:node-alpha:dev:linein"},
+			outputs:       []string{"urn:audio:virt:monitor", "urn:audio:hw:pulse:d=0"},
+			wantLocalOnly: true,
+		},
+		{
+			name:          "remote input with local output",
+			inputs:        []string{"urn:audio:node:node-remote-1:dev:mic"},
+			outputs:       []string{"urn:audio:hw:alsa:c=0:d=1"},
+			wantLocalOnly: false,
+		},
+		{
+			name:          "local input with remote output",
+			inputs:        []string{"urn:audio:hw:alsa:c=0:d=0"},
+			outputs:       []string{"urn:audio:node:node-remote-2:dev:speaker"},
+			wantLocalOnly: false,
+		},
+		{
+			name:          "both remote inputs and outputs",
+			inputs:        []string{"urn:audio:node:node-remote-1:dev:stream"},
+			outputs:       []string{"urn:audio:node:node-remote-2:dev:dac"},
+			wantLocalOnly: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := NewRoom(RoomConfig{
+				ID:          RoomID("loc-" + tc.name),
+				LocalPeerID: localNode,
+			})
+			for _, in := range tc.inputs {
+				if err := r.AddInput(in); err != nil {
+					t.Fatalf("AddInput(%q) failed: %v", in, err)
+				}
+			}
+			for _, out := range tc.outputs {
+				if err := r.AddOutput(out); err != nil {
+					t.Fatalf("AddOutput(%q) failed: %v", out, err)
+				}
+			}
+			if got := r.IsLocalOnly(); got != tc.wantLocalOnly {
+				t.Errorf("IsLocalOnly() = %v, want %v", got, tc.wantLocalOnly)
+			}
+		})
+	}
+}
+
+func TestRoomLocalOnlyLeadershipImmunity(t *testing.T) {
+	// Local node with lexicographically high ID
+	const localNode = "node-zzz-local"
+
+	disc := &mockDiscoveryProvider{
+		nodeID: localNode,
+		peers: []discovery.Peer{
+			{ID: "node-aaa-remote", Addr: "127.0.0.1:4001", LastSeen: time.Now()},
+		},
+		livePeers: []discovery.Peer{
+			{ID: "node-aaa-remote", Addr: "127.0.0.1:4001", LastSeen: time.Now()},
+		},
+	}
+
+	room := NewRoom(RoomConfig{
+		ID:          "local-immune-room",
+		Name:        "Local Immune Room",
+		LocalPeerID: localNode,
+		Discovery:   disc,
+	})
+
+	if err := room.AddInput("urn:audio:hw:alsa:c=0:d=0"); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	if err := room.AddOutput("urn:audio:hw:alsa:c=0:d=1"); err != nil {
+		t.Fatalf("AddOutput: %v", err)
+	}
+
+	if !room.IsLocalOnly() {
+		t.Fatal("expected room to be local-only")
+	}
+
+	// 1. Initial leadership evaluation should assert localNode immediately
+	room.recomputeLeader()
+	if room.Leader() != localNode {
+		t.Fatalf("expected leader %q, got %q", localNode, room.Leader())
+	}
+	if !room.IsLeader() {
+		t.Fatal("expected IsLeader() == true")
+	}
+	if room.State() != RoomStateActive {
+		t.Fatalf("expected RoomStateActive, got %v", room.State())
+	}
+
+	// 2. Add remote peer with lower ID ("node-aaa-remote" < "node-zzz-local")
+	room.addMember("node-aaa-remote", &RoomMember{
+		PeerID:   "node-aaa-remote",
+		NodeID:   "node-aaa-remote",
+		LastSeen: time.Now(),
+	})
+
+	// Recompute leader: local-only room must NOT be usurped by remote peer
+	room.recomputeLeader()
+	if room.Leader() != localNode {
+		t.Fatalf("local room leader hijacked by remote peer: expected %q, got %q", localNode, room.Leader())
+	}
+	if room.State() != RoomStateActive {
+		t.Fatalf("local room state changed from Active: got %v", room.State())
+	}
+
+	// 3. Remote peer becomes dead / removed from LivePeers
+	disc.livePeers = nil
+	// Remote peer LastSeen goes stale
+	if m := room.Member("node-aaa-remote"); m != nil {
+		m.LastSeen = time.Now().Add(-1 * time.Hour)
+	}
+
+	// Recompute leader again: local room must remain active, immune to remote failure
+	room.recomputeLeader()
+	if room.Leader() != localNode {
+		t.Fatalf("expected leader to stay %q, got %q", localNode, room.Leader())
+	}
+	if room.State() != RoomStateActive {
+		t.Fatalf("local room stalled in non-active state: %v", room.State())
+	}
+}
+
+func TestRoomDynamicEndpointLocalityTransitions(t *testing.T) {
+	const localNode = "node-mmm-local"
+	const lowerRemoteNode = "node-aaa-remote"
+
+	disc := &mockDiscoveryProvider{
+		nodeID: localNode,
+		peers: []discovery.Peer{
+			{ID: lowerRemoteNode, Addr: "127.0.0.1:4002", LastSeen: time.Now()},
+		},
+		livePeers: []discovery.Peer{
+			{ID: lowerRemoteNode, Addr: "127.0.0.1:4002", LastSeen: time.Now()},
+		},
+	}
+
+	room := NewRoom(RoomConfig{
+		ID:          "dynamic-transition-room",
+		Name:        "Dynamic Transition Room",
+		LocalPeerID: localNode,
+		Discovery:   disc,
+	})
+
+	// Start purely local
+	_ = room.AddInput("urn:audio:hw:alsa:c=0:d=0")
+	_ = room.AddOutput("urn:audio:virt:loopback:0")
+	room.addMember(localNode, &RoomMember{PeerID: localNode, NodeID: localNode, LastSeen: time.Now()})
+	room.addMember(lowerRemoteNode, &RoomMember{PeerID: lowerRemoteNode, NodeID: lowerRemoteNode, LastSeen: time.Now()})
+
+	if !room.IsLocalOnly() {
+		t.Fatal("expected room to be local-only initially")
+	}
+
+	room.recomputeLeader()
+	if room.Leader() != localNode {
+		t.Fatalf("expected local leader %q, got %q", localNode, room.Leader())
+	}
+
+	// Dynamically transition to DistributedMesh by adding a remote input
+	remoteURN := "urn:audio:node:" + lowerRemoteNode + ":dev:mic1"
+	if err := room.AddInput(remoteURN); err != nil {
+		t.Fatalf("AddInput remote: %v", err)
+	}
+
+	if room.IsLocalOnly() {
+		t.Fatal("expected room to be distributed mesh after adding remote input")
+	}
+
+	// In distributed mesh, lowest-ID rule applies: lowerRemoteNode < localNode
+	room.recomputeLeader()
+	if room.Leader() != lowerRemoteNode {
+		t.Fatalf("expected remote leader %q for distributed room, got %q", lowerRemoteNode, room.Leader())
+	}
+
+	// Dynamically transition back to LocalOnly by removing the remote input
+	if err := room.RemoveInput(remoteURN); err != nil {
+		t.Fatalf("RemoveInput remote: %v", err)
+	}
+
+	if !room.IsLocalOnly() {
+		t.Fatal("expected room to return to local-only after removing remote input")
+	}
+
+	room.recomputeLeader()
+	if room.Leader() != localNode {
+		t.Fatalf("expected leader to revert to localNode %q, got %q", localNode, room.Leader())
+	}
+	if room.State() != RoomStateActive {
+		t.Fatalf("expected RoomStateActive, got %v", room.State())
 	}
 }

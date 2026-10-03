@@ -82,7 +82,7 @@ type Room struct {
 	members   map[string]*RoomMember // keyed by peer ID
 	localID   string
 	cfg       *config.Config
-	disc      *discovery.Discovery
+	disc      DiscoveryProvider
 	syncMgr   *syncmgr.Manager
 	transport streamer.Transport
 	router    *router.Router
@@ -109,13 +109,20 @@ type Room struct {
 	onStateChange  func(RoomState)
 }
 
+// DiscoveryProvider provides peer topology and live peer membership.
+type DiscoveryProvider interface {
+	Peers() []discovery.Peer
+	LivePeers() []discovery.Peer
+	NodeID() string
+}
+
 // RoomConfig holds the configuration for creating a room
 type RoomConfig struct {
 	ID            RoomID
 	Name          string
 	LocalPeerID   string
 	Config        *config.Config
-	Discovery     *discovery.Discovery
+	Discovery     DiscoveryProvider
 	SyncManager   *syncmgr.Manager
 	Transport     streamer.Transport
 	Router        *router.Router
@@ -179,6 +186,33 @@ func (r *Room) Leader() string { return r.leader.Load().(string) }
 
 // IsLeader returns true if we are the leader
 func (r *Room) IsLeader() bool { return r.Leader() == r.localID }
+
+// IsLocalOnly reports whether the room is strictly local-only (all assigned inputs and outputs are local endpoints).
+func (r *Room) IsLocalOnly() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isLocalOnlyLocked()
+}
+
+func (r *Room) isLocalOnlyLocked() bool {
+	if len(r.inputs) == 0 && len(r.outputs) == 0 {
+		return false
+	}
+
+	for _, dev := range r.inputs {
+		loc, _ := urn.ClassifyDeviceLocality(dev, r.localID)
+		if loc != urn.LocalityLocal {
+			return false
+		}
+	}
+	for _, dev := range r.outputs {
+		loc, _ := urn.ClassifyDeviceLocality(dev, r.localID)
+		if loc != urn.LocalityLocal {
+			return false
+		}
+	}
+	return true
+}
 
 // Transport returns the streamer transport configured for this room.
 func (r *Room) Transport() streamer.Transport {
@@ -346,16 +380,18 @@ func (r *Room) SetOutputGain(deviceID string, gain float64) {
 // Supports both AddInput(deviceID) and AddInput(roomID, deviceID).
 func (r *Room) AddInput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
@@ -363,12 +399,15 @@ func (r *Room) AddInput(args ...string) error {
 	for _, id := range r.inputs {
 		if id == devID {
 			log.Printf("[ROOM:ROUTE] devID=%q already bound to room=%s", devID, r.id)
+			r.mu.Unlock()
 			return nil
 		}
 	}
 	r.inputs = append(r.inputs, devID)
 	r.recompileRoutesLocked()
 	log.Printf("[ROOM:ROUTE] AddInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+	r.mu.Unlock()
+	r.recomputeLeader()
 	return nil
 }
 
@@ -376,16 +415,18 @@ func (r *Room) AddInput(args ...string) error {
 // Supports both RemoveInput(deviceID) and RemoveInput(roomID, deviceID).
 func (r *Room) RemoveInput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
@@ -402,7 +443,11 @@ func (r *Room) RemoveInput(args ...string) error {
 		delete(r.inputGains, devID)
 		r.recompileRoutesLocked()
 		log.Printf("[ROOM:ROUTE] RemoveInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+		r.mu.Unlock()
+		r.recomputeLeader()
+		return nil
 	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -410,16 +455,18 @@ func (r *Room) RemoveInput(args ...string) error {
 // Supports both AddOutput(deviceID) and AddOutput(roomID, deviceID).
 func (r *Room) AddOutput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
@@ -427,12 +474,15 @@ func (r *Room) AddOutput(args ...string) error {
 	for _, id := range r.outputs {
 		if id == devID {
 			log.Printf("[ROOM:ROUTE] devID=%q already bound to room=%s", devID, r.id)
+			r.mu.Unlock()
 			return nil
 		}
 	}
 	r.outputs = append(r.outputs, devID)
 	r.recompileRoutesLocked()
 	log.Printf("[ROOM:ROUTE] AddOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+	r.mu.Unlock()
+	r.recomputeLeader()
 	return nil
 }
 
@@ -440,16 +490,18 @@ func (r *Room) AddOutput(args ...string) error {
 // Supports both RemoveOutput(deviceID) and RemoveOutput(roomID, deviceID).
 func (r *Room) RemoveOutput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
@@ -466,7 +518,11 @@ func (r *Room) RemoveOutput(args ...string) error {
 		delete(r.outputGains, devID)
 		r.recompileRoutesLocked()
 		log.Printf("[ROOM:ROUTE] RemoveOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+		r.mu.Unlock()
+		r.recomputeLeader()
+		return nil
 	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -509,19 +565,18 @@ func (r *Room) SetRoomSync(args ...any) error {
 // SetBindings replaces inputs, outputs, and sync state atomically.
 func (r *Room) SetBindings(inputs, outputs []string, synced bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	r.inputs = cleanDeviceList(inputs)
 	r.outputs = cleanDeviceList(outputs)
 	r.synced = synced
 	r.recompileRoutesLocked()
+	r.mu.Unlock()
+	r.recomputeLeader()
 }
 
 // SetRoomBindings updates inputs, outputs, and sync state.
 // Accepts (inputs, outputs []string, synced bool) or (roomID string, inputs, outputs []string, synced bool).
 func (r *Room) SetRoomBindings(args ...any) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	var inputs, outputs []string
 	var synced bool
@@ -529,29 +584,37 @@ func (r *Room) SetRoomBindings(args ...any) error {
 	if len(args) == 3 {
 		var ok bool
 		if inputs, ok = args[0].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("inputs must be []string")
 		}
 		if outputs, ok = args[1].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("outputs must be []string")
 		}
 		if synced, ok = args[2].(bool); !ok {
+			r.mu.Unlock()
 			return errors.New("synced must be bool")
 		}
 	} else if len(args) == 4 {
 		if roomID, ok := args[0].(string); ok && roomID != "" && roomID != string(r.id) {
+			r.mu.Unlock()
 			return fmt.Errorf("room ID mismatch: %s != %s", roomID, r.id)
 		}
 		var ok bool
 		if inputs, ok = args[1].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("inputs must be []string")
 		}
 		if outputs, ok = args[2].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("outputs must be []string")
 		}
 		if synced, ok = args[3].(bool); !ok {
+			r.mu.Unlock()
 			return errors.New("synced must be bool")
 		}
 	} else {
+		r.mu.Unlock()
 		return errors.New("invalid arguments for SetRoomBindings")
 	}
 
@@ -559,6 +622,8 @@ func (r *Room) SetRoomBindings(args ...any) error {
 	r.outputs = cleanDeviceList(outputs)
 	r.synced = synced
 	r.recompileRoutesLocked()
+	r.mu.Unlock()
+	r.recomputeLeader()
 	return nil
 }
 
@@ -820,16 +885,15 @@ func (r *Room) removeMember(id string) bool {
 		delete(r.members, id)
 	}
 	// Any membership change re-enters the Election phase until the next
-	// recompute converges on a leader again. recomputeLeader then restores
-	// RoomStateActive on the following tick.
-	if left != nil {
+	// recompute converges on a leader again. Local-only rooms are immune.
+	if left != nil && !r.isLocalOnlyLocked() {
 		r.state.Store(RoomState(RoomStateElection))
 	}
 	r.mu.Unlock()
 
 	// Only fire the member/state events after the mutation is visible.
 	if left != nil && id != r.localID {
-		if r.onStateChange != nil {
+		if r.onStateChange != nil && !r.IsLocalOnly() {
 			r.onStateChange(RoomStateElection)
 		}
 		if r.onMemberLeave != nil {
@@ -844,14 +908,32 @@ func (r *Room) removeMember(id string) bool {
 // Every node runs this same function on the same member set, so all nodes
 // agree on a single leader; no network election is required and no
 // split-brain is possible (peer IDs are unique).
+//
+// When a room contains only local inputs and outputs (IsLocalOnly() == true):
+// The leader is unconditionally set to the local node and room state to Active.
+// Remote peers or their unhealthiness do not affect local bus operation.
 func (r *Room) recomputeLeader() {
+	if r.IsLocalOnly() {
+		old := r.Leader()
+		r.leader.Store(r.localID)
+		r.state.Store(RoomState(RoomStateActive))
+		log.Printf("room %s: recomputeLeader (local-only) -> leader=%s", r.id, r.localID)
+		if old != "" && old != r.localID {
+			log.Printf("room %s: leader change %q -> %q", r.id, old, r.localID)
+			if r.onLeaderChange != nil {
+				r.onLeaderChange(r.localID)
+			}
+		}
+		return
+	}
+
 	const peerTTL = 10 * time.Second
 	now := time.Now()
 
 	var present map[string]bool
 	if r.disc != nil {
 		present = make(map[string]bool, 16)
-		for _, p := range r.disc.Peers() {
+		for _, p := range r.disc.LivePeers() {
 			present[p.ID] = true
 		}
 	}
@@ -924,11 +1006,19 @@ func (r *Room) announcePresence() {
 
 // syncMembersFromDiscovery merges discovery peers into the member set.
 func (r *Room) syncMembersFromDiscovery() {
+	now := time.Now()
+	// Always refresh our own presence
+	if r.localID != "" {
+		r.addMember(r.localID, &RoomMember{
+			PeerID:   r.localID,
+			NodeID:   r.localID,
+			LastSeen: now,
+		})
+	}
 	if r.disc == nil {
 		return
 	}
-	now := time.Now()
-	for _, p := range r.disc.Peers() {
+	for _, p := range r.disc.LivePeers() {
 		r.addMember(p.ID, &RoomMember{
 			PeerID:     p.ID,
 			NodeID:     p.ID,
@@ -939,13 +1029,6 @@ func (r *Room) syncMembersFromDiscovery() {
 			LastSeen:   p.LastSeen, // presence-freshness: freeze when peer stops announcing
 		})
 	}
-	// always include ourselves
-	r.addMember(r.localID, &RoomMember{
-		PeerID:   r.localID,
-		NodeID:   r.localID,
-		Addr:     "",
-		LastSeen: now,
-	})
 }
 
 // checkPeerTimeouts removes members that are stale OR no longer present
@@ -959,7 +1042,7 @@ func (r *Room) checkPeerTimeouts() {
 	var present map[string]bool
 	if r.disc != nil {
 		present = make(map[string]bool, 16)
-		for _, p := range r.disc.Peers() {
+		for _, p := range r.disc.LivePeers() {
 			present[p.ID] = true
 		}
 	}

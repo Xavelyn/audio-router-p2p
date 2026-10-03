@@ -271,8 +271,10 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 	}
 
 	localPeerID := ""
+	var disc DiscoveryProvider
 	if m.disc != nil {
 		localPeerID = m.disc.NodeID()
+		disc = m.disc
 	}
 
 	room := NewRoom(RoomConfig{
@@ -280,7 +282,7 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 		Name:          name,
 		LocalPeerID:   localPeerID,
 		Config:        m.cfg,
-		Discovery:     m.disc,
+		Discovery:     disc,
 		SyncManager:   m.syncMgr,
 		Transport:     m.trans,
 		Router:        m.router,
@@ -644,8 +646,10 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 	defer m.mu.Unlock()
 
 	localPeerID := ""
+	var disc DiscoveryProvider
 	if m.disc != nil {
 		localPeerID = m.disc.NodeID()
+		disc = m.disc
 	}
 
 	for id, pr := range persisted {
@@ -658,7 +662,7 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 			Name:          pr.Name,
 			LocalPeerID:   localPeerID,
 			Config:        m.cfg,
-			Discovery:     m.disc,
+			Discovery:     disc,
 			SyncManager:   m.syncMgr,
 			Transport:     m.trans,
 			Router:        m.router,

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mrand "math/rand"
 	"net"
 	"net/url"
 	"sort"
@@ -39,10 +40,10 @@ var (
 // Peer is a node discovered on the network.
 type Peer struct {
 	ID         string    `json:"id"`
-	Addr       string    `json:"addr"`                 // unicast discovery/control address host:port
-	APIAddr    string    `json:"apiAddr,omitempty"`    // HTTP/HTTPS control plane base URL
-	SyncAddr   string    `json:"syncAddr"`             // clock-sync address host:port
-	StreamAddr string    `json:"streamAddr"`           // audio stream address host:port
+	Addr       string    `json:"addr"`              // unicast discovery/control address host:port
+	APIAddr    string    `json:"apiAddr,omitempty"` // HTTP/HTTPS control plane base URL
+	SyncAddr   string    `json:"syncAddr"`          // clock-sync address host:port
+	StreamAddr string    `json:"streamAddr"`        // audio stream address host:port
 	LastSeen   time.Time `json:"lastSeen"`
 }
 
@@ -147,10 +148,18 @@ func generateNodeID() (string, error) {
 }
 
 // NodeID returns this node's unique cluster ID.
-func (d *Discovery) NodeID() string { return d.nodeID }
+func (d *Discovery) NodeID() string {
+	if d == nil {
+		return ""
+	}
+	return d.nodeID
+}
 
 // Peers returns a snapshot of discovered live peers sorted by ID.
 func (d *Discovery) Peers() []Peer {
+	if d == nil {
+		return nil
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	out := make([]Peer, 0, len(d.peers))
@@ -158,6 +167,51 @@ func (d *Discovery) Peers() []Peer {
 		if p != nil {
 			out = append(out, *p)
 		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// LivePeers returns strictly those peers whose LastSeen is within PeerTTL
+// and whose underlying Memberlist state is confirmed StateAlive.
+func (d *Discovery) LivePeers() []Peer {
+	if d == nil {
+		return nil
+	}
+	d.mlistMu.RLock()
+	mlist := d.mlist
+	d.mlistMu.RUnlock()
+
+	aliveMap := make(map[string]bool)
+	if mlist != nil {
+		for _, m := range mlist.Members() {
+			if m != nil && m.State == memberlist.StateAlive {
+				aliveMap[m.Name] = true
+			}
+		}
+	}
+
+	ttl := 10 * time.Second
+	if d.cfg != nil && d.cfg.PeerTTL > 0 {
+		ttl = d.cfg.PeerTTL
+	}
+	cutoff := time.Now().Add(-ttl)
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	out := make([]Peer, 0, len(d.peers))
+	for _, p := range d.peers {
+		if p == nil {
+			continue
+		}
+		if p.LastSeen.Before(cutoff) {
+			continue
+		}
+		if mlist != nil && !aliveMap[p.ID] {
+			continue
+		}
+		out = append(out, *p)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
@@ -178,6 +232,9 @@ func (d *Discovery) PeerAddrs() []string {
 
 // PeerByID returns a safe copy of a peer by its ID, or nil if not found.
 func (d *Discovery) PeerByID(id string) *Peer {
+	if d == nil {
+		return nil
+	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	if p, ok := d.peers[id]; ok && p != nil {
@@ -301,11 +358,14 @@ func (d *Discovery) DiscoveredPeers() []telemetry.DiscoveredPeer {
 
 // PeerState queries the SWIM failure detector state for a given peer ID.
 func (d *Discovery) PeerState(peerID string) string {
+	if d == nil {
+		return "unknown"
+	}
 	d.mlistMu.RLock()
 	mlist := d.mlist
 	d.mlistMu.RUnlock()
 	if mlist == nil {
-		return "alive"
+		return "unknown"
 	}
 	for _, m := range mlist.Members() {
 		if m.Name == peerID {
@@ -319,7 +379,7 @@ func (d *Discovery) PeerState(peerID string) string {
 			}
 		}
 	}
-	return "alive"
+	return "unknown"
 }
 
 // APIAddr returns this node's advertised HTTP/HTTPS control plane base URL.
@@ -917,19 +977,114 @@ func (d *Discovery) Run() {
 	}
 }
 
+type seedTracker struct {
+	addr        string
+	resolvedIPs []net.IP
+	consecFails int
+	nextAttempt time.Time
+}
+
+func calculateSeedBackoff(consecFails int) time.Duration {
+	base := 1 * time.Second
+	maxWait := 30 * time.Second
+
+	shift := consecFails
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 5 {
+		shift = 5
+	}
+	wait := base * time.Duration(1<<shift)
+	if wait > maxWait {
+		wait = maxWait
+	}
+
+	// Jitter: Uniform(-0.2*wait, +0.2*wait)
+	jitterDelta := (mrand.Float64() - 0.5) * 0.4 * float64(wait)
+	dur := wait + time.Duration(jitterDelta)
+	if dur < 500*time.Millisecond {
+		dur = 500 * time.Millisecond
+	}
+	return dur
+}
+
+func isSeedAlive(addr string, aliveNodes []*memberlist.Node, peers map[string]*Peer, resolvedIPs ...[]net.IP) bool {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+		portStr = "0"
+	}
+	port, _ := strconv.Atoi(portStr)
+	parsedIP := net.ParseIP(host)
+
+	var extraIPs []net.IP
+	if len(resolvedIPs) > 0 {
+		extraIPs = resolvedIPs[0]
+	}
+
+	for _, m := range aliveNodes {
+		if m == nil {
+			continue
+		}
+		// Direct IP:port match with Memberlist node
+		if parsedIP != nil && m.Addr.Equal(parsedIP) && (port == 0 || int(m.Port) == port) {
+			return true
+		}
+		if m.Addr.String() == host && (port == 0 || int(m.Port) == port) {
+			return true
+		}
+		for _, rip := range extraIPs {
+			if m.Addr.Equal(rip) && (port == 0 || int(m.Port) == port) {
+				return true
+			}
+		}
+		// Match against peer entry for this node
+		if p, ok := peers[m.Name]; ok && p != nil {
+			if p.Addr == addr {
+				return true
+			}
+			pHost, pPortStr, _ := net.SplitHostPort(p.Addr)
+			if parsedIP != nil && net.ParseIP(pHost) != nil && net.ParseIP(pHost).Equal(parsedIP) && (port == 0 || pPortStr == portStr) {
+				return true
+			}
+			if pHost == host && (port == 0 || pPortStr == portStr) {
+				return true
+			}
+			for _, rip := range extraIPs {
+				if net.ParseIP(pHost) != nil && net.ParseIP(pHost).Equal(rip) && (port == 0 || pPortStr == portStr) {
+					return true
+				}
+			}
+		}
+		// Localhost aliases
+		if (host == "localhost" || host == "127.0.0.1" || host == "::1") && (m.Addr.IsLoopback() || m.Addr.String() == "127.0.0.1" || m.Addr.String() == "::1") {
+			if port == 0 || int(m.Port) == port {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (d *Discovery) seedJoinLoop(seedAddrs []string) {
 	defer d.wg.Done()
 
-	// Initial immediate attempt
-	d.attemptSeedJoin(seedAddrs)
+	trackers := make([]*seedTracker, len(seedAddrs))
+	for i, addr := range seedAddrs {
+		trackers[i] = &seedTracker{addr: addr}
+	}
 
-	retryTicker := time.NewTicker(3 * time.Second)
-	defer retryTicker.Stop()
+	// Initial immediate attempt
+	d.evaluateSeedJoins(trackers)
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-retryTicker.C:
-			d.attemptSeedJoin(seedAddrs)
+		case <-ticker.C:
+			d.evaluateSeedJoins(trackers)
 		case <-d.stopCh:
 			return
 		}
@@ -937,6 +1092,14 @@ func (d *Discovery) seedJoinLoop(seedAddrs []string) {
 }
 
 func (d *Discovery) attemptSeedJoin(seedAddrs []string) {
+	trackers := make([]*seedTracker, len(seedAddrs))
+	for i, addr := range seedAddrs {
+		trackers[i] = &seedTracker{addr: addr}
+	}
+	d.evaluateSeedJoins(trackers)
+}
+
+func (d *Discovery) evaluateSeedJoins(trackers []*seedTracker) {
 	d.mlistMu.RLock()
 	mlist := d.mlist
 	d.mlistMu.RUnlock()
@@ -944,34 +1107,68 @@ func (d *Discovery) attemptSeedJoin(seedAddrs []string) {
 		return
 	}
 
-	// Check which seeds are not yet in our peer list
-	var unjoined []string
-	d.mu.RLock()
-	for _, addr := range seedAddrs {
-		found := false
-		for _, p := range d.peers {
-			if p != nil && p.Addr == addr {
-				found = true
-				break
-			}
+	// Gather nodes confirmed StateAlive in Memberlist
+	allMembers := mlist.Members()
+	aliveNodes := make([]*memberlist.Node, 0, len(allMembers))
+	for _, m := range allMembers {
+		if m != nil && m.State == memberlist.StateAlive && m.Name != d.nodeID {
+			aliveNodes = append(aliveNodes, m)
 		}
-		if !found {
-			unjoined = append(unjoined, addr)
+	}
+
+	d.mu.RLock()
+	peersCopy := make(map[string]*Peer, len(d.peers))
+	for k, v := range d.peers {
+		if v != nil {
+			peersCopy[k] = v
 		}
 	}
 	d.mu.RUnlock()
 
-	if len(unjoined) == 0 {
-		return
-	}
+	now := time.Now()
+	for _, t := range trackers {
+		if len(t.resolvedIPs) == 0 {
+			host, _, err := net.SplitHostPort(t.addr)
+			if err != nil {
+				host = t.addr
+			}
+			if net.ParseIP(host) == nil && host != "localhost" {
+				if ips, err := net.LookupIP(host); err == nil {
+					t.resolvedIPs = ips
+				}
+			}
+		}
 
-	d.seedJoinAttempts.Add(1)
-	numJoined, err := mlist.Join(unjoined)
-	if err != nil {
-		log.Printf("[DISCOVERY:WARN] seed join attempt to %v failed: %v", unjoined, err)
-	} else if numJoined > 0 {
-		d.seedJoinSuccesses.Add(uint64(numJoined))
-		log.Printf("[DISCOVERY:JOIN] joined %d/%d seed peers", numJoined, len(unjoined))
+		if isSeedAlive(t.addr, aliveNodes, peersCopy, t.resolvedIPs) {
+			t.consecFails = 0
+			t.nextAttempt = time.Time{}
+			continue
+		}
+
+		if !t.nextAttempt.IsZero() && now.Before(t.nextAttempt) {
+			continue
+		}
+
+		d.seedJoinAttempts.Add(1)
+		numJoined, err := mlist.Join([]string{t.addr})
+		if err != nil || numJoined == 0 {
+			t.consecFails++
+			backoff := calculateSeedBackoff(t.consecFails)
+			t.nextAttempt = now.Add(backoff)
+			var joinErr error = err
+			if joinErr == nil {
+				joinErr = errors.New("0 seed nodes joined")
+			}
+			if t.consecFails <= 3 || t.consecFails%5 == 0 {
+				log.Printf("[DISCOVERY:WARN] seed join to %s failed (attempt %d, retry in %v): %v",
+					t.addr, t.consecFails, backoff.Round(100*time.Millisecond), joinErr)
+			}
+		} else if numJoined > 0 {
+			d.seedJoinSuccesses.Add(uint64(numJoined))
+			t.consecFails = 0
+			t.nextAttempt = time.Time{}
+			log.Printf("[DISCOVERY:JOIN] successfully joined static seed peer %s", t.addr)
+		}
 	}
 }
 
@@ -986,14 +1183,19 @@ func (d *Discovery) refreshActiveMembers() {
 	now := time.Now()
 	members := mlist.Members()
 	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	for _, m := range members {
 		if m != nil && m.Name != d.nodeID {
-			if p, ok := d.peers[m.Name]; ok {
-				p.LastSeen = now
+			// CRITICAL: Only refresh LastSeen if the member is strictly ALIVE.
+			// Suspect or Dead members retained during tombstone reaping must decay.
+			if m.State == memberlist.StateAlive {
+				if p, ok := d.peers[m.Name]; ok {
+					p.LastSeen = now
+				}
 			}
 		}
 	}
-	d.mu.Unlock()
 }
 
 func (d *Discovery) beaconRecvLoop(conn *net.UDPConn) {
@@ -1175,16 +1377,18 @@ func (d *Discovery) sendBeaconNow() {
 
 // prune removes peers that have not been refreshed within PeerTTL and cleans up join throttles.
 func (d *Discovery) prune() {
-	if d.cfg.PeerTTL > 0 {
-		cutoff := time.Now().Add(-d.cfg.PeerTTL)
-		d.mu.Lock()
-		for id, p := range d.peers {
-			if p.LastSeen.Before(cutoff) {
-				delete(d.peers, id)
-			}
-		}
-		d.mu.Unlock()
+	ttl := 10 * time.Second
+	if d.cfg != nil && d.cfg.PeerTTL > 0 {
+		ttl = d.cfg.PeerTTL
 	}
+	cutoff := time.Now().Add(-ttl)
+	d.mu.Lock()
+	for id, p := range d.peers {
+		if p == nil || p.LastSeen.Before(cutoff) {
+			delete(d.peers, id)
+		}
+	}
+	d.mu.Unlock()
 
 	// Evict join throttle cache entries older than 10 seconds
 	throttleCutoff := time.Now().Add(-10 * time.Second)
