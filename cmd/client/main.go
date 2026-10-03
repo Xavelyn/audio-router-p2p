@@ -10,7 +10,6 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"fmt"
 	"log"
 	"math/big"
 	"net"
@@ -34,6 +33,7 @@ import (
 	"github.com/audio-router-p2p/pkg/telemetry"
 	"github.com/audio-router-p2p/pkg/transport"
 	"strconv"
+	"strings"
 )
 
 func main() {
@@ -108,37 +108,12 @@ func main() {
 
 	localIPs := collectLocalIPs(trans, disc)
 	streams := newStreamManager(cfg, trans, localIPs, disc)
-	for _, route := range rt.List() {
-		if err := streams.StartRoute(route); err != nil {
-			log.Printf("route %s: %v", route.ID, err)
-		}
-	}
 
 	// Room Manager
 	roomMgr := group.NewDefaultRoomManager(cfg, disc, sm, trans)
 	roomMgr.SetRouter(rt)
 	roomMgr.SetStreamManager(streams)
-	if err := roomMgr.Load(cfg.RoomsFile); err != nil && !errors.Is(err, os.ErrNotExist) {
-		log.Printf("load rooms from %s: %v", cfg.RoomsFile, err)
-	}
-	if cfg.RoomAutoJoin || cfg.RoomID != "" {
-		roomID := cfg.RoomID
-		if roomID == "" {
-			roomID = "default"
-		}
-		roomName := cfg.RoomName
-		if roomName == "" {
-			roomName = "Default Room"
-		}
-		if _, err := roomMgr.CreateRoom(roomID, roomName); err != nil {
-			log.Printf("auto-create room %s: %v", roomID, err)
-		}
-		if err := roomMgr.JoinRoom(roomID); err != nil {
-			log.Printf("auto-join room %s: %v", roomID, err)
-		} else {
-			log.Printf("auto-joined room %s (%s)", roomID, roomName)
-		}
-	}
+	disc.SetStateDelegate(roomMgr)
 
 	// HTTP API.
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
@@ -179,10 +154,62 @@ func main() {
 		}()
 	}
 
+	// Asynchronous route activation and room synchronization in background goroutine.
+	// This ensures the HTTP server and management Web UI are immediately reachable
+	// even if physical audio soundcards or drivers hang during device opening.
+	bootCtx, cancelBoot := context.WithCancel(context.Background())
+	defer cancelBoot()
+
+	go func() {
+		log.Printf("Starting asynchronous route and room initialization...")
+		for _, route := range rt.List() {
+			if bootCtx.Err() != nil {
+				return
+			}
+			if err := streams.StartRoute(route); err != nil {
+				log.Printf("route %s: %v", route.ID, err)
+			}
+		}
+
+		if bootCtx.Err() != nil {
+			return
+		}
+
+		if err := roomMgr.Load(cfg.RoomsFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("load rooms from %s: %v", cfg.RoomsFile, err)
+		}
+		if bootCtx.Err() != nil {
+			return
+		}
+		if cfg.RoomAutoJoin || cfg.RoomID != "" {
+			roomID := cfg.RoomID
+			if roomID == "" {
+				roomID = "default"
+			}
+			roomName := cfg.RoomName
+			if roomName == "" {
+				roomName = "Default Room"
+			}
+			if _, err := roomMgr.CreateRoom(roomID, roomName); err != nil {
+				log.Printf("auto-create room %s: %v", roomID, err)
+			}
+			if bootCtx.Err() != nil {
+				return
+			}
+			if err := roomMgr.JoinRoom(roomID); err != nil {
+				log.Printf("auto-join room %s: %v", roomID, err)
+			} else {
+				log.Printf("auto-joined room %s (%s)", roomID, roomName)
+			}
+		}
+		log.Printf("Asynchronous route and room initialization complete")
+	}()
+
 	// Graceful shutdown.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
+	cancelBoot()
 	log.Println("Shutting down...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
@@ -332,8 +359,8 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	if sr.Channels < 1 {
 		sr.Channels = 1
 	}
-	log.Printf("[STREAM:MGR] StartRoute called: routeID=%s srcURN=%q dstURN=%q peerID=%q dests=%v sr=%d ch=%d",
-		sr.ID, sr.SourceDeviceURN, sr.DestDeviceURN, sr.PeerID, sr.Destinations, sr.SampleRate, sr.Channels)
+	log.Printf("[STREAM:MGR] StartRoute called: routeID=%s srcNode=%q srcURN=%q dstNode=%q dstURN=%q peerID=%q dests=%v sr=%d ch=%d",
+		sr.ID, sr.SourceNodeID, sr.SourceDeviceURN, sr.PeerID, sr.DestDeviceURN, sr.PeerID, sr.Destinations, sr.SampleRate, sr.Channels)
 
 	if old, ok := m.routes[sr.ID]; ok {
 		log.Printf("[STREAM:MGR] Stopping pre-existing stream for route=%s", sr.ID)
@@ -341,47 +368,129 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		delete(m.routes, sr.ID)
 	}
 
+	localNodeID := ""
+	if m.disc != nil {
+		localNodeID = m.disc.NodeID()
+	}
+
+	isRemoteSource := sr.SourceNodeID != "" && sr.SourceNodeID != "local" && (localNodeID == "" || sr.SourceNodeID != localNodeID)
+	isLocalDest := sr.PeerID == "" || sr.PeerID == "local" || (localNodeID != "" && sr.PeerID == localNodeID)
+
+	// Ingress route: remote audio source sending to our local output device.
+	if isRemoteSource && isLocalDest {
+		dstRef := sr.DestDeviceURN
+		if dstRef == "" {
+			dstRef = strconv.Itoa(sr.DestDevice)
+		}
+		log.Printf("[STREAM:MGR] Opening local output device ref=%q for ingress route=%s from sourceNode=%s", dstRef, sr.ID, sr.SourceNodeID)
+		out := openOutputWithTimeout(m.resolver, dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator, 2*time.Second)
+
+		streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
+		st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, localNodeID)
+		if err != nil {
+			if out != nil {
+				_ = out.Close()
+			}
+			log.Printf("[STREAM:MGR] ERROR creating Streamer for ingress route=%s: %v", sr.ID, err)
+			return err
+		}
+
+		// Bind deterministic StreamID derived from auth token and route ID so incoming packets match
+		st.SetStreamID(streamer.DeriveStreamID(m.cfg.AuthToken, sr.ID))
+
+		if err := st.Start(nil, nil, out); err != nil {
+			if out != nil {
+				_ = out.Close()
+			}
+			log.Printf("[STREAM:MGR] ERROR starting Streamer for ingress route=%s: %v", sr.ID, err)
+			return err
+		}
+
+		if m.hub != nil {
+			tap := m.hub.RegisterTap(sr.ID, sr.Channels)
+			st.SetAudioTap(tap)
+			log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to ingress route=%s (%d channels)", sr.ID, sr.Channels)
+		}
+
+		m.routes[sr.ID] = &activeStream{route: sr, st: st, in: nil, out: out}
+		log.Printf("[STREAM:MGR] Ingress route %s active: receiving from node %s -> local output %s", sr.ID, sr.SourceNodeID, dstRef)
+		return nil
+	}
+
 	srcRef := sr.SourceDeviceURN
 	if srcRef == "" {
 		srcRef = strconv.Itoa(sr.SourceDevice)
 	}
 
-	in, err := m.resolver.OpenInput(srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
-	if err != nil {
-		log.Printf("[STREAM:MGR] ERROR opening input device %s: %v", srcRef, err)
-		return fmt.Errorf("open input device %s: %w", srcRef, err)
-	}
+	in := openInputWithTimeout(m.resolver, srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator, 2*time.Second)
 
 	var out audio.AudioStream
-	destAddrs := sr.Destinations
+	var destAddrs []string
 
-	// If route has a peer ID, try to bind to that peer
-	if sr.PeerID != "" && sr.PeerID != "local" {
-		if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
-			// Use peer's stream address if available
-			if !contains(destAddrs, peer.StreamAddr) {
-				destAddrs = append(destAddrs, peer.StreamAddr)
-			}
-			// Update route with peer info for persistence
-			sr.PeerAddr = peer.StreamAddr
+	// If route targets a remote peer, resolve peer's stream address (host:port)
+	if sr.PeerID != "" && sr.PeerID != "local" && (localNodeID == "" || sr.PeerID != localNodeID) {
+		resolved, err := streamer.ResolvePeerDestination(sr, m.disc, m.cfg.StreamPort)
+		if err == nil && resolved != "" {
+			destAddrs = append(destAddrs, resolved)
+			sr.PeerAddr = resolved
+		} else {
+			log.Printf("[STREAM:MGR] WARN: could not resolve peer %s: %v", sr.PeerID, err)
 		}
-	} else if len(destAddrs) > 0 {
-		// Try to match destinations to discovered peers
-		for i, dest := range destAddrs {
-			if peer := m.disc.PeerByAddr(dest); peer != nil && peer.StreamAddr != "" {
-				destAddrs[i] = peer.StreamAddr
-				if sr.PeerID == "" {
-					sr.PeerID = peer.ID
+	}
+
+	// Normalize any additional configured destinations, ensuring valid host:port
+	for _, d := range sr.Destinations {
+		if d == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(d); err == nil {
+			if !contains(destAddrs, d) {
+				destAddrs = append(destAddrs, d)
+			}
+			continue
+		}
+		// Try resolving through discovery if it matches a peer ID or peer Addr
+		if m.disc != nil {
+			if p := m.disc.PeerByID(d); p != nil {
+				if p.StreamAddr != "" {
+					if _, _, err := net.SplitHostPort(p.StreamAddr); err == nil {
+						if !contains(destAddrs, p.StreamAddr) {
+							destAddrs = append(destAddrs, p.StreamAddr)
+						}
+						continue
+					}
+				}
+				host, _, _ := net.SplitHostPort(p.Addr)
+				if host == "" {
+					host = p.Addr
+				}
+				if host != "" {
+					port := strings.TrimPrefix(m.cfg.StreamPort, ":")
+					if port == "" {
+						port = "45678"
+					}
+					joined := net.JoinHostPort(host, port)
+					if !contains(destAddrs, joined) {
+						destAddrs = append(destAddrs, joined)
+					}
+					continue
 				}
 			}
+		}
+		// Bare host without port
+		port := strings.TrimPrefix(m.cfg.StreamPort, ":")
+		if port == "" {
+			port = "45678"
+		}
+		joined := net.JoinHostPort(d, port)
+		if !contains(destAddrs, joined) {
+			destAddrs = append(destAddrs, joined)
 		}
 	}
 
 	hasLocalDest := false
-	if sr.PeerID == "local" || sr.PeerID == "" {
-		if sr.DestDeviceURN != "" || sr.DestDevice >= 0 {
-			hasLocalDest = true
-		}
+	if isLocalDest && (sr.DestDeviceURN != "" || sr.DestDevice >= 0) {
+		hasLocalDest = true
 	}
 	for _, d := range destAddrs {
 		if destIsLocal(d, m.localIPs) {
@@ -396,13 +505,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			dstRef = strconv.Itoa(sr.DestDevice)
 		}
 		log.Printf("[STREAM:MGR] Opening local output device ref=%q for route=%s", dstRef, sr.ID)
-		out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
-		if err != nil {
-			_ = in.Close()
-			log.Printf("[STREAM:MGR] ERROR opening local output device %s: %v", dstRef, err)
-			return fmt.Errorf("open local output device %s: %w", dstRef, err)
-		}
-		log.Printf("[STREAM:MGR] Successfully opened local output device ref=%q for route=%s", dstRef, sr.ID)
+		out = openOutputWithTimeout(m.resolver, dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator, 2*time.Second)
 
 		if len(destAddrs) == 0 {
 			destAddrs = []string{"127.0.0.1:45678"}
@@ -410,17 +513,22 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
-	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, m.disc.NodeID())
+	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, localNodeID)
 	if err != nil {
-		_ = in.Close()
+		if in != nil {
+			_ = in.Close()
+		}
 		if out != nil {
 			_ = out.Close()
 		}
 		log.Printf("[STREAM:MGR] ERROR creating Streamer for route=%s: %v", sr.ID, err)
 		return err
 	}
+	st.SetStreamID(streamer.DeriveStreamID(m.cfg.AuthToken, sr.ID))
 	if err := st.Start(in, destAddrs, out); err != nil {
-		_ = in.Close()
+		if in != nil {
+			_ = in.Close()
+		}
 		if out != nil {
 			_ = out.Close()
 		}
@@ -441,11 +549,80 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		log.Printf("[STREAM:MGR] [AUDIO:METER] WARN: hub is nil when starting route=%s; tap will be bound retroactively once hub attaches", sr.ID)
 	}
 
-	// Save the potentially updated route (with peer binding)
+	// Save the potentially updated route (with peer binding and validated destinations)
+	sr.Destinations = destAddrs
 	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out}
 	log.Printf("[STREAM:MGR] route %s: streaming device %s -> %d destinations (peer: %s, hasLocalOut: %t)",
 		sr.ID, srcRef, len(destAddrs), sr.PeerID, out != nil)
 	return nil
+}
+
+func openInputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRate, channels int, useEmulator bool, timeout time.Duration) audio.AudioStream {
+	if resolver == nil {
+		return audio.NewGhostAudioStream(sampleRate, channels)
+	}
+	type res struct {
+		stream audio.AudioStream
+		err    error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		st, err := resolver.OpenInput(ref, sampleRate, channels, useEmulator)
+		ch <- res{stream: st, err: err}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			log.Printf("[STREAM:MGR] WARN: OpenInput(%s) error: %v, falling back to GhostAudioStream", ref, r.err)
+			return audio.NewGhostAudioStream(sampleRate, channels)
+		}
+		return r.stream
+	case <-time.After(timeout):
+		log.Printf("[STREAM:MGR] WARN: OpenInput(%s) timed out after %v, falling back to GhostAudioStream", ref, timeout)
+		go func() {
+			r := <-ch
+			if r.stream != nil {
+				log.Printf("[STREAM:MGR] Closing late-opened input device %s after timeout", ref)
+				_ = r.stream.Close()
+			}
+		}()
+		return audio.NewGhostAudioStream(sampleRate, channels)
+	}
+}
+
+func openOutputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRate, channels int, useEmulator bool, timeout time.Duration) audio.AudioStream {
+	if resolver == nil {
+		return audio.NewGhostAudioStream(sampleRate, channels)
+	}
+	type res struct {
+		stream audio.AudioStream
+		err    error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		st, err := resolver.OpenOutput(ref, sampleRate, channels, useEmulator)
+		ch <- res{stream: st, err: err}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			log.Printf("[STREAM:MGR] WARN: OpenOutput(%s) error: %v, falling back to GhostAudioStream", ref, r.err)
+			return audio.NewGhostAudioStream(sampleRate, channels)
+		}
+		return r.stream
+	case <-time.After(timeout):
+		log.Printf("[STREAM:MGR] WARN: OpenOutput(%s) timed out after %v, falling back to GhostAudioStream", ref, timeout)
+		go func() {
+			r := <-ch
+			if r.stream != nil {
+				log.Printf("[STREAM:MGR] Closing late-opened output device %s after timeout", ref)
+				_ = r.stream.Close()
+			}
+		}()
+		return audio.NewGhostAudioStream(sampleRate, channels)
+	}
 }
 
 // StopRoute stops and releases a route's streams.

@@ -327,6 +327,22 @@ func (a *localClusterNodeAdapter) ActiveStreams() int {
 	return 0
 }
 
+func (a *localClusterNodeAdapter) ExportCRDTRooms() ([]byte, error) {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ ExportCRDTRooms() ([]byte, error) }); ok {
+		return syncer.ExportCRDTRooms()
+	}
+	return nil, fmt.Errorf("crdt room sync not supported")
+}
+
+func (a *localClusterNodeAdapter) MergeCRDTRooms(data []byte) error {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ MergeCRDTRooms([]byte) error }); ok {
+		return syncer.MergeCRDTRooms(data)
+	}
+	return fmt.Errorf("crdt room sync not supported")
+}
+
 type clusterDiscoveryAdapter struct {
 	disc *discovery.Discovery
 }
@@ -603,6 +619,22 @@ func (a *v1RoomManagerAdapter) SetOutputGain(roomID, deviceID string, gain float
 	return nil
 }
 
+func (a *v1RoomManagerAdapter) ExportCRDTRooms() ([]byte, error) {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ ExportCRDTRooms() ([]byte, error) }); ok {
+		return syncer.ExportCRDTRooms()
+	}
+	return nil, fmt.Errorf("crdt room sync not supported")
+}
+
+func (a *v1RoomManagerAdapter) MergeCRDTRooms(data []byte) error {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ MergeCRDTRooms([]byte) error }); ok {
+		return syncer.MergeCRDTRooms(data)
+	}
+	return fmt.Errorf("crdt room sync not supported")
+}
+
 // Handler returns the fully-wrapped HTTP handler with CORS, body size limiting, metrics, and panic recovery.
 func (s *Server) Handler() http.Handler {
 	return s.cors(s.recoverPanic(s.metrics(s.maxBytes(s.mux))))
@@ -647,6 +679,9 @@ func (s *Server) routes() {
 
 	// 3. Canonical OpenAPI 3.1 V1 endpoints
 	s.V1().MountRoutes(s.mux)
+
+	// 4. Embedded SPA Web UI serving with fallback
+	s.mountSPAHandler()
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

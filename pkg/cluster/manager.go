@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -28,6 +29,12 @@ type LocalNodeProvider interface {
 	UpdateDeviceState(id string, vol *float64, muted *bool) (AudioDeviceSummary, bool)
 	HealthSnapshot() *telemetry.NetworkHealthSnapshot
 	ActiveStreams() int
+}
+
+// RoomSyncProvider allows anti-entropy room synchronization across mesh nodes (ADR 0017).
+type RoomSyncProvider interface {
+	ExportCRDTRooms() ([]byte, error)
+	MergeCRDTRooms(data []byte) error
 }
 
 // DiscoveryProvider provides mesh topology and gossip state.
@@ -609,6 +616,26 @@ func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterN
 
 	// Success: reset failures and clear circuit
 	m.recordSuccess(peer.ID)
+
+	// 3. Scrape GET /api/v1/cluster/rooms for HTTP anti-entropy room synchronization (ADR 0017)
+	if syncer, ok := m.local.(RoomSyncProvider); ok && syncer != nil {
+		roomsURL := strings.TrimRight(peer.APIAddr, "/") + "/api/v1/cluster/rooms"
+		rReq, err := http.NewRequestWithContext(ctx, http.MethodGet, roomsURL, nil)
+		if err == nil {
+			if m.cfg.AuthToken != "" {
+				rReq.Header.Set("Authorization", "Bearer "+m.cfg.AuthToken)
+			}
+			if rResp, err := m.httpClient.Do(rReq); err == nil {
+				if rResp.StatusCode == http.StatusOK {
+					var body bytes.Buffer
+					if _, err := io.Copy(&body, io.LimitReader(rResp.Body, 1<<20)); err == nil {
+						_ = syncer.MergeCRDTRooms(body.Bytes())
+					}
+				}
+				_ = rResp.Body.Close()
+			}
+		}
+	}
 
 	peerDevices := make([]AudioDeviceSummary, len(rawDevices))
 	for i, d := range rawDevices {

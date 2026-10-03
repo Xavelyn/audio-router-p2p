@@ -176,7 +176,18 @@ func generateRoomID() string {
 func (r *Room) ID() RoomID { return r.id }
 
 // Name returns the room name
-func (r *Room) Name() string { return r.name }
+func (r *Room) Name() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.name
+}
+
+// SetName safely updates the room display name.
+func (r *Room) SetName(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.name = name
+}
 
 // State returns the current room state
 func (r *Room) State() RoomState { return r.state.Load().(RoomState) }

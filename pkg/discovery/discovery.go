@@ -80,16 +80,18 @@ type Discovery struct {
 	cfg    *config.Config
 	nodeID string
 
-	mu         sync.RWMutex
-	peers      map[string]*Peer
-	ownAddr    string
-	ownAPIAddr string
-	ownSync    string
-	ownStream  string
-	boundPort  int
+	mu            sync.RWMutex
+	peers         map[string]*Peer
+	ownAddr       string
+	ownAPIAddr    string
+	ownSync       string
+	ownStream     string
+	boundPort     int
+	stateDelegate StateDelegate
 
-	mlistMu sync.RWMutex
-	mlist   *memberlist.Memberlist
+	mlistMu    sync.RWMutex
+	mlist      *memberlist.Memberlist
+	broadcasts *memberlist.TransmitLimitedQueue
 
 	sockMu      sync.RWMutex
 	bcastAddrs  []*net.UDPAddr
@@ -624,6 +626,17 @@ func (d *Discovery) setup() error {
 
 	d.mlistMu.Lock()
 	d.mlist = mlist
+	d.broadcasts = &memberlist.TransmitLimitedQueue{
+		NumNodes: func() int {
+			d.mlistMu.RLock()
+			defer d.mlistMu.RUnlock()
+			if d.mlist != nil {
+				return d.mlist.NumMembers()
+			}
+			return 1
+		},
+		RetransmitMult: 3,
+	}
 	d.mlistMu.Unlock()
 
 	bcastStrs := make([]string, 0, len(bcastAddrs))
@@ -720,21 +733,95 @@ func (d *Discovery) NodeMeta(limit int) []byte {
 	return b
 }
 
+// StateDelegate enables external state synchronization (e.g. CRDT room replication)
+// over Memberlist gossip and TCP push/pull.
+type StateDelegate interface {
+	GetBroadcasts(overhead, limit int) [][]byte
+	NotifyMsg(msg []byte)
+	LocalState(join bool) []byte
+	MergeRemoteState(buf []byte, join bool)
+}
+
+// SimpleBroadcast implements memberlist.Broadcast.
+type SimpleBroadcast struct {
+	Msg []byte
+}
+
+func (b *SimpleBroadcast) Invalidates(other memberlist.Broadcast) bool { return false }
+func (b *SimpleBroadcast) Message() []byte                             { return b.Msg }
+func (b *SimpleBroadcast) Finished()                                   {}
+
+// SetStateDelegate attaches a state delegate for distributed CRDT replication.
+func (d *Discovery) SetStateDelegate(sd StateDelegate) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.stateDelegate = sd
+}
+
+// Broadcast queues a message to be piggybacked onto outbound Memberlist SWIM gossip.
+func (d *Discovery) Broadcast(msg []byte) {
+	if d == nil {
+		return
+	}
+	d.mlistMu.RLock()
+	bcast := d.broadcasts
+	d.mlistMu.RUnlock()
+	if bcast != nil {
+		bcast.QueueBroadcast(&SimpleBroadcast{Msg: msg})
+	}
+}
+
 // NotifyMsg receives user-data broadcast gossip frames.
-func (d *Discovery) NotifyMsg([]byte) {}
+func (d *Discovery) NotifyMsg(buf []byte) {
+	d.mu.RLock()
+	sd := d.stateDelegate
+	d.mu.RUnlock()
+	if sd != nil {
+		sd.NotifyMsg(buf)
+	}
+}
 
 // GetBroadcasts returns pending user broadcast messages to piggyback onto outgoing SWIM pings.
 func (d *Discovery) GetBroadcasts(overhead, limit int) [][]byte {
-	return nil
+	var msgs [][]byte
+	d.mlistMu.RLock()
+	bcast := d.broadcasts
+	d.mlistMu.RUnlock()
+	if bcast != nil {
+		msgs = bcast.GetBroadcasts(overhead, limit)
+	}
+	d.mu.RLock()
+	sd := d.stateDelegate
+	d.mu.RUnlock()
+	if sd != nil {
+		extra := sd.GetBroadcasts(overhead, limit)
+		if len(extra) > 0 {
+			msgs = append(msgs, extra...)
+		}
+	}
+	return msgs
 }
 
 // LocalState is invoked for TCP push/pull state transfers.
 func (d *Discovery) LocalState(join bool) []byte {
+	d.mu.RLock()
+	sd := d.stateDelegate
+	d.mu.RUnlock()
+	if sd != nil {
+		return sd.LocalState(join)
+	}
 	return nil
 }
 
 // MergeRemoteState is invoked after a TCP push/pull state transfer.
-func (d *Discovery) MergeRemoteState(buf []byte, join bool) {}
+func (d *Discovery) MergeRemoteState(buf []byte, join bool) {
+	d.mu.RLock()
+	sd := d.stateDelegate
+	d.mu.RUnlock()
+	if sd != nil {
+		sd.MergeRemoteState(buf, join)
+	}
+}
 
 // NotifyAlive validates an incoming node alive message using constant-time token comparison.
 func (d *Discovery) NotifyAlive(peer *memberlist.Node) error {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -186,4 +187,61 @@ func (s *V1Server) handlePatchClusterNodeDevice(w http.ResponseWriter, r *http.R
 	}
 
 	s.WriteJSON(w, http.StatusOK, resp)
+}
+
+// handleClusterRooms handles GET /api/v1/cluster/rooms and POST /api/v1/cluster/rooms for CRDT anti-entropy.
+func (s *V1Server) handleClusterRooms(w http.ResponseWriter, r *http.Request) {
+	if s.roomMgr == nil {
+		s.WriteError(w, http.StatusServiceUnavailable, "ERR_NO_ROOM_MANAGER", "room manager not configured")
+		return
+	}
+
+	syncer, isSyncer := s.roomMgr.(interface {
+		ExportCRDTRooms() ([]byte, error)
+		MergeCRDTRooms([]byte) error
+	})
+
+	switch r.Method {
+	case http.MethodGet:
+		if isSyncer {
+			data, err := syncer.ExportCRDTRooms()
+			if err != nil {
+				s.WriteError(w, http.StatusInternalServerError, "ERR_CRDT_EXPORT", err.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
+			return
+		}
+		// Fallback to standard room list
+		rooms := s.roomMgr.ListRooms()
+		s.WriteJSON(w, http.StatusOK, rooms)
+
+	case http.MethodPost:
+		if !isSyncer {
+			s.WriteError(w, http.StatusNotImplemented, "ERR_NOT_SUPPORTED", "CRDT room synchronization not supported")
+			return
+		}
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
+		if err != nil {
+			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
+			return
+		}
+		if err := syncer.MergeCRDTRooms(body); err != nil {
+			s.WriteError(w, http.StatusBadRequest, "ERR_MERGE_FAILED", err.Error())
+			return
+		}
+		data, err := syncer.ExportCRDTRooms()
+		if err != nil {
+			s.WriteError(w, http.StatusInternalServerError, "ERR_CRDT_EXPORT", err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(data)
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }

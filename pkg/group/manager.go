@@ -104,14 +104,21 @@ type managedRoom struct {
 
 // PersistedRoom is the file-backed format for serializing audio room state.
 type PersistedRoom struct {
-	ID          string             `json:"id"`
-	Name        string             `json:"name"`
-	Leader      string             `json:"leader"`
-	Inputs      []string           `json:"inputs"`
-	Outputs     []string           `json:"outputs"`
-	Synced      bool               `json:"synced"`
-	InputGains  map[string]float64 `json:"input_gains,omitempty"`
-	OutputGains map[string]float64 `json:"output_gains,omitempty"`
+	ID            string             `json:"id"`
+	Name          string             `json:"name"`
+	Leader        string             `json:"leader"`
+	Inputs        []string           `json:"inputs"`
+	Outputs       []string           `json:"outputs"`
+	Synced        bool               `json:"synced"`
+	InputGains    map[string]float64 `json:"input_gains,omitempty"`
+	OutputGains   map[string]float64 `json:"output_gains,omitempty"`
+	Timestamp     HLT                `json:"ts,omitempty"`
+	Deleted       bool               `json:"deleted,omitempty"`
+	DeletedAt     int64              `json:"deleted_at,omitempty"`
+	InputAdds     map[string]HLT     `json:"input_adds,omitempty"`
+	InputRemoves  map[string]HLT     `json:"input_removes,omitempty"`
+	OutputAdds    map[string]HLT     `json:"output_adds,omitempty"`
+	OutputRemoves map[string]HLT     `json:"output_removes,omitempty"`
 }
 
 // DefaultRoomManager coordinates room lifecycles, discovery presence, deterministic
@@ -128,6 +135,7 @@ type DefaultRoomManager struct {
 
 	roomsFile string
 	rooms     map[string]*managedRoom
+	crdt      *LWWSet
 	closed    bool
 
 	// OnLeaderChange is an optional notification hook for testing or external monitoring.
@@ -135,6 +143,7 @@ type DefaultRoomManager struct {
 }
 
 var _ api.RoomManager = (*DefaultRoomManager)(nil)
+var _ discovery.StateDelegate = (*DefaultRoomManager)(nil)
 
 // NewDefaultRoomManager creates an initialized DefaultRoomManager.
 func NewDefaultRoomManager(
@@ -163,7 +172,12 @@ func NewDefaultRoomManager(
 		}
 	}
 
-	return &DefaultRoomManager{
+	localNodeID := ""
+	if disc != nil {
+		localNodeID = disc.NodeID()
+	}
+
+	mgr := &DefaultRoomManager{
 		cfg:         cfg,
 		disc:        disc,
 		syncMgr:     syncMgr,
@@ -171,7 +185,12 @@ func NewDefaultRoomManager(
 		devProvider: dp,
 		roomsFile:   roomsFile,
 		rooms:       make(map[string]*managedRoom),
+		crdt:        NewLWWSet(localNodeID),
 	}
+	if disc != nil {
+		disc.SetStateDelegate(mgr)
+	}
+	return mgr
 }
 
 // SetRouter configures the router and propagates it to all active managed rooms.
@@ -264,9 +283,14 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 		id = generateRoomID()
 	}
 
+	rec := m.crdt.CreateRoom(id, name)
+
 	if mr, ok := m.rooms[id]; ok {
+		mr.room.SetName(name)
 		info := m.roomInfoLocked(mr.room)
 		m.mu.Unlock()
+		m.broadcastDelta(rec)
+		_ = m.Save()
 		return info, nil
 	}
 
@@ -306,16 +330,21 @@ func (m *DefaultRoomManager) CreateRoom(id, name string) (api.RoomInfo, error) {
 	info := m.roomInfoLocked(room)
 	m.mu.Unlock()
 
+	m.broadcastDelta(rec)
 	_ = m.Save()
 	return info, nil
 }
 
 // DeleteRoom removes a room, tears down any active stream, cleans up routes, and persists.
 func (m *DefaultRoomManager) DeleteRoom(id string) error {
+	rec, _ := m.crdt.DeleteRoom(id)
+
 	m.mu.Lock()
 	mr, ok := m.rooms[id]
 	if !ok {
 		m.mu.Unlock()
+		m.broadcastDelta(rec)
+		_ = m.Save()
 		return fmt.Errorf("room %s not found", id)
 	}
 	gs := mr.streamer
@@ -328,6 +357,7 @@ func (m *DefaultRoomManager) DeleteRoom(id string) error {
 		gs.Stop()
 	}
 	_ = mr.room.Leave()
+	m.broadcastDelta(rec)
 	_ = m.Save()
 	return nil
 }
@@ -342,6 +372,9 @@ func (m *DefaultRoomManager) AddInput(roomID, deviceID string) error {
 	}
 	if err := mr.room.AddInput(deviceID); err != nil {
 		return err
+	}
+	if rec, err := m.crdt.AddInput(roomID, deviceID); err == nil {
+		m.broadcastDelta(rec)
 	}
 	_ = m.Save()
 	return nil
@@ -358,6 +391,9 @@ func (m *DefaultRoomManager) RemoveInput(roomID, deviceID string) error {
 	if err := mr.room.RemoveInput(deviceID); err != nil {
 		return err
 	}
+	if rec, err := m.crdt.RemoveInput(roomID, deviceID); err == nil {
+		m.broadcastDelta(rec)
+	}
 	_ = m.Save()
 	return nil
 }
@@ -372,6 +408,9 @@ func (m *DefaultRoomManager) AddOutput(roomID, deviceID string) error {
 	}
 	if err := mr.room.AddOutput(deviceID); err != nil {
 		return err
+	}
+	if rec, err := m.crdt.AddOutput(roomID, deviceID); err == nil {
+		m.broadcastDelta(rec)
 	}
 	_ = m.Save()
 	return nil
@@ -388,6 +427,9 @@ func (m *DefaultRoomManager) RemoveOutput(roomID, deviceID string) error {
 	if err := mr.room.RemoveOutput(deviceID); err != nil {
 		return err
 	}
+	if rec, err := m.crdt.RemoveOutput(roomID, deviceID); err == nil {
+		m.broadcastDelta(rec)
+	}
 	_ = m.Save()
 	return nil
 }
@@ -402,6 +444,9 @@ func (m *DefaultRoomManager) SetRoomSync(roomID string, synced bool) error {
 	}
 	if err := mr.room.SetRoomSync(synced); err != nil {
 		return err
+	}
+	if rec, err := m.crdt.SetRoomSync(roomID, synced); err == nil {
+		m.broadcastDelta(rec)
 	}
 	_ = m.Save()
 	return nil
@@ -418,6 +463,9 @@ func (m *DefaultRoomManager) SetRoomBindings(roomID string, inputs, outputs []st
 	if err := mr.room.SetRoomBindings(inputs, outputs, synced); err != nil {
 		return err
 	}
+	if rec, err := m.crdt.SetRoomBindings(roomID, inputs, outputs, synced); err == nil {
+		m.broadcastDelta(rec)
+	}
 	_ = m.Save()
 	return nil
 }
@@ -431,6 +479,9 @@ func (m *DefaultRoomManager) SetInputGain(roomID, deviceID string, gain float64)
 		return fmt.Errorf("room %s not found", roomID)
 	}
 	mr.room.SetInputGain(deviceID, gain)
+	if rec, err := m.crdt.SetInputGain(roomID, deviceID, gain); err == nil {
+		m.broadcastDelta(rec)
+	}
 	_ = m.Save()
 	return nil
 }
@@ -444,6 +495,9 @@ func (m *DefaultRoomManager) SetOutputGain(roomID, deviceID string, gain float64
 		return fmt.Errorf("room %s not found", roomID)
 	}
 	mr.room.SetOutputGain(deviceID, gain)
+	if rec, err := m.crdt.SetOutputGain(roomID, deviceID, gain); err == nil {
+		m.broadcastDelta(rec)
+	}
 	_ = m.Save()
 	return nil
 }
@@ -571,12 +625,244 @@ func (m *DefaultRoomManager) handleLeaderChange(roomID RoomID, newLeader string)
 	log.Printf("room manager: room %s leader changed to %s", roomID, newLeader)
 
 	m.mu.RLock()
+	if m.closed {
+		m.mu.RUnlock()
+		return
+	}
 	cb := m.OnLeaderChange
 	m.mu.RUnlock()
+
+	if rec, ok := m.crdt.GetRecord(string(roomID)); ok && rec.Leader == newLeader {
+		if cb != nil {
+			cb(string(roomID), newLeader)
+		}
+		return
+	}
+
+	if rec, err := m.crdt.SetLeader(string(roomID), newLeader); err == nil {
+		m.broadcastDelta(rec)
+		_ = m.Save()
+	}
 
 	if cb != nil {
 		cb(string(roomID), newLeader)
 	}
+}
+
+func (m *DefaultRoomManager) broadcastDelta(rec RoomRecord) {
+	if m.disc == nil {
+		return
+	}
+	buf, err := MarshalCRDTDelta(m.disc.NodeID(), rec)
+	if err == nil {
+		m.disc.Broadcast(buf)
+	}
+}
+
+// CRDT returns the underlying LWWSet CRDT store.
+func (m *DefaultRoomManager) CRDT() *LWWSet {
+	return m.crdt
+}
+
+// applyRecordLocked synchronizes a RoomRecord with the in-memory Room instances.
+// Must be called with m.mu held. Returns any active streamers or rooms that need cleanup after unlock.
+func (m *DefaultRoomManager) applyRecordLocked(rec RoomRecord) (*GroupStreamer, *Room) {
+	if rec.Deleted {
+		if mr, exists := m.rooms[rec.ID]; exists {
+			gs := mr.streamer
+			room := mr.room
+			mr.streamer = nil
+			mr.joined = false
+			delete(m.rooms, rec.ID)
+			return gs, room
+		}
+		return nil, nil
+	}
+
+	mr, exists := m.rooms[rec.ID]
+	if !exists {
+		localPeerID := ""
+		var disc DiscoveryProvider
+		if m.disc != nil {
+			localPeerID = m.disc.NodeID()
+			disc = m.disc
+		}
+		room := NewRoom(RoomConfig{
+			ID:            RoomID(rec.ID),
+			Name:          rec.Name,
+			LocalPeerID:   localPeerID,
+			Config:        m.cfg,
+			Discovery:     disc,
+			SyncManager:   m.syncMgr,
+			Transport:     m.trans,
+			Router:        m.router,
+			StreamManager: m.streamMgr,
+		})
+		roomID := room.ID()
+		room.SetCallbacks(
+			nil,
+			nil,
+			func(newLeader string) {
+				go m.handleLeaderChange(roomID, newLeader)
+			},
+			nil,
+		)
+		if rec.Leader != "" {
+			room.SetLeader(rec.Leader)
+		}
+		for dev, gain := range rec.InputGains {
+			room.SetInputGain(dev, gain)
+		}
+		for dev, gain := range rec.OutputGains {
+			room.SetOutputGain(dev, gain)
+		}
+		room.SetBindings(rec.Inputs, rec.Outputs, rec.Synced)
+
+		m.rooms[rec.ID] = &managedRoom{
+			room: room,
+		}
+		return nil, nil
+	}
+
+	// Update existing room
+	mr.room.SetName(rec.Name)
+	if rec.Leader != "" {
+		mr.room.SetLeader(rec.Leader)
+	}
+	for dev, gain := range rec.InputGains {
+		mr.room.SetInputGain(dev, gain)
+	}
+	for dev, gain := range rec.OutputGains {
+		mr.room.SetOutputGain(dev, gain)
+	}
+	mr.room.SetBindings(rec.Inputs, rec.Outputs, rec.Synced)
+	return nil, nil
+}
+
+// MergeRecord merges a single room delta into the CRDT and reconciles active rooms.
+func (m *DefaultRoomManager) MergeRecord(rec RoomRecord) {
+	merged, changed := m.crdt.MergeRecord(rec)
+	if !changed {
+		return
+	}
+	m.mu.Lock()
+	gs, rm := m.applyRecordLocked(merged)
+	m.mu.Unlock()
+
+	if gs != nil {
+		gs.Stop()
+	}
+	if rm != nil {
+		_ = rm.Leave()
+	}
+	_ = m.Save()
+}
+
+// MergeState merges multiple records into the CRDT and reconciles active rooms.
+func (m *DefaultRoomManager) MergeState(records []RoomRecord) {
+	changedIDs := m.crdt.MergeState(records)
+	if len(changedIDs) == 0 {
+		return
+	}
+	var toStop []*GroupStreamer
+	var toLeave []*Room
+
+	m.mu.Lock()
+	for _, id := range changedIDs {
+		if rec, ok := m.crdt.GetRecord(id); ok {
+			gs, rm := m.applyRecordLocked(rec)
+			if gs != nil {
+				toStop = append(toStop, gs)
+			}
+			if rm != nil {
+				toLeave = append(toLeave, rm)
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	for _, gs := range toStop {
+		gs.Stop()
+	}
+	for _, rm := range toLeave {
+		_ = rm.Leave()
+	}
+	_ = m.Save()
+}
+
+// NotifyMsg receives incoming gossip delta broadcasts from memberlist.
+func (m *DefaultRoomManager) NotifyMsg(buf []byte) {
+	if len(buf) == 0 {
+		return
+	}
+	var delta CRDTDeltaMsg
+	if err := json.Unmarshal(buf, &delta); err == nil && delta.Type == "crdt_room_delta" {
+		m.MergeRecord(delta.Record)
+		return
+	}
+	var state CRDTStateMsg
+	if err := json.Unmarshal(buf, &state); err == nil && state.Type == "crdt_room_state" {
+		m.MergeState(state.Records)
+		return
+	}
+	var records []RoomRecord
+	if err := json.Unmarshal(buf, &records); err == nil {
+		m.MergeState(records)
+		return
+	}
+}
+
+// GetBroadcasts returns pending user broadcast messages (implemented via TransmitLimitedQueue).
+func (m *DefaultRoomManager) GetBroadcasts(overhead, limit int) [][]byte {
+	return nil
+}
+
+// LocalState serializes the full CRDT state (including active tombstones within 72h) for TCP push/pull.
+func (m *DefaultRoomManager) LocalState(join bool) []byte {
+	m.crdt.PruneTombstones()
+	data, err := json.Marshal(m.crdt.ExportState())
+	if err != nil {
+		return nil
+	}
+	return data
+}
+
+// MergeRemoteState deserializes and merges the remote CRDT state after TCP push/pull.
+func (m *DefaultRoomManager) MergeRemoteState(buf []byte, join bool) {
+	if len(buf) == 0 {
+		return
+	}
+	var records []RoomRecord
+	if err := json.Unmarshal(buf, &records); err == nil {
+		m.MergeState(records)
+		return
+	}
+	var state CRDTStateMsg
+	if err := json.Unmarshal(buf, &state); err == nil && state.Type == "crdt_room_state" {
+		m.MergeState(state.Records)
+		return
+	}
+}
+
+// ExportCRDTRooms exports the serialized CRDT room state for HTTP anti-entropy.
+func (m *DefaultRoomManager) ExportCRDTRooms() ([]byte, error) {
+	m.crdt.PruneTombstones()
+	return json.Marshal(m.crdt.ExportState())
+}
+
+// MergeCRDTRooms merges incoming serialized CRDT room state for HTTP anti-entropy.
+func (m *DefaultRoomManager) MergeCRDTRooms(data []byte) error {
+	var records []RoomRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		var state CRDTStateMsg
+		if err2 := json.Unmarshal(data, &state); err2 == nil {
+			records = state.Records
+		} else {
+			return err
+		}
+	}
+	m.MergeState(records)
+	return nil
 }
 
 // GetRoom returns a Room by ID if managed.
@@ -652,7 +938,34 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 		disc = m.disc
 	}
 
+	var records []RoomRecord
 	for id, pr := range persisted {
+		rec := RoomRecord{
+			ID:            id,
+			Name:          pr.Name,
+			Leader:        pr.Leader,
+			Inputs:        pr.Inputs,
+			Outputs:       pr.Outputs,
+			Synced:        pr.Synced,
+			InputGains:    pr.InputGains,
+			OutputGains:   pr.OutputGains,
+			Timestamp:     pr.Timestamp,
+			Deleted:       pr.Deleted,
+			DeletedAt:     pr.DeletedAt,
+			InputAdds:     pr.InputAdds,
+			InputRemoves:  pr.InputRemoves,
+			OutputAdds:    pr.OutputAdds,
+			OutputRemoves: pr.OutputRemoves,
+		}
+		if rec.Timestamp.IsZero() {
+			rec.Timestamp = HLT{WallTime: time.Now().UnixNano(), Counter: 1, NodeID: localPeerID}
+		}
+		records = append(records, rec)
+	}
+	m.crdt.ImportState(records)
+
+	for _, pr := range m.crdt.ListActive() {
+		id := pr.ID
 		if _, exists := m.rooms[id]; exists {
 			continue
 		}
@@ -674,7 +987,7 @@ func (m *DefaultRoomManager) Load(filePath ...string) error {
 			nil,
 			nil,
 			func(newLeader string) {
-				m.handleLeaderChange(roomID, newLeader)
+				go m.handleLeaderChange(roomID, newLeader)
 			},
 			nil,
 		)
@@ -704,18 +1017,26 @@ func (m *DefaultRoomManager) getSnapshot() (string, map[string]PersistedRoom) {
 	if m.roomsFile == "" {
 		return "", nil
 	}
-	snapshot := make(map[string]PersistedRoom, len(m.rooms))
-	for id, mr := range m.rooms {
-		r := mr.room
-		snapshot[id] = PersistedRoom{
-			ID:          string(r.ID()),
-			Name:        r.Name(),
-			Leader:      r.Leader(),
-			Inputs:      r.Inputs(),
-			Outputs:     r.Outputs(),
-			Synced:      r.Synced(),
-			InputGains:  r.InputGains(),
-			OutputGains: r.OutputGains(),
+	m.crdt.PruneTombstones()
+	allRecs := m.crdt.ExportState()
+	snapshot := make(map[string]PersistedRoom, len(allRecs))
+	for _, r := range allRecs {
+		snapshot[r.ID] = PersistedRoom{
+			ID:            r.ID,
+			Name:          r.Name,
+			Leader:        r.Leader,
+			Inputs:        r.Inputs,
+			Outputs:       r.Outputs,
+			Synced:        r.Synced,
+			InputGains:    r.InputGains,
+			OutputGains:   r.OutputGains,
+			Timestamp:     r.Timestamp,
+			Deleted:       r.Deleted,
+			DeletedAt:     r.DeletedAt,
+			InputAdds:     r.InputAdds,
+			InputRemoves:  r.InputRemoves,
+			OutputAdds:    r.OutputAdds,
+			OutputRemoves: r.OutputRemoves,
 		}
 	}
 	return m.roomsFile, snapshot

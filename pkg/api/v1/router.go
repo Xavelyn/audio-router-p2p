@@ -204,10 +204,11 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/rooms", s.AuthMiddleware(s.handleRooms))
 	mux.HandleFunc("/api/v1/rooms/", s.AuthMiddleware(s.handleRoomsSubpath))
 
-	// Cluster Management & Observability (ADR 0011)
+	// Cluster Management & Observability (ADR 0011 & ADR 0017)
 	mux.HandleFunc("/api/v1/cluster/nodes", s.AuthMiddleware(s.handleClusterNodes))
 	mux.HandleFunc("/api/v1/cluster/nodes/", s.AuthMiddleware(s.handleClusterNodesSubpath))
 	mux.HandleFunc("/api/v1/cluster/devices", s.AuthMiddleware(s.handleClusterDevices))
+	mux.HandleFunc("/api/v1/cluster/rooms", s.AuthMiddleware(s.handleClusterRooms))
 
 	// Telemetry & Diagnostics
 	mux.HandleFunc("/api/v1/network/health", s.AuthMiddleware(s.handleNetworkHealth))

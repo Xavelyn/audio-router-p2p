@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,7 @@ type StreamRoute struct {
 	ID              string   `json:"id"`
 	SourceDevice    int      `json:"sourceDevice"`
 	SourceDeviceURN string   `json:"sourceDeviceUrn,omitempty"`
+	SourceNodeID    string   `json:"sourceNodeId,omitempty"` // Node ID of source endpoint
 	DestDevice      int      `json:"destDevice,omitempty"`
 	DestDeviceURN   string   `json:"destDeviceUrn,omitempty"`
 	Destinations    []string `json:"destinations"`
@@ -281,6 +283,9 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 		ch = 2
 	}
 	srcNode := "local"
+	if sr.SourceNodeID != "" {
+		srcNode = sr.SourceNodeID
+	}
 	dstNode := "local"
 	if sr.PeerID != "" {
 		dstNode = sr.PeerID
@@ -353,7 +358,9 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 
 	var dests []string
 	if mr.Destination.NodeID != "" && mr.Destination.NodeID != "local" {
-		dests = []string{mr.Destination.NodeID}
+		if _, _, err := net.SplitHostPort(mr.Destination.NodeID); err == nil {
+			dests = []string{mr.Destination.NodeID}
+		}
 	} else if len(mr.Destination.Channels) > 0 {
 		dests = []string{"127.0.0.1:45678"}
 	}
@@ -361,6 +368,7 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		ID:              mr.ID,
 		SourceDevice:    srcDev,
 		SourceDeviceURN: mr.Source.DeviceID,
+		SourceNodeID:    mr.Source.NodeID,
 		DestDevice:      dstDev,
 		DestDeviceURN:   mr.Destination.DeviceID,
 		Destinations:    dests,
