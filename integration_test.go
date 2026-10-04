@@ -825,6 +825,7 @@ func setupNode(t *testing.T, tmpDir, certFile, keyFile string, idx int) *nodeSet
 	multicastPort := 47200 // Same for all nodes
 
 	cfg := &config.Config{
+		NodeIDFile:       filepath.Join(tmpDir, fmt.Sprintf("node_%d.id", idx)),
 		ListenAddr:       fmt.Sprintf("127.0.0.1:%d", apiPort),
 		CertFile:         certFile,
 		KeyFile:          keyFile,

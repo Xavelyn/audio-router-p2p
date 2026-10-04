@@ -740,6 +740,81 @@ func (r *Room) resolveDeviceEndpointLocked(devRef string) (nodeID, cleanDevID st
 			parsedNode := strings.TrimSpace(devRef[:slash])
 			parsedDev := strings.TrimSpace(devRef[slash+1:])
 			if parsedDev != "" {
+				// If parsed node is already local, return local
+				if parsedNode == "local" || (r.localID != "" && parsedNode == r.localID) {
+					if r.localID != "" {
+						return r.localID, parsedDev
+					}
+					return "local", parsedDev
+				}
+
+				// Only perform reconciliation if discovery or cluster manager is configured
+				if r.disc != nil || r.clusterMgr != nil {
+					isPeerLive := false
+					if r.disc != nil {
+						for _, peer := range r.disc.LivePeers() {
+							if peer.ID == parsedNode {
+								isPeerLive = true
+								break
+							}
+						}
+						if !isPeerLive {
+							for _, peer := range r.disc.Peers() {
+								if peer.ID == parsedNode {
+									isPeerLive = true
+									break
+								}
+							}
+						}
+					}
+					if !isPeerLive && r.clusterMgr != nil {
+						if snap := r.clusterMgr.GetSnapshot(); snap != nil {
+							if snap.Nodes != nil {
+								if _, exists := snap.Nodes[parsedNode]; exists {
+									isPeerLive = true
+								}
+							}
+							if !isPeerLive && snap.ClusterDevices != nil {
+								for _, cd := range snap.ClusterDevices {
+									if cd.NodeID == parsedNode {
+										isPeerLive = true
+										break
+									}
+								}
+							}
+						}
+					}
+					if !isPeerLive && r.members != nil {
+						if _, exists := r.members[parsedNode]; exists {
+							isPeerLive = true
+						}
+					}
+
+					// If parsedNode is NOT an active live peer in the cluster, check if parsedDev exists locally
+					if !isPeerLive {
+						isLocalDev := false
+						if r.devResolver != nil {
+							_, isLocalDev = r.devResolver.Resolve(parsedDev)
+						} else if gr := audio.GlobalResolver(); gr != nil {
+							_, isLocalDev = gr.Resolve(parsedDev)
+						}
+						if !isLocalDev && r.devResolver == nil && (strings.HasPrefix(parsedDev, "urn:audio:hw:") || strings.HasPrefix(parsedDev, "urn:audio:virt:")) {
+							isLocalDev = true
+						}
+
+						// Stale remote node prefix reconciled to active local node
+						if isLocalDev {
+							target := "local"
+							if r.localID != "" {
+								target = r.localID
+							}
+							log.Printf("[ROOM:RECONCILE] room=%s: reconciled stale node prefix %q -> local node %q for device %q",
+								r.id, parsedNode, target, parsedDev)
+							return target, parsedDev
+						}
+					}
+				}
+
 				return parsedNode, parsedDev
 			}
 		}
@@ -832,11 +907,16 @@ func (r *Room) resolveDeviceEndpointLocked(devRef string) (nodeID, cleanDevID st
 	return "local", cleanDevID
 }
 
-// resolveDeviceEndpoint resolves devRef to its owning nodeID and clean device ID.
-func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+// ResolveDeviceEndpoint resolves devRef to its owning nodeID and clean device ID.
+func (r *Room) ResolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.resolveDeviceEndpointLocked(devRef)
+}
+
+// resolveDeviceEndpoint resolves devRef to its owning nodeID and clean device ID.
+func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+	return r.ResolveDeviceEndpoint(devRef)
 }
 
 func (r *Room) recompileRoutesLocked() {

@@ -113,30 +113,32 @@ func Eventually(t *testing.T, timeout, interval time.Duration, condition func() 
 // ManagedTestNode encapsulates a fully isolated, production-grade daemon instance
 // bound to ephemeral loopback ports with disk-backed state persistence.
 type ManagedTestNode struct {
-	id          string
-	t           *testing.T
-	tmpDir      string
-	routesFile  string
-	roomsFile   string
-	certFile    string
-	keyFile     string
-	seedAddrs   []string
-	apiPort     int
-	streamPort  int
-	cfg         *config.Config
-	disc        *discovery.Discovery
-	syncMgr     *syncmgr.Manager
-	trans       streamer.Transport
-	streams     *streamManager
-	roomMgr     *group.DefaultRoomManager
-	rt          *router.Router
-	apiServer   *api.Server
-	httpServer  *http.Server
-	apiURL      string
-	client      *http.Client
-	isDead      bool
-	virtualDevs []v1.CreateVirtualDeviceRequest
-	mu          sync.Mutex
+	id           string
+	configuredID string
+	t            *testing.T
+	tmpDir       string
+	routesFile   string
+	roomsFile    string
+	nodeIDFile   string
+	certFile     string
+	keyFile      string
+	seedAddrs    []string
+	apiPort      int
+	streamPort   int
+	cfg          *config.Config
+	disc         *discovery.Discovery
+	syncMgr      *syncmgr.Manager
+	trans        streamer.Transport
+	streams      *streamManager
+	roomMgr      *group.DefaultRoomManager
+	rt           *router.Router
+	apiServer    *api.Server
+	httpServer   *http.Server
+	apiURL       string
+	client       *http.Client
+	isDead       bool
+	virtualDevs  []v1.CreateVirtualDeviceRequest
+	mu           sync.Mutex
 }
 
 // spawnManagedTestNode initializes and launches an active node with dedicated storage.
@@ -148,16 +150,19 @@ func spawnManagedTestNode(t *testing.T, id string, seedAddrs ...string) *Managed
 	keyFile := filepath.Join(tmpDir, "key.pem")
 	routesFile := filepath.Join(tmpDir, "routes.json")
 	roomsFile := filepath.Join(tmpDir, "rooms.json")
+	nodeIDFile := filepath.Join(tmpDir, "node.id")
 
 	node := &ManagedTestNode{
-		id:         id,
-		t:          t,
-		tmpDir:     tmpDir,
-		routesFile: routesFile,
-		roomsFile:  roomsFile,
-		certFile:   certFile,
-		keyFile:    keyFile,
-		seedAddrs:  seedAddrs,
+		id:           id,
+		configuredID: id,
+		t:            t,
+		tmpDir:       tmpDir,
+		routesFile:   routesFile,
+		roomsFile:    roomsFile,
+		nodeIDFile:   nodeIDFile,
+		certFile:     certFile,
+		keyFile:      keyFile,
+		seedAddrs:    seedAddrs,
 		client: &http.Client{
 			Transport: &http.Transport{
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
@@ -210,6 +215,8 @@ func (n *ManagedTestNode) startComponentsLocked() {
 		KeyFile:          n.keyFile,
 		RoutesFile:       n.routesFile,
 		RoomsFile:        n.roomsFile,
+		NodeID:           n.configuredID,
+		NodeIDFile:       n.nodeIDFile,
 		UseEmulator:      false,
 		DiscoveryPort:    0,
 		MulticastPort:    0,
@@ -231,6 +238,12 @@ func (n *ManagedTestNode) startComponentsLocked() {
 	if err := ensureTLS(cfg); err != nil {
 		n.t.Fatalf("[%s] ensureTLS: %v", n.id, err)
 	}
+
+	resolvedID, err := discovery.ResolveOrPersistNodeID(cfg)
+	if err != nil {
+		n.t.Fatalf("[%s] discovery.ResolveOrPersistNodeID: %v", n.id, err)
+	}
+	n.id = resolvedID
 
 	disc, err := discovery.New(cfg, n.id)
 	if err != nil {
@@ -255,6 +268,7 @@ func (n *ManagedTestNode) startComponentsLocked() {
 	roomMgr.SetRoomsFile(cfg.RoomsFile)
 	roomMgr.SetRouter(rt)
 	roomMgr.SetStreamManager(streamMgr)
+	roomMgr.SetDeviceResolver(audio.GlobalResolver())
 	disc.SetStateDelegate(roomMgr)
 	n.roomMgr = roomMgr
 
@@ -1256,4 +1270,198 @@ func TestE2E_Permutation_CrashRecoveryAndPersistence(t *testing.T) {
 
 	metrics := injectAudioAndVerify(t, micStream, spkStreamPostCrash, 440.0, 0.707, 3840)
 	t.Logf("PASS: Abrupt crash recovery and audio resumption verified (RMS=%.2f dBFS)", metrics.RMSdBFS)
+}
+
+// -------------------------------------------------------------------------------------------------
+// PERMUTATION MATRIX 7: Single-Node Reboot State Reconciliation and Persistent Identity Verification
+// -------------------------------------------------------------------------------------------------
+
+// TestE2E_Permutation_SingleNodeRestartAndPersistence verifies ADR 0025:
+// 1. A standalone node initialized without an explicit node ID generates and atomically persists a 32-hex ID into node.id (0600 permissions).
+// 2. Intra-node room routing passes 48kHz PCM audio with valid RMS energy.
+// 3. Across graceful daemon restarts, the exact node ID is restored from node.id.
+// 4. Stale node prefixes in persistent rooms referencing local audio hardware/virtual devices are dynamically reconciled to the active node ID.
+// 5. The single-node fast-path immediately asserts RoomStateActive and elects the local node leader without discovery timeouts.
+// 6. Post-restart intra-node audio streaming resumes cleanly with valid RMS signal energy (> -30 dBFS).
+func TestE2E_Permutation_SingleNodeRestartAndPersistence(t *testing.T) {
+	setupLeakGuard(t)
+
+	// Step 1: Spawn single node without an explicit node ID (simulating default daemon startup)
+	node := spawnManagedTestNode(t, "")
+	initialID := node.id
+	if len(initialID) != 32 {
+		t.Fatalf("expected 32-char generated node ID, got %q (len=%d)", initialID, len(initialID))
+	}
+
+	// Verify node.id file exists on disk with 0600 permissions and matching ID
+	idData, err := os.ReadFile(node.nodeIDFile)
+	if err != nil {
+		t.Fatalf("reading node.id file: %v", err)
+	}
+	if strings.TrimSpace(string(idData)) != initialID {
+		t.Fatalf("node.id content %q does not match node.id %q", string(idData), initialID)
+	}
+	info, err := os.Stat(node.nodeIDFile)
+	if err != nil {
+		t.Fatalf("stat node.id file: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0600 {
+		t.Fatalf("expected node.id permissions 0600, got %04o", perm)
+	}
+
+	// Step 2: Provision virtual mic and speaker devices
+	micDev, err := node.ProvisionVirtualDevice(v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-single-mic",
+		Direction:        "input",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	})
+	if err != nil {
+		t.Fatalf("create mic: %v", err)
+	}
+
+	spkDev, err := node.ProvisionVirtualDevice(v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-single-spk",
+		Direction:        "output",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	})
+	if err != nil {
+		t.Fatalf("create spk: %v", err)
+	}
+
+	// Step 3: Create room and bind local devices via API
+	const roomID = "room-single-persist"
+	roomReq := map[string]string{"id": roomID, "name": "Single Persist Room"}
+	resp, err := node.Post("/api/v1/rooms", roomReq)
+	if err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	resp, err = node.Post(fmt.Sprintf("/api/v1/rooms/%s/inputs", roomID), v1.RoomDeviceBindingRequest{DeviceID: micDev.URN, NodeID: node.id})
+	if err != nil {
+		t.Fatalf("add input: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	resp, err = node.Post(fmt.Sprintf("/api/v1/rooms/%s/outputs", roomID), v1.RoomDeviceBindingRequest{DeviceID: spkDev.URN, NodeID: node.id})
+	if err != nil {
+		t.Fatalf("add output: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	_ = node.roomMgr.SetInputGain(roomID, micDev.URN, 1.0)
+	_ = node.roomMgr.SetOutputGain(roomID, spkDev.URN, 1.0)
+
+	// Verify room convergence to RoomStateActive and leader == node.id
+	Eventually(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		r, ok := node.roomMgr.GetRoom(roomID)
+		return ok && r != nil && r.State() == group.RoomStateActive && r.Leader() == node.id
+	}, "room-single-persist convergence to active")
+
+	// Step 4: Stream audio pre-restart and assert valid RMS energy
+	micStream, okMic := node.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(micDev.URN)
+	spkStream, okSpk := node.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(spkDev.URN)
+	if !okMic || !okSpk {
+		t.Fatalf("failed to retrieve virtual streams pre-restart")
+	}
+
+	preMetrics := injectAudioAndVerify(t, micStream, spkStream, 440.0, 0.707, 3840)
+	t.Logf("Pre-restart intra-node audio verified (RMS=%.2f dBFS)", preMetrics.RMSdBFS)
+
+	// Step 5: Stop node components gracefully (flushing in-memory state to disk)
+	node.mu.Lock()
+	node.stopComponentsLocked(true)
+
+	// Read rooms.json to verify persistence
+	roomsData, err := os.ReadFile(node.roomsFile)
+	if err != nil || len(roomsData) == 0 {
+		node.mu.Unlock()
+		t.Fatalf("rooms.json missing or empty on disk: %v", err)
+	}
+	var prs map[string]group.PersistedRoom
+	if err := json.Unmarshal(roomsData, &prs); err != nil {
+		node.mu.Unlock()
+		t.Fatalf("unmarshaling rooms.json: %v", err)
+	}
+
+	// Inject a second room simulating a stale node ID from prior release / dead host
+	const staleRoomID = "room-stale-persist"
+	const staleNodeID = "stale-dead-node-legacy9999"
+	prs[staleRoomID] = group.PersistedRoom{
+		ID:          staleRoomID,
+		Name:        "Stale Reconcile Room",
+		Leader:      staleNodeID,
+		Inputs:      []string{staleNodeID + "/" + micDev.URN},
+		Outputs:     []string{staleNodeID + "/" + spkDev.URN},
+		InputGains:  map[string]float64{staleNodeID + "/" + micDev.URN: 1.0},
+		OutputGains: map[string]float64{staleNodeID + "/" + spkDev.URN: 1.0},
+		Timestamp:   group.HLT{WallTime: time.Now().UnixNano(), Counter: 1, NodeID: staleNodeID},
+	}
+	modData, err := json.MarshalIndent(prs, "", "  ")
+	if err != nil {
+		node.mu.Unlock()
+		t.Fatalf("marshal modified rooms.json: %v", err)
+	}
+	if err := os.WriteFile(node.roomsFile, modData, 0644); err != nil {
+		node.mu.Unlock()
+		t.Fatalf("write modified rooms.json: %v", err)
+	}
+
+	// Step 6: Restart node components from persistent storage
+	t.Log("Restarting node from persistent state...")
+	node.startComponentsLocked()
+	node.mu.Unlock()
+
+	// Step 7: Verify persistent node identity was preserved across restart
+	if node.id != initialID {
+		t.Fatalf("node ID changed across reboot: pre=%q post=%q", initialID, node.id)
+	}
+	idDataPost, err := os.ReadFile(node.nodeIDFile)
+	if err != nil || strings.TrimSpace(string(idDataPost)) != initialID {
+		t.Fatalf("node.id file post-reboot mismatch: %v, content=%q", err, string(idDataPost))
+	}
+
+	// Step 8: Verify pre-existing room rehydration and convergence
+	Eventually(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		r, ok := node.roomMgr.GetRoom(roomID)
+		return ok && r != nil && r.State() == group.RoomStateActive && r.Leader() == node.id
+	}, "rehydrated room-single-persist convergence")
+
+	// Step 9: Verify stale room self-healing: stale prefix reconciled to node.id and converges to Active
+	Eventually(t, 5*time.Second, 50*time.Millisecond, func() bool {
+		r, ok := node.roomMgr.GetRoom(staleRoomID)
+		if !ok || r == nil {
+			return false
+		}
+		if r.State() != group.RoomStateActive || r.Leader() != node.id {
+			return false
+		}
+		for _, in := range r.Inputs() {
+			owner, _ := r.ResolveDeviceEndpoint(in)
+			if owner != node.id && owner != "local" {
+				return false
+			}
+		}
+		for _, out := range r.Outputs() {
+			owner, _ := r.ResolveDeviceEndpoint(out)
+			if owner != node.id && owner != "local" {
+				return false
+			}
+		}
+		return true
+	}, "stale room self-healing and leadership reconciliation")
+
+	// Step 10: Stream audio post-restart through reconciled pipeline and verify RMS energy
+	micStreamPost, okMicPost := node.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(micDev.URN)
+	spkStreamPost, okSpkPost := node.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(spkDev.URN)
+	if !okMicPost || !okSpkPost {
+		t.Fatalf("failed to retrieve virtual streams post-restart")
+	}
+
+	postMetrics := injectAudioAndVerify(t, micStreamPost, spkStreamPost, 440.0, 0.707, 3840)
+	t.Logf("PASS: Post-restart intra-node audio and reconciliation verified (RMS=%.2f dBFS)", postMetrics.RMSdBFS)
 }

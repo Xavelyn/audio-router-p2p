@@ -47,7 +47,11 @@ func main() {
 
 	// Discovery + clock sync run first: the DTLS client transport needs the
 	// peer's stream address, which comes from the route table / discovery.
-	disc, err := discovery.New(cfg, "")
+	nodeID, err := discovery.ResolveOrPersistNodeID(cfg)
+	if err != nil {
+		log.Fatalf("failed to resolve node identity: %v", err)
+	}
+	disc, err := discovery.New(cfg, nodeID)
 	if err != nil {
 		log.Fatalf("discovery: %v", err)
 	}
@@ -115,6 +119,8 @@ func main() {
 	roomMgr := group.NewDefaultRoomManager(cfg, disc, sm, trans)
 	roomMgr.SetRouter(rt)
 	roomMgr.SetStreamManager(streams)
+	devResolver := audio.GlobalResolver()
+	roomMgr.SetDeviceResolver(devResolver)
 	disc.SetStateDelegate(roomMgr)
 
 	// HTTP API.

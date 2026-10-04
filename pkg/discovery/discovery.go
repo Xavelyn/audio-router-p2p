@@ -1,9 +1,7 @@
 package discovery
 
 import (
-	crand "crypto/rand"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -121,11 +119,15 @@ type Discovery struct {
 // discovers local broadcast targets, and creates the HashiCorp Memberlist cluster.
 func New(cfg *config.Config, nodeID string) (*Discovery, error) {
 	if nodeID == "" {
-		gen, err := generateNodeID()
-		if err != nil {
-			return nil, err
+		if cfg != nil && cfg.NodeID != "" {
+			nodeID = cfg.NodeID
+		} else {
+			resolved, err := ResolveOrPersistNodeID(cfg)
+			if err != nil {
+				return nil, err
+			}
+			nodeID = resolved
 		}
-		nodeID = gen
 	}
 	d := &Discovery{
 		cfg:             cfg,
@@ -139,14 +141,6 @@ func New(cfg *config.Config, nodeID string) (*Discovery, error) {
 		return nil, err
 	}
 	return d, nil
-}
-
-func generateNodeID() (string, error) {
-	var b [16]byte
-	if _, err := crand.Read(b[:]); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b[:]), nil
 }
 
 // NodeID returns this node's unique cluster ID.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -90,7 +91,9 @@ func TestDiscoveryInitialization(t *testing.T) {
 	}
 
 	// Verify automatic NodeID generation when empty
-	d2, err := New(testConfig("239.255.0.1", freeUDPPort(t)), "")
+	cfg2 := testConfig("239.255.0.1", freeUDPPort(t))
+	cfg2.NodeIDFile = filepath.Join(t.TempDir(), "node.id")
+	d2, err := New(cfg2, "")
 	if err != nil {
 		t.Fatalf("New auto-id: %v", err)
 	}

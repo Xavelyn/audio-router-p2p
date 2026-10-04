@@ -129,3 +129,35 @@ func TestLoadFromArgs_PeersFlag(t *testing.T) {
 		t.Errorf("expected peer 1 addr 10.1.10.201:45401, got '%s'", cfg.StaticPeers[1].Addr)
 	}
 }
+
+func TestLoadFromArgs_NodeIDFlags(t *testing.T) {
+	// Defaults
+	argsDefault := []string{"-auth-token", "tok"}
+	cfgDefault, err := LoadFromArgs(argsDefault)
+	if err != nil {
+		t.Fatalf("LoadFromArgs default failed: %v", err)
+	}
+	if cfgDefault.NodeID != "" {
+		t.Errorf("expected empty default NodeID, got %q", cfgDefault.NodeID)
+	}
+	if cfgDefault.NodeIDFile != "node.id" {
+		t.Errorf("expected default NodeIDFile 'node.id', got %q", cfgDefault.NodeIDFile)
+	}
+
+	// Explicit override
+	argsExplicit := []string{
+		"-auth-token", "tok",
+		"-node-id", "test-node-explicit-1234",
+		"-node-id-file", "/custom/path/custom_node.id",
+	}
+	cfgExplicit, err := LoadFromArgs(argsExplicit)
+	if err != nil {
+		t.Fatalf("LoadFromArgs explicit failed: %v", err)
+	}
+	if cfgExplicit.NodeID != "test-node-explicit-1234" {
+		t.Errorf("expected NodeID 'test-node-explicit-1234', got %q", cfgExplicit.NodeID)
+	}
+	if cfgExplicit.NodeIDFile != "/custom/path/custom_node.id" {
+		t.Errorf("expected NodeIDFile '/custom/path/custom_node.id', got %q", cfgExplicit.NodeIDFile)
+	}
+}

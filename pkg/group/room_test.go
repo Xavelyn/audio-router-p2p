@@ -1084,3 +1084,88 @@ func TestRoomSingleOwningNodeEdgeCases(t *testing.T) {
 		t.Fatal("expected room to remain non-active after owner departed, but state was set to Active")
 	}
 }
+
+func TestRoom_StaleNodePrefixReconciliationOnSingleNodeReboot(t *testing.T) {
+	const staleNodeID = "stale-node-uuid-1111"
+	const freshNodeID = "fresh-node-uuid-2222"
+	const micDeviceURN = "urn:audio:virt:vdev-reboot-mic"
+	const spkDeviceURN = "urn:audio:virt:vdev-reboot-spk"
+
+	devRes := &mockDeviceResolver{
+		devices: map[string]audio.Device{
+			micDeviceURN: {URN: micDeviceURN, Name: "Virtual Mic"},
+			spkDeviceURN: {URN: spkDeviceURN, Name: "Virtual Spk"},
+		},
+	}
+
+	disc := &mockDiscoveryProvider{
+		nodeID:    freshNodeID,
+		peers:     nil, // Single node: no other peers in mesh
+		livePeers: nil,
+	}
+
+	routesFile := filepath.Join(t.TempDir(), "routes.json")
+	rt, err := router.New(routesFile)
+	if err != nil {
+		t.Fatalf("router.New failed: %v", err)
+	}
+
+	room := NewRoom(RoomConfig{
+		ID:             "room-single-reboot",
+		Name:           "Single Reboot Room",
+		LocalPeerID:    freshNodeID,
+		Discovery:      disc,
+		DeviceResolver: devRes,
+		Router:         rt,
+	})
+
+	// Add inputs and outputs with stale node prefix from prior boot cycle
+	staleMic := staleNodeID + "/" + micDeviceURN
+	staleSpk := staleNodeID + "/" + spkDeviceURN
+
+	if err := room.AddInput(staleMic); err != nil {
+		t.Fatalf("AddInput(%q) failed: %v", staleMic, err)
+	}
+	if err := room.AddOutput(staleSpk); err != nil {
+		t.Fatalf("AddOutput(%q) failed: %v", staleSpk, err)
+	}
+
+	// Verify resolveDeviceEndpoint reconciles stale prefix to freshNodeID
+	gotNode, gotDev := room.resolveDeviceEndpoint(staleMic)
+	if gotNode != freshNodeID {
+		t.Fatalf("expected resolved node %q, got %q", freshNodeID, gotNode)
+	}
+	if gotDev != micDeviceURN {
+		t.Fatalf("expected resolved clean dev %q, got %q", micDeviceURN, gotDev)
+	}
+
+	// Verify room evaluates as single-owning node mapped to freshNodeID
+	room.mu.RLock()
+	owner, isSingle := room.singleOwningNodeLocked()
+	room.mu.RUnlock()
+	if !isSingle || owner != freshNodeID {
+		t.Fatalf("expected single owning node %q, got owner=%q isSingle=%v", freshNodeID, owner, isSingle)
+	}
+
+	// Verify room is classified as LocalOnly
+	if !room.IsLocalOnly() {
+		t.Fatalf("expected room to be classified as LocalOnly after reconciliation")
+	}
+
+	// Verify recomputeLeader immediately converges to RoomStateActive with freshNodeID as leader
+	room.recomputeLeader()
+	if room.State() != RoomStateActive {
+		t.Fatalf("expected state RoomStateActive, got %v", room.State())
+	}
+	if room.Leader() != freshNodeID {
+		t.Fatalf("expected leader %q, got %q", freshNodeID, room.Leader())
+	}
+
+	// Verify compiled matrix routes use freshNodeID
+	room.mu.RLock()
+	compiledRoutes := len(room.compiledRoutes)
+	room.mu.RUnlock()
+	if compiledRoutes != 1 {
+		t.Fatalf("expected 1 compiled route, got %d", compiledRoutes)
+	}
+}

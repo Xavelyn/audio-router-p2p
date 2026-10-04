@@ -5,6 +5,8 @@
 tools/env.sh
 routes.json
 rooms.json
+node.id
+*.id
 cert.pem
 key.pem
 audio-router-node

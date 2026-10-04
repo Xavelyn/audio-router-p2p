@@ -35,6 +35,10 @@ type Config struct {
 	SyncInterval     time.Duration
 	ShutdownTimeout  time.Duration
 
+	// Node identity flags
+	NodeID     string // Explicit persistent node identifier override
+	NodeIDFile string // Path to persistent node ID file
+
 	// Room orchestration flags
 	RoomID       string // Room ID to create/join
 	RoomName     string // Human-readable room name
@@ -87,6 +91,9 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.StringVar(&cfg.RoomID, "room-id", "", "Room ID to create/join")
 	fs.StringVar(&cfg.RoomName, "room-name", "", "Human-readable name of the room")
 	fs.BoolVar(&cfg.RoomAutoJoin, "room-auto-join", false, "Auto-join room on daemon startup")
+
+	fs.StringVar(&cfg.NodeID, "node-id", "", "Explicit persistent node identifier")
+	fs.StringVar(&cfg.NodeIDFile, "node-id-file", "node.id", "Path to node ID persistence file")
 
 	// Static peers (comma-separated JSON array or comma-separated addresses)
 	staticPeersJSON := fs.String("static-peers", "", "Static peers JSON array (for cross-broadcast domains)")
