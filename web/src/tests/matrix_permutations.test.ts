@@ -750,4 +750,152 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
     expect(flowLayoutStore.getPosition('input-hw:duplex-both')).toEqual({ x: 50, y: 300 });
     expect(flowLayoutStore.getPosition('output-hw:duplex-both')).toBeUndefined();
   });
+
+  // ==========================================================================
+  // Matrix 12: Multi-Node Endpoint Staging and Dismissal Isolation (ADR 0028)
+  // Devices with identical IDs on different cluster nodes must never bleed or collide.
+  // ==========================================================================
+  it('Matrix 12: Multi-Node Endpoint Isolation - identical hardware IDs on different nodes stage and unstage independently', async () => {
+    const devId = 'shared-mic-1';
+    const nodeAEndpoint = `node-alpha/${devId}`;
+    const nodeBEndpoint = `node-beta/${devId}`;
+
+    // 1. Stage input endpoint on Node Alpha only
+    flowLayoutStore.stageEndpoint(nodeAEndpoint, 'input', { x: 50, y: 120 });
+
+    // 2. Invariant: Node Alpha is staged; Node Beta MUST NOT be staged!
+    expect(flowLayoutStore.isEndpointStaged(nodeAEndpoint, 'input')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged(nodeBEndpoint, 'input')).toBe(false);
+    expect(flowLayoutStore.isDeviceEnabled(devId, 'node-alpha', 'input')).toBe(true);
+    expect(flowLayoutStore.isDeviceEnabled(devId, 'node-beta', 'input')).toBe(false);
+
+    // 3. Stage input endpoint on Node Beta at different coordinates
+    flowLayoutStore.stageEndpoint(nodeBEndpoint, 'input', { x: 50, y: 460 });
+    expect(flowLayoutStore.isEndpointStaged(nodeAEndpoint, 'input')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged(nodeBEndpoint, 'input')).toBe(true);
+    expect(flowLayoutStore.getPosition(`input-${nodeAEndpoint}`)).toEqual({ x: 50, y: 120 });
+    expect(flowLayoutStore.getPosition(`input-${nodeBEndpoint}`)).toEqual({ x: 50, y: 460 });
+
+    // 4. Unstage Node Alpha's endpoint: Node Beta MUST remain staged with its position intact!
+    flowLayoutStore.unstageEndpoint(nodeAEndpoint, 'input');
+    expect(flowLayoutStore.isEndpointStaged(nodeAEndpoint, 'input')).toBe(false);
+    expect(flowLayoutStore.isEndpointStaged(nodeBEndpoint, 'input')).toBe(true);
+    expect(flowLayoutStore.getPosition(`input-${nodeAEndpoint}`)).toBeUndefined();
+    expect(flowLayoutStore.getPosition(`input-${nodeBEndpoint}`)).toEqual({ x: 50, y: 460 });
+
+    // 5. Unstage Node Beta's endpoint
+    flowLayoutStore.unstageEndpoint(nodeBEndpoint, 'input');
+    expect(flowLayoutStore.isEndpointStaged(nodeBEndpoint, 'input')).toBe(false);
+    expect(flowLayoutStore.getPosition(`input-${nodeBEndpoint}`)).toBeUndefined();
+  });
+
+  // ==========================================================================
+  // Matrix 13: Multi-Node Room Route Unbinding Isolation (ADR 0028)
+  // Unbinding a route belonging to Node Alpha must never unbind Node Beta's identical device ID.
+  // ==========================================================================
+  it('Matrix 13: Multi-Node Route Isolation - unbinding an endpoint from one node preserves identical devices from sibling nodes', async () => {
+    const roomId = `room-m13-${Date.now()}`;
+    const devId = 'usb-audio-card';
+    const nodeAEndpoint = `node-alpha/${devId}`;
+    const nodeBEndpoint = `node-beta/${devId}`;
+
+    await roomStore.createRoom({ id: roomId, name: 'Matrix 13 Multi-Node Studio' });
+
+    // 1. Bind both nodes' endpoints to the same room
+    await roomStore.addRoomInput(roomId, devId, 'node-alpha');
+    await roomStore.addRoomInput(roomId, devId, 'node-beta');
+
+    const roomBoth = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && r.inputs.includes(nodeAEndpoint) && r.inputs.includes(nodeBEndpoint)
+    );
+    expect(roomBoth).toBeDefined();
+    expect(roomBoth!.inputs.length).toBe(2);
+
+    // 2. Unbind Node Alpha's input
+    await roomStore.removeRoomInput(roomId, nodeAEndpoint);
+
+    const roomAfterUnbindA = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && !r.inputs.includes(nodeAEndpoint) && r.inputs.includes(nodeBEndpoint)
+    );
+
+    // Invariant: Node Alpha is removed; Node Beta remains firmly bound!
+    expect(roomAfterUnbindA).toBeDefined();
+    expect(roomAfterUnbindA!.inputs).not.toContain(nodeAEndpoint);
+    expect(roomAfterUnbindA!.inputs).toContain(nodeBEndpoint);
+    expect(roomAfterUnbindA!.inputs.length).toBe(1);
+
+    // Teardown
+    await roomStore.deleteRoom(roomId);
+  });
+
+  // ==========================================================================
+  // Matrix 14: Multi-Node Room Output Isolation (ADR 0028)
+  // Unbinding an output route belonging to Node Alpha preserves Node Beta's identical device ID.
+  // ==========================================================================
+  it('Matrix 14: Multi-Node Output Route Isolation - unbinding an output preserves identical devices from sibling nodes', async () => {
+    const roomId = `room-m14-${Date.now()}`;
+    const devId = 'studio-monitors';
+    const nodeAEndpoint = `node-alpha/${devId}`;
+    const nodeBEndpoint = `node-beta/${devId}`;
+
+    await roomStore.createRoom({ id: roomId, name: 'Matrix 14 Multi-Node Output Studio' });
+
+    // 1. Bind both nodes' output endpoints to the same room
+    await roomStore.addRoomOutput(roomId, devId, 'node-alpha');
+    await roomStore.addRoomOutput(roomId, devId, 'node-beta');
+
+    const roomBoth = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && r.outputs.includes(nodeAEndpoint) && r.outputs.includes(nodeBEndpoint)
+    );
+    expect(roomBoth).toBeDefined();
+    expect(roomBoth!.outputs.length).toBe(2);
+
+    // 2. Unbind Node Alpha's output
+    await roomStore.removeRoomOutput(roomId, nodeAEndpoint);
+
+    const roomAfterUnbindA = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && !r.outputs.includes(nodeAEndpoint) && r.outputs.includes(nodeBEndpoint)
+    );
+
+    // Invariant: Node Alpha's output is removed; Node Beta's output remains firmly bound!
+    expect(roomAfterUnbindA).toBeDefined();
+    expect(roomAfterUnbindA!.outputs).not.toContain(nodeAEndpoint);
+    expect(roomAfterUnbindA!.outputs).toContain(nodeBEndpoint);
+    expect(roomAfterUnbindA!.outputs.length).toBe(1);
+
+    // Teardown
+    await roomStore.deleteRoom(roomId);
+  });
+
+  // ==========================================================================
+  // Matrix 15: Multi-Node disableDevice Scoping (ADR 0028)
+  // Calling disableDevice on node-alpha/devId must only remove node-alpha staging.
+  // ==========================================================================
+  it('Matrix 15: Multi-Node disableDevice Isolation - disabling device on one node preserves identical devices on other nodes', () => {
+    const devId = 'shared-interface';
+    const nodeA = 'node-alpha';
+    const nodeB = 'node-beta';
+    const nodeAKey = `${nodeA}/${devId}`;
+    const nodeBKey = `${nodeB}/${devId}`;
+
+    // Enable duplex on both nodes
+    flowLayoutStore.enableDevice(nodeAKey, { x: 100, y: 100 });
+    flowLayoutStore.enableDevice(nodeBKey, { x: 200, y: 200 });
+
+    expect(flowLayoutStore.isDeviceEnabled(devId, nodeA)).toBe(true);
+    expect(flowLayoutStore.isDeviceEnabled(devId, nodeB)).toBe(true);
+
+    // Disable node-alpha's device
+    flowLayoutStore.disableDevice(devId, nodeA);
+
+    // Invariant: node-alpha is disabled, but node-beta remains enabled!
+    expect(flowLayoutStore.isDeviceEnabled(devId, nodeA)).toBe(false);
+    expect(flowLayoutStore.isDeviceEnabled(devId, nodeB)).toBe(true);
+    expect(flowLayoutStore.getPosition(`input-${nodeAKey}`)).toBeUndefined();
+    expect(flowLayoutStore.getPosition(`input-${nodeBKey}`)).toEqual({ x: 200, y: 200 });
+  });
 });

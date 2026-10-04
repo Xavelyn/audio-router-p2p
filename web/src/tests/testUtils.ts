@@ -487,8 +487,13 @@ export class MockBackendServer {
           return json(room);
         }
         if (method === 'DELETE' && parts[2]) {
-          const devId = parts[2];
-          room.inputs = room.inputs.filter((id) => id !== devId && !id.endsWith(`/${devId}`));
+          const devId = parts.slice(2).join('/');
+          const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+          room.inputs = room.inputs.filter((id) => {
+            if (id === devId) return false;
+            if (devId.includes('/')) return true;
+            return id !== clean && !id.endsWith(`/${clean}`);
+          });
           return json(room);
         }
       }
@@ -502,8 +507,13 @@ export class MockBackendServer {
           return json(room);
         }
         if (method === 'DELETE' && parts[2]) {
-          const devId = parts[2];
-          room.outputs = room.outputs.filter((id) => id !== devId && !id.endsWith(`/${devId}`));
+          const devId = parts.slice(2).join('/');
+          const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+          room.outputs = room.outputs.filter((id) => {
+            if (id === devId) return false;
+            if (devId.includes('/')) return true;
+            return id !== clean && !id.endsWith(`/${clean}`);
+          });
           return json(room);
         }
       }

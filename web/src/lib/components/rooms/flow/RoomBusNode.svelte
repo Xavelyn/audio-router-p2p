@@ -166,7 +166,8 @@
                   <button
                     type="button"
                     onclick={() => {
-                      data.onAddInput(dev.id);
+                      const devKey = (dev as any).node_id && !dev.id.includes('/') ? `${(dev as any).node_id}/${dev.id}` : dev.id;
+                      data.onAddInput(devKey);
                       showAddInputMenu = false;
                     }}
                     class="w-full text-left rounded px-2 py-1 text-xs font-mono text-zinc-200 hover:bg-cyan-500/20 hover:text-cyan-300 transition-colors truncate"
@@ -182,14 +183,14 @@
 
       <!-- Inputs List -->
       <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-        {#each data.inputDevices as dev (dev.id)}
+        {#each data.inputDevices as dev ((dev as any).endpoint_id || dev.id)}
           <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
             <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
               <span class="text-cyan-300 font-medium truncate block">{dev.name}</span>
             </div>
             <button
               type="button"
-              onclick={() => data.onRemoveInput(dev.id)}
+              onclick={() => data.onRemoveInput((dev as any).endpoint_id || dev.id)}
               class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Remove {dev.name} from room"
               aria-label="Remove {dev.name} from room"
@@ -235,7 +236,8 @@
                   <button
                     type="button"
                     onclick={() => {
-                      data.onAddOutput(dev.id);
+                      const devKey = (dev as any).node_id && !dev.id.includes('/') ? `${(dev as any).node_id}/${dev.id}` : dev.id;
+                      data.onAddOutput(devKey);
                       showAddOutputMenu = false;
                     }}
                     class="w-full text-left rounded px-2 py-1 text-xs font-mono text-zinc-200 hover:bg-purple-500/20 hover:text-purple-300 transition-colors truncate"
@@ -251,14 +253,14 @@
 
       <!-- Outputs List -->
       <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-        {#each data.outputDevices as dev (dev.id)}
+        {#each data.outputDevices as dev ((dev as any).endpoint_id || dev.id)}
           <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
             <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
               <span class="text-purple-300 font-medium truncate block">{dev.name}</span>
             </div>
             <button
               type="button"
-              onclick={() => data.onRemoveOutput(dev.id)}
+              onclick={() => data.onRemoveOutput((dev as any).endpoint_id || dev.id)}
               class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Remove {dev.name} from room"
               aria-label="Remove {dev.name} from room"

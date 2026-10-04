@@ -27,6 +27,72 @@ export interface FlowLayoutStorageV1 {
   collapsedNodes?: string[];
 }
 
+// =========================================================================
+// ADR 0027 / ADR 0028 Directional Staging & Strict Canonical Endpoint Identity (CEI)
+// =========================================================================
+
+/**
+ * Test whether a stored item matches a requested target canvas key for a given direction.
+ * Enforces strict node isolation (ADR 0028):
+ * - If both targetKey and stored item are node-qualified (e.g. "nodeA/mic" vs "nodeB/mic"),
+ *   they match IF AND ONLY IF their exact qualified keys match.
+ * - If targetKey is node-qualified ("nodeA/mic") and stored item is legacy bare ("mic"),
+ *   matches only if stored item equals targetKey's device part.
+ * - If targetKey is bare ("mic") and stored item is qualified ("nodeA/mic"),
+ *   matches if stored item ends with "/" + targetKey.
+ * - If both are bare, matches if equal.
+ */
+function matchesEndpointTag(
+  storedItem: string,
+  targetKey: string,
+  direction?: 'input' | 'output'
+): boolean {
+  let stripped = storedItem;
+  if (direction) {
+    const dirTag = direction === 'input' ? 'in:' : 'out:';
+    const nodePrefix = direction === 'input' ? 'input-' : 'output-';
+    if (storedItem.startsWith(dirTag)) {
+      stripped = storedItem.slice(dirTag.length);
+    } else if (storedItem.startsWith(nodePrefix)) {
+      stripped = storedItem.slice(nodePrefix.length);
+    } else if (
+      storedItem.startsWith('in:') ||
+      storedItem.startsWith('out:') ||
+      storedItem.startsWith('input-') ||
+      storedItem.startsWith('output-')
+    ) {
+      // Belongs to the other direction
+      return false;
+    }
+  } else {
+    stripped = storedItem.replace(/^(in:|out:|input-|output-)/, '');
+  }
+
+  // Exact match
+  if (stripped === targetKey) return true;
+
+  const targetHasSlash = targetKey.includes('/');
+  const strippedHasSlash = stripped.includes('/');
+
+  // Both are node-qualified: if not exact, they NEVER match (ADR 0028 isolation)!
+  if (targetHasSlash && strippedHasSlash) {
+    return false;
+  }
+
+  // targetKey is node-qualified (e.g. nodeA/dev1), stored is legacy bare (e.g. dev1)
+  if (targetHasSlash && !strippedHasSlash) {
+    const targetDev = targetKey.slice(targetKey.indexOf('/') + 1);
+    return stripped === targetDev;
+  }
+
+  // targetKey is bare (e.g. dev1), stored is qualified (e.g. nodeA/dev1)
+  if (!targetHasSlash && strippedHasSlash) {
+    return stripped.endsWith(`/${targetKey}`);
+  }
+
+  return false;
+}
+
 export class FlowLayoutStore {
   // Staged device / directional endpoint IDs visible on the canvas (e.g. "in:hw:0", "out:hw:0")
   enabledDevices = $state<Set<string>>(new Set());
@@ -223,50 +289,22 @@ export class FlowLayoutStore {
 
   /**
    * Check if a specific directional endpoint is staged on canvas.
-   * Matches "in:<canvasKey>", "out:<canvasKey>", SvelteFlow node IDs ("input-...", "output-..."),
-   * and legacy bare keys.
+   * Enforces strict node isolation (ADR 0028):
+   * Matches exact "in:<canvasKey>", "out:<canvasKey>", SvelteFlow node IDs,
+   * or legacy bare keys, but never bleeds across different cluster nodes.
    */
   isEndpointStaged(canvasKey: string, direction: 'input' | 'output'): boolean {
     const dirTag = direction === 'input' ? 'in:' : 'out:';
     const nodePrefix = direction === 'input' ? 'input-' : 'output-';
-    const cleanKey = canvasKey.includes('/') ? canvasKey.slice(canvasKey.indexOf('/') + 1) : canvasKey;
 
-    // 1. Direct key lookups
+    // 1. Direct fast-path key lookups
     if (this.enabledDevices.has(`${dirTag}${canvasKey}`)) return true;
     if (this.enabledDevices.has(`${nodePrefix}${canvasKey}`)) return true;
-    if (this.enabledDevices.has(`${dirTag}${cleanKey}`)) return true;
-    if (this.enabledDevices.has(`${nodePrefix}${cleanKey}`)) return true;
 
-    // 2. Scan enabledDevices for prefix/suffix and legacy bare matches
+    // 2. Scan enabledDevices using strict canonical matching (ADR 0028)
     for (const d of this.enabledDevices) {
-      // Directional tag match
-      if (d.startsWith(dirTag) || d.startsWith(nodePrefix)) {
-        const stripped = d.startsWith(dirTag) ? d.slice(dirTag.length) : d.slice(nodePrefix.length);
-        if (
-          stripped === canvasKey ||
-          stripped === cleanKey ||
-          stripped.endsWith(`/${cleanKey}`) ||
-          cleanKey.endsWith(`/${stripped}`)
-        ) {
-          return true;
-        }
-      }
-
-      // Legacy un-prefixed bare device key fallback
-      if (
-        !d.startsWith('in:') &&
-        !d.startsWith('out:') &&
-        !d.startsWith('input-') &&
-        !d.startsWith('output-')
-      ) {
-        if (
-          d === canvasKey ||
-          d === cleanKey ||
-          d.endsWith(`/${cleanKey}`) ||
-          cleanKey.endsWith(`/${d}`)
-        ) {
-          return true;
-        }
+      if (matchesEndpointTag(d, canvasKey, direction)) {
+        return true;
       }
     }
 
@@ -297,9 +335,9 @@ export class FlowLayoutStore {
    * Unstage only the specified directional endpoint.
    * Removes "in:<canvasKey>" or "out:<canvasKey>", deletes its directional position,
    * and preserves the counterpart directional endpoint (migrating legacy bare keys if present).
+   * Enforces strict node isolation (ADR 0028): never unstages matching devices on other nodes.
    */
   unstageEndpoint(canvasKey: string, direction: 'input' | 'output') {
-    const cleanKey = canvasKey.includes('/') ? canvasKey.slice(canvasKey.indexOf('/') + 1) : canvasKey;
     const dirTag = direction === 'input' ? 'in:' : 'out:';
     const nodePrefix = direction === 'input' ? 'input-' : 'output-';
     const counterpartDirection = direction === 'input' ? 'output' : 'input';
@@ -316,7 +354,7 @@ export class FlowLayoutStore {
         !d.startsWith('input-') &&
         !d.startsWith('output-')
       ) {
-        if (d === canvasKey || d === cleanKey || d.endsWith(`/${cleanKey}`) || cleanKey.endsWith(`/${d}`)) {
+        if (matchesEndpointTag(d, canvasKey)) {
           hadBareKey = true;
           next.delete(d);
         }
@@ -327,36 +365,24 @@ export class FlowLayoutStore {
       next.add(counterpartTag);
     }
 
-    // 2. Remove all directional entries matching this direction
+    // 2. Remove all directional entries matching this canvasKey and direction (ADR 0028)
     for (const d of Array.from(next)) {
-      if (d.startsWith(dirTag) || d.startsWith(nodePrefix)) {
-        const stripped = d.startsWith(dirTag) ? d.slice(dirTag.length) : d.slice(nodePrefix.length);
-        if (
-          stripped === canvasKey ||
-          stripped === cleanKey ||
-          stripped.endsWith(`/${cleanKey}`) ||
-          cleanKey.endsWith(`/${stripped}`)
-        ) {
-          next.delete(d);
-        }
+      if (matchesEndpointTag(d, canvasKey, direction)) {
+        next.delete(d);
       }
     }
 
     this.enabledDevices = next;
 
-    // 3. Remove ONLY positions for this direction, preserving counterpart positions
+    // 3. Remove ONLY positions for this direction and this canvasKey
     const nextPositions = new Map(this.positions);
-    nextPositions.delete(`${nodePrefix}${canvasKey}`);
-    nextPositions.delete(`${nodePrefix}${cleanKey}`);
+    const targetNodeId = `${nodePrefix}${canvasKey}`;
+    nextPositions.delete(targetNodeId);
+
     for (const k of Array.from(nextPositions.keys())) {
       if (k.startsWith(nodePrefix)) {
         const stripped = k.slice(nodePrefix.length);
-        if (
-          stripped === canvasKey ||
-          stripped === cleanKey ||
-          stripped.endsWith(`/${cleanKey}`) ||
-          cleanKey.endsWith(`/${stripped}`)
-        ) {
+        if (matchesEndpointTag(stripped, canvasKey)) {
           nextPositions.delete(k);
         }
       }
@@ -436,6 +462,7 @@ export class FlowLayoutStore {
   /**
    * Remove a device from canvas staging and clean up associated positions.
    * If direction is passed, delegates to unstageEndpoint; otherwise removes all directional endpoints.
+   * Enforces strict node isolation (ADR 0028).
    */
   disableDevice(deviceId: string, nodeId?: string, direction?: 'input' | 'output') {
     const canvasKey = nodeId && !deviceId.includes('/') ? `${nodeId}/${deviceId}` : deviceId;
@@ -444,47 +471,22 @@ export class FlowLayoutStore {
       return;
     }
 
-    const cleanKey = deviceId.includes('/') ? deviceId.slice(deviceId.indexOf('/') + 1) : deviceId;
-
     const next = new Set(this.enabledDevices);
     for (const d of Array.from(next)) {
-      const stripped = d.replace(/^(in:|out:|input-|output-)/, '');
-      if (
-        d === deviceId ||
-        d === canvasKey ||
-        d === cleanKey ||
-        stripped === deviceId ||
-        stripped === canvasKey ||
-        stripped === cleanKey ||
-        stripped.endsWith(`/${cleanKey}`) ||
-        cleanKey.endsWith(`/${stripped}`)
-      ) {
+      if (matchesEndpointTag(d, canvasKey)) {
         next.delete(d);
       }
     }
     this.enabledDevices = next;
 
     const nextPositions = new Map(this.positions);
-    nextPositions.delete(deviceId);
     nextPositions.delete(canvasKey);
-    nextPositions.delete(cleanKey);
-    nextPositions.delete(`input-${deviceId}`);
-    nextPositions.delete(`output-${deviceId}`);
     nextPositions.delete(`input-${canvasKey}`);
     nextPositions.delete(`output-${canvasKey}`);
-    if (nodeId) {
-      nextPositions.delete(`${nodeId}/${deviceId}`);
-      nextPositions.delete(`input-${nodeId}/${deviceId}`);
-      nextPositions.delete(`output-${nodeId}/${deviceId}`);
-    }
+
     for (const k of Array.from(nextPositions.keys())) {
       const stripped = k.replace(/^(input-|output-)/, '');
-      if (
-        stripped === deviceId ||
-        stripped === canvasKey ||
-        stripped === cleanKey ||
-        stripped.endsWith(`/${cleanKey}`)
-      ) {
+      if (matchesEndpointTag(stripped, canvasKey)) {
         nextPositions.delete(k);
       }
     }

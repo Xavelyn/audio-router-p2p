@@ -122,11 +122,24 @@ class RoomStore {
 
   async removeRoomInput(roomId: string, devId: string) {
     this.lastError = null;
-    // Optimistic local unbinding
+    const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+    // Optimistic local unbinding (ADR 0028 strict canonical isolation)
     const idx = this.rooms.findIndex((r) => r.id === roomId);
     if (idx !== -1) {
       this.rooms = this.rooms.map((r, i) =>
-        i === idx ? { ...r, inputs: (r.inputs || []).filter((id) => id !== devId && !id.endsWith(`/${devId}`)) } : r
+        i === idx
+          ? {
+              ...r,
+              inputs: (r.inputs || []).filter((id) => {
+                if (id === devId) return false;
+                if (devId.includes('/')) {
+                  // devId is qualified (e.g. nodeA/mic-1): never unbind nodeB/mic-1
+                  return true;
+                }
+                return id !== clean && !id.endsWith(`/${clean}`);
+              }),
+            }
+          : r
       );
     }
     try {
@@ -179,11 +192,24 @@ class RoomStore {
 
   async removeRoomOutput(roomId: string, devId: string) {
     this.lastError = null;
-    // Optimistic local unbinding
+    const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+    // Optimistic local unbinding (ADR 0028 strict canonical isolation)
     const idx = this.rooms.findIndex((r) => r.id === roomId);
     if (idx !== -1) {
       this.rooms = this.rooms.map((r, i) =>
-        i === idx ? { ...r, outputs: (r.outputs || []).filter((id) => id !== devId && !id.endsWith(`/${devId}`)) } : r
+        i === idx
+          ? {
+              ...r,
+              outputs: (r.outputs || []).filter((id) => {
+                if (id === devId) return false;
+                if (devId.includes('/')) {
+                  // devId is qualified (e.g. nodeA/mic-1): never unbind nodeB/mic-1
+                  return true;
+                }
+                return id !== clean && !id.endsWith(`/${clean}`);
+              }),
+            }
+          : r
       );
     }
     try {

@@ -338,7 +338,7 @@
                 No matching devices found
               </div>
             {:else}
-              {#each matchingDevices as device (device.id)}
+              {#each matchingDevices as device (node.id && !device.id.includes('/') ? `${node.id}/${device.id}` : device.id)}
                 {@const canvasKey = node.id && !device.id.includes('/') ? `${node.id}/${device.id}` : device.id}
                 {@const isInput = device.max_input > 0 && device.max_output === 0}
                 {@const isOutput = device.max_output > 0 && device.max_input === 0}
@@ -404,13 +404,13 @@
                     </div>
                   </div>
 
-                  <!-- Staging Status Pill / Add Button (ADR 0027 Directional Awareness) -->
+                  <!-- Staging Status Pill / Add Button (ADR 0027, ADR 0028 Directional & Canonical Isolation) -->
                   <div class="shrink-0 flex items-center gap-1">
                     {#if isDuplex}
                       {#if isBothStaged}
                         <button
                           type="button"
-                          onclick={() => onFocusDevice?.(device.id)}
+                          onclick={() => onFocusDevice?.(canvasKey)}
                           class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
                           title="Both endpoints staged on canvas. Click to focus."
                         >
@@ -421,7 +421,7 @@
                         <div class="inline-flex items-center gap-1">
                           <button
                             type="button"
-                            onclick={() => onFocusDevice?.(device.id, 'input')}
+                            onclick={() => onFocusDevice?.(canvasKey, 'input')}
                             class="inline-flex items-center gap-0.5 rounded bg-cyan-500/20 px-1.5 py-0.5 text-[8px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
                             title="Input endpoint is on canvas. Click to focus."
                           >
@@ -453,7 +453,7 @@
                           </button>
                           <button
                             type="button"
-                            onclick={() => onFocusDevice?.(device.id, 'output')}
+                            onclick={() => onFocusDevice?.(canvasKey, 'output')}
                             class="inline-flex items-center gap-0.5 rounded bg-purple-500/20 px-1.5 py-0.5 text-[8px] font-mono font-bold text-purple-300 border border-purple-500/40 hover:bg-purple-500/30 transition-colors cursor-pointer"
                             title="Output endpoint is on canvas. Click to focus."
                           >
@@ -476,7 +476,7 @@
                     {:else if isSimplexStaged}
                       <button
                         type="button"
-                        onclick={() => onFocusDevice?.(device.id)}
+                        onclick={() => onFocusDevice?.(canvasKey)}
                         class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
                         title="Already staged on canvas. Click to focus."
                       >
