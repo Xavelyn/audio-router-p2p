@@ -189,6 +189,7 @@ func (s *V1Server) WriteError(w http.ResponseWriter, statusCode int, code, msg s
 func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	// System & Node Management
 	mux.HandleFunc("/api/v1/system/status", s.AuthMiddleware(s.handleSystemStatus))
+	mux.HandleFunc("/api/v1/status", s.AuthMiddleware(s.handleSystemStatus))
 	mux.HandleFunc("/api/v1/system/peers", s.AuthMiddleware(s.handleSystemPeers))
 	mux.HandleFunc("/api/v1/system/clock-sync", s.AuthMiddleware(s.handleSystemClockSync))
 
