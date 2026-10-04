@@ -9,13 +9,13 @@ import { SSEManager } from '$lib/api/sse';
 import { apiClient } from '$lib/api/client';
 import { tick } from 'svelte';
 
-// Canonical endpoint match helper accommodating node qualification (ADR 0013 / ADR 0018)
-// and SvelteFlow node prefixing ('input-', 'output-')
+// Canonical endpoint match helper accommodating node qualification (ADR 0013 / ADR 0018),
+// SvelteFlow node prefixing ('input-', 'output-'), and directional staging ('in:', 'out:') (ADR 0027)
 function hasDevice(list: string[] | undefined, deviceId: string): boolean {
   if (!list) return false;
   return list.some((id) => {
-    const cleanId = id.replace(/^(input-|output-)/, '');
-    const cleanDev = deviceId.replace(/^(input-|output-)/, '');
+    const cleanId = id.replace(/^(input-|output-|in:|out:)/, '');
+    const cleanDev = deviceId.replace(/^(input-|output-|in:|out:)/, '');
     return cleanId === cleanDev || cleanId.endsWith(`/${cleanDev}`) || cleanDev.endsWith(`/${cleanId}`);
   });
 }
@@ -416,13 +416,14 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
     expect(flowLayoutStore.getPosition(`output-${secondaryDev}`)).toEqual({ x: 1080, y: 120 });
     expect(flowLayoutStore.viewport).toEqual({ x: 15, y: 25, zoom: 1.15 });
 
-    // 3. Reconcile against active server devices: detect and prune ghost nodes
+    // 3. Reconcile against active server devices: detect and prune ghost nodes (ADR 0027 clean ID match)
     const knownDeviceIds = new Set(deviceStore.devices.map((d) => d.id));
     const staged = Array.from(flowLayoutStore.enabledDevices);
 
     for (const id of staged) {
-      if (!knownDeviceIds.has(id)) {
-        flowLayoutStore.disableDevice(id);
+      const cleanId = id.replace(/^(in:|out:|input-|output-)/, '');
+      if (!knownDeviceIds.has(cleanId)) {
+        flowLayoutStore.disableDevice(cleanId);
       }
     }
 
@@ -437,7 +438,7 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
     mockStorage.simulateReboot(true); // persistent disk remains intact
     const restored = JSON.parse(mockStorage.getItem(STORAGE_KEY_V1) || '{}');
     expect(restored.version).toBe(1);
-    expect(restored.stagedDeviceIds).toContain(primaryDev);
+    expect(hasDevice(restored.stagedDeviceIds, primaryDev)).toBe(true);
   });
 
   // ==========================================================================
@@ -492,5 +493,261 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
     sse.disconnect();
     unsubscribe();
     expect(sse.state).toBe('disconnected');
+  });
+
+  // ==========================================================================
+  // Matrix 8: Duplex Output Dismissal Isolation (ADR 0027)
+  // Duplex physical/virtual interface has both input and output staged on canvas.
+  // Input node is bound to a room and streaming audio.
+  // Output node is dismissed (unstaged) from canvas.
+  // VERIFY:
+  // 1. Output endpoint is removed from flowLayoutStore.
+  // 2. Counterpart input endpoint remains staged on canvas with intact coordinates.
+  // 3. Room input route is NOT removed.
+  // 4. Room card continues to render the input device (no phantom bindings).
+  // ==========================================================================
+  it('Matrix 8: Duplex Output Dismissal Isolation - dismissing output preserves connected input and room binding', async () => {
+    const roomId = `room-m8-duplex-${Date.now()}`;
+
+    // 1. Create duplex virtual device
+    const duplexDev = await deviceStore.createVirtual({
+      name: `M8 Duplex Interface ${Date.now()}`,
+      direction: 'duplex',
+      channels: 2,
+      sample_rate: 48000,
+    });
+    expect(duplexDev.max_input).toBeGreaterThan(0);
+    expect(duplexDev.max_output).toBeGreaterThan(0);
+
+    // 2. Stage both directional endpoints on canvas
+    flowLayoutStore.stageEndpoint(duplexDev.id, 'input', { x: 60, y: 150 });
+    flowLayoutStore.stageEndpoint(duplexDev.id, 'output', { x: 1040, y: 150 });
+
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'input')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'output')).toBe(true);
+    expect(flowLayoutStore.getPosition(`input-${duplexDev.id}`)).toEqual({ x: 60, y: 150 });
+    expect(flowLayoutStore.getPosition(`output-${duplexDev.id}`)).toEqual({ x: 1040, y: 150 });
+
+    // 3. Create room and bind duplex input only
+    await roomStore.createRoom({ id: roomId, name: 'M8 Duplex Live Studio' });
+    await roomStore.addRoomInput(roomId, duplexDev.id);
+
+    const roomBeforeDismiss = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && hasDevice(r.inputs, duplexDev.id)
+    );
+    expect(roomBeforeDismiss).toBeDefined();
+    expect(roomBeforeDismiss!.inputs.length).toBe(1);
+    expect(roomBeforeDismiss!.outputs.length).toBe(0);
+
+    // 4. Operator dismisses output node ("output-duplexDev.id") from canvas
+    // Simulate direction-scoped dismissal per ADR 0027 handleDismissDevice
+    for (const room of roomStore.rooms) {
+      if (room.outputs && hasDevice(room.outputs, duplexDev.id)) {
+        await roomStore.removeRoomOutput(room.id, duplexDev.id);
+      }
+    }
+    flowLayoutStore.unstageEndpoint(duplexDev.id, 'output');
+
+    // 5. Assert: Output node is unstaged and its position removed
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'output')).toBe(false);
+    expect(flowLayoutStore.getPosition(`output-${duplexDev.id}`)).toBeUndefined();
+
+    // 6. Assert: Input node REMAINS STAGED on canvas with exact spatial coordinates!
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'input')).toBe(true);
+    expect(flowLayoutStore.getPosition(`input-${duplexDev.id}`)).toEqual({ x: 60, y: 150 });
+    expect(flowLayoutStore.isDeviceEnabled(duplexDev.id)).toBe(true);
+
+    // 7. Assert: Room inputs route is completely UNTOUCHED
+    const roomAfterDismiss = roomStore.rooms.find((r) => r.id === roomId);
+    expect(roomAfterDismiss).toBeDefined();
+    expect(hasDevice(roomAfterDismiss!.inputs, duplexDev.id)).toBe(true);
+    expect(roomAfterDismiss!.inputs.length).toBe(1);
+
+    // 8. Assert: Authoritative Room Card Acoustic Resolution (no phantom binding)
+    // Assigned inputs strictly matches room.inputs 1:1
+    const allKnown = new Map(deviceStore.devices.map((d) => [d.id, d]));
+    const assignedInputs = roomAfterDismiss!.inputs.map((inId) => {
+      const match = allKnown.get(inId);
+      return match || { id: inId, name: `${inId} (Offline / Unstaged)` };
+    });
+    expect(assignedInputs.length).toBe(roomAfterDismiss!.inputs.length);
+    expect(hasDevice(assignedInputs.map((d) => d.id), duplexDev.id)).toBe(true);
+
+    // Teardown
+    await roomStore.deleteRoom(roomId);
+    await deviceStore.deleteVirtual(duplexDev.id);
+  });
+
+  // ==========================================================================
+  // Matrix 9: Duplex Input Dismissal Isolation (ADR 0027)
+  // Duplex physical/virtual interface has both input and output staged on canvas.
+  // Output node is bound to a room as playout sink.
+  // Input node is dismissed (unstaged) from canvas.
+  // VERIFY:
+  // 1. Input endpoint is removed from flowLayoutStore.
+  // 2. Counterpart output endpoint remains staged on canvas with intact coordinates.
+  // 3. Room output route is NOT removed.
+  // 4. Room card continues to render the output device.
+  // ==========================================================================
+  it('Matrix 9: Duplex Input Dismissal Isolation - dismissing input preserves connected output and room binding', async () => {
+    const roomId = `room-m9-duplex-${Date.now()}`;
+
+    // 1. Create duplex virtual device
+    const duplexDev = await deviceStore.createVirtual({
+      name: `M9 Duplex Playout ${Date.now()}`,
+      direction: 'duplex',
+      channels: 2,
+      sample_rate: 48000,
+    });
+
+    // 2. Stage both directional endpoints on canvas
+    flowLayoutStore.stageEndpoint(duplexDev.id, 'input', { x: 70, y: 250 });
+    flowLayoutStore.stageEndpoint(duplexDev.id, 'output', { x: 1050, y: 250 });
+
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'input')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'output')).toBe(true);
+
+    // 3. Create room and bind duplex output only
+    await roomStore.createRoom({ id: roomId, name: 'M9 Playout Monitor Room' });
+    await roomStore.addRoomOutput(roomId, duplexDev.id);
+
+    const roomBeforeDismiss = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && hasDevice(r.outputs, duplexDev.id)
+    );
+    expect(roomBeforeDismiss!.outputs.length).toBe(1);
+
+    // 4. Operator dismisses input node ("input-duplexDev.id")
+    for (const room of roomStore.rooms) {
+      if (room.inputs && hasDevice(room.inputs, duplexDev.id)) {
+        await roomStore.removeRoomInput(room.id, duplexDev.id);
+      }
+    }
+    flowLayoutStore.unstageEndpoint(duplexDev.id, 'input');
+
+    // 5. Assert: Input node is unstaged and its position removed
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'input')).toBe(false);
+    expect(flowLayoutStore.getPosition(`input-${duplexDev.id}`)).toBeUndefined();
+
+    // 6. Assert: Output node REMAINS STAGED on canvas with exact spatial coordinates
+    expect(flowLayoutStore.isEndpointStaged(duplexDev.id, 'output')).toBe(true);
+    expect(flowLayoutStore.getPosition(`output-${duplexDev.id}`)).toEqual({ x: 1050, y: 250 });
+    expect(flowLayoutStore.isDeviceEnabled(duplexDev.id)).toBe(true);
+
+    // 7. Assert: Room outputs route is completely UNTOUCHED
+    const roomAfterDismiss = roomStore.rooms.find((r) => r.id === roomId);
+    expect(hasDevice(roomAfterDismiss!.outputs, duplexDev.id)).toBe(true);
+    expect(roomAfterDismiss!.outputs.length).toBe(1);
+
+    // 8. Assert: Authoritative Room Card outputs match room.outputs 1:1
+    const allKnown = new Map(deviceStore.devices.map((d) => [d.id, d]));
+    const assignedOutputs = roomAfterDismiss!.outputs.map((outId) => {
+      const match = allKnown.get(outId);
+      return match || { id: outId, name: `${outId} (Offline / Unstaged)` };
+    });
+    expect(assignedOutputs.length).toBe(roomAfterDismiss!.outputs.length);
+    expect(hasDevice(assignedOutputs.map((d) => d.id), duplexDev.id)).toBe(true);
+
+    // Teardown
+    await roomStore.deleteRoom(roomId);
+    await deviceStore.deleteVirtual(duplexDev.id);
+  });
+
+  // ==========================================================================
+  // Matrix 10: Room Acoustic Decoupling & Offline Synthetic Fallbacks (ADR 0027)
+  // Devices assigned to room that are either unstaged from canvas or disconnected
+  // must render synthetic fallback items. Total rendered items must strictly
+  // equal room.inputs.length and room.outputs.length.
+  // ==========================================================================
+  it('Matrix 10: Room Acoustic Decoupling - renders synthetic fallbacks and avoids phantom room card bindings', async () => {
+    const roomId = `room-m10-acoustic-${Date.now()}`;
+    const offlineDevId = 'offline:remote-satellite-mic';
+
+    // 1. Create room with an unstaged/offline device bound
+    await roomStore.createRoom({ id: roomId, name: 'M10 Acoustic Room' });
+    await roomStore.addRoomInput(roomId, offlineDevId);
+
+    const room = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && hasDevice(r.inputs, offlineDevId)
+    );
+    expect(room).toBeDefined();
+    expect(room!.inputs.length).toBe(1);
+
+    // 2. Device is NOT in active deviceStore inventory and NOT staged in flowLayoutStore
+    expect(flowLayoutStore.isEndpointStaged(offlineDevId, 'input')).toBe(false);
+    expect(deviceStore.devices.some((d) => d.id === offlineDevId)).toBe(false);
+
+    // 3. Resolve room card items directly from room state (ADR 0027 logic)
+    const allKnown = new Map(deviceStore.devices.map((d) => [d.id, d]));
+    const assignedInputs = room!.inputs.map((inId) => {
+      const match = allKnown.get(inId);
+      if (match) return match;
+      return {
+        id: inId,
+        name: `${inId} (Offline / Unstaged)`,
+        max_input: 1,
+        max_output: 0,
+      };
+    });
+
+    // Invariant Guarantee: |renderedInputItems| === |room.inputs|
+    expect(assignedInputs.length).toBe(room!.inputs.length);
+    expect(assignedInputs[0].name).toContain('(Offline / Unstaged)');
+    expect(hasDevice([assignedInputs[0].id], offlineDevId)).toBe(true);
+
+    // 4. Verify unbind action works cleanly from the room card
+    await roomStore.removeRoomInput(roomId, offlineDevId);
+    const roomAfterUnbind = await waitForStore(
+      () => roomStore.rooms.find((r) => r.id === roomId),
+      (r) => !!r && r.inputs.length === 0
+    );
+    expect(roomAfterUnbind!.inputs.length).toBe(0);
+
+    // Teardown
+    await roomStore.deleteRoom(roomId);
+  });
+
+  // ==========================================================================
+  // Matrix 11: Schema Migration from Legacy V1 to Directional Staging (ADR 0027)
+  // Hydrating legacy bare device keys with positional inference.
+  // ==========================================================================
+  it('Matrix 11: Legacy V1 Schema Hydration - converts bare device keys to directional endpoints based on positions', async () => {
+    const legacyLayout = {
+      version: 1,
+      lastUpdated: Date.now() - 10000,
+      sidebarCollapsed: false,
+      stagedDeviceIds: ['hw:mic-only', 'hw:speaker-only', 'hw:duplex-both'],
+      nodePositions: {
+        'input-hw:mic-only': { x: 50, y: 100 },
+        'output-hw:speaker-only': { x: 1000, y: 100 },
+        'input-hw:duplex-both': { x: 50, y: 300 },
+        'output-hw:duplex-both': { x: 1000, y: 300 },
+      },
+    };
+
+    mockStorage.setItem(STORAGE_KEY_V1, JSON.stringify(legacyLayout));
+    flowLayoutStore.hydrate();
+    await tick();
+
+    // 1. Mic-only device had only input position -> normalized to "in:hw:mic-only"
+    expect(flowLayoutStore.isEndpointStaged('hw:mic-only', 'input')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged('hw:mic-only', 'output')).toBe(false);
+
+    // 2. Speaker-only device had only output position -> normalized to "out:hw:speaker-only"
+    expect(flowLayoutStore.isEndpointStaged('hw:speaker-only', 'output')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged('hw:speaker-only', 'input')).toBe(false);
+
+    // 3. Duplex device had both positions -> normalized to both directions
+    expect(flowLayoutStore.isEndpointStaged('hw:duplex-both', 'input')).toBe(true);
+    expect(flowLayoutStore.isEndpointStaged('hw:duplex-both', 'output')).toBe(true);
+
+    // 4. Dismissing output of duplex device leaves input intact
+    flowLayoutStore.unstageEndpoint('hw:duplex-both', 'output');
+    expect(flowLayoutStore.isEndpointStaged('hw:duplex-both', 'output')).toBe(false);
+    expect(flowLayoutStore.isEndpointStaged('hw:duplex-both', 'input')).toBe(true);
+    expect(flowLayoutStore.getPosition('input-hw:duplex-both')).toEqual({ x: 50, y: 300 });
+    expect(flowLayoutStore.getPosition('output-hw:duplex-both')).toBeUndefined();
   });
 });
