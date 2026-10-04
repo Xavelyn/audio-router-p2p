@@ -18,6 +18,7 @@ export interface StreamMeterState {
   dtxState: DTXState;
   timestampNs: number;
   channels: ChannelState[];
+  lastUpdated: number;
 }
 
 class MeterStore {
@@ -84,13 +85,21 @@ class MeterStore {
   }
 
   public handleMeterFrame(frame: MeterFrame) {
-    this.lastRealPacketTime = Date.now();
+    if (frame.closed) {
+      if (this.streams[frame.stream_id]) {
+        delete this.streams[frame.stream_id];
+        this.recomputeActiveChannels();
+      }
+      return;
+    }
+
     const now = Date.now();
+    this.lastRealPacketTime = now;
 
     const existingStream = this.streams[frame.stream_id];
     const prevChannels = existingStream?.channels || [];
 
-    const updatedChannels: ChannelState[] = frame.channels.map((ch) => {
+    const updatedChannels: ChannelState[] = (frame.channels || []).map((ch) => {
       const prev = prevChannels.find((p) => p.channel === ch.channel);
       const prevPeakHold = prev?.peakHoldDb ?? -96;
       const prevClipHold = prev?.clipHoldUntil ?? 0;
@@ -118,9 +127,10 @@ class MeterStore {
 
     this.streams[frame.stream_id] = {
       streamId: frame.stream_id,
-      dtxState: frame.dtx_state,
-      timestampNs: frame.timestamp_ns,
+      dtxState: frame.dtx_state || 'Active',
+      timestampNs: frame.timestamp_ns || (now * 1000000),
       channels: updatedChannels,
+      lastUpdated: now,
     };
 
     // Flatten channels for primary rack view
@@ -128,39 +138,59 @@ class MeterStore {
   }
 
   private recomputeActiveChannels() {
-    const streamKeys = Object.keys(this.streams);
-    if (streamKeys.length > 0) {
-      // Show first active stream channels, or combine
-      const primaryStream = this.streams[streamKeys[0]];
-      this.activeChannelMeters = primaryStream.channels;
+    const now = Date.now();
+    // Filter active streams updated within 1500ms
+    const activeStreams = Object.values(this.streams).filter(
+      (s) => s.streamId === 'demo-multitrack-bus' || (now - s.lastUpdated < 1500)
+    );
+
+    if (activeStreams.length > 0) {
+      // Pick the most recently updated active stream
+      activeStreams.sort((a, b) => b.lastUpdated - a.lastUpdated);
+      this.activeChannelMeters = activeStreams[0].channels;
     } else if (this.useSimulation) {
       // Simulation will populate activeChannelMeters
     } else {
       // Default idle stereo meters
       this.activeChannelMeters = [
-        { channel: 0, rmsDb: -96, peakDb: -96, peakHoldDb: -96, clipped: false, clipHoldUntil: 0, lastUpdated: Date.now() },
-        { channel: 1, rmsDb: -96, peakDb: -96, peakHoldDb: -96, clipped: false, clipHoldUntil: 0, lastUpdated: Date.now() },
+        { channel: 0, rmsDb: -96, peakDb: -96, peakHoldDb: -96, clipped: false, clipHoldUntil: 0, lastUpdated: now },
+        { channel: 1, rmsDb: -96, peakDb: -96, peakHoldDb: -96, clipped: false, clipHoldUntil: 0, lastUpdated: now },
       ];
     }
   }
 
   // Decay loop running at ~60fps to decay peak needle hold & clip lamps
   private startDecayLoop() {
-    let lastTick = performance.now();
+    let lastTick = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
     const tick = (time: number) => {
-      const dt = (time - lastTick) / 1000;
+      const dt = Math.min(Math.max((time - lastTick) / 1000, 0), 0.1);
       lastTick = time;
       const now = Date.now();
+      let streamEvicted = false;
 
-      // Check if real stream is silent or not sending
-      if (now - this.lastRealPacketTime > 2000 && !this.useSimulation && Object.keys(this.streams).length === 0) {
-        // Idle decay
-      }
+      for (const [sId, stream] of Object.entries(this.streams)) {
+        if (sId === 'demo-multitrack-bus') continue;
 
-      for (const stream of Object.values(this.streams)) {
+        const ageMs = now - stream.lastUpdated;
+
+        // TTL eviction after 1500ms without frames
+        if (ageMs > 1500) {
+          delete this.streams[sId];
+          streamEvicted = true;
+          continue;
+        }
+
+        // If packets paused (>100ms), decay audio levels towards noise floor (-96 dBFS)
+        if (ageMs > 100) {
+          for (const ch of stream.channels) {
+            ch.peakDb = Math.max(-96, ch.peakDb - 24 * dt);
+            ch.rmsDb = Math.max(-96, ch.rmsDb - 24 * dt);
+          }
+        }
+
+        // Peak hold decay: ~20 dB per second
         for (const ch of stream.channels) {
-          // Peak hold decay: ~20 dB per second
           if (ch.peakHoldDb > ch.peakDb) {
             ch.peakHoldDb = Math.max(ch.peakDb, ch.peakHoldDb - 22 * dt);
           }
@@ -179,10 +209,16 @@ class MeterStore {
         }
       }
 
-      this.animFrameId = requestAnimationFrame(tick);
+      if (streamEvicted) {
+        this.recomputeActiveChannels();
+      }
+
+      if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+        this.animFrameId = requestAnimationFrame(tick);
+      }
     };
 
-    if (typeof window !== 'undefined') {
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
       this.animFrameId = requestAnimationFrame(tick);
     }
   }

@@ -227,9 +227,11 @@ export type DTXState = 'Active' | 'Hangover' | 'Suppressed';
 
 export interface MeterFrame {
   stream_id: string;
-  timestamp_ns: number;
-  dtx_state: DTXState;
+  timestamp_ns?: number;
+  dtx_state?: DTXState;
   channels: ChannelMeter[];
+  closed?: boolean;
+  timestamp?: number;
 }
 
 export type StreamMeterFrame = MeterFrame;

@@ -9,6 +9,12 @@
   let canvasElements: Record<string, HTMLCanvasElement> = {};
   let animId: number | null = null;
 
+  const activeStreams = $derived(
+    Object.values(meterStore.streams).filter(
+      (s) => s.streamId === 'demo-multitrack-bus' || Date.now() - s.lastUpdated < 1500
+    )
+  );
+
   onMount(() => {
     meterStore.init();
     startCanvasRenderLoop();
@@ -147,7 +153,7 @@
   <div class="flex-1 overflow-y-auto p-6 flex flex-col items-center justify-center bg-zinc-950">
     <div class="flex flex-col gap-6 w-full max-w-5xl">
       <!-- Streams Loop or Multi-channel Rack -->
-      {#if Object.keys(meterStore.streams).length === 0 && !meterStore.useSimulation}
+      {#if activeStreams.length === 0 && !meterStore.useSimulation}
         <div class="flex flex-col items-center justify-center p-12 rounded-xl border border-dashed border-zinc-800 text-center">
           <Activity class="w-8 h-8 text-zinc-600 mb-2" />
           <h3 class="text-sm font-semibold text-zinc-300">No active audio stream telemetry frames</h3>
@@ -163,7 +169,7 @@
           </button>
         </div>
       {:else}
-        {#each Object.values(meterStore.streams) as stream (stream.streamId)}
+        {#each activeStreams as stream (stream.streamId)}
           {@const dtxBadge = getDtxBadge(stream.dtxState)}
           <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-xl min-w-0">
             <!-- Stream Header -->

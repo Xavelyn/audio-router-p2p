@@ -2,6 +2,7 @@
   import { Handle, Position } from '@xyflow/svelte';
   import type { AudioDevice } from '$lib/api/types';
   import { meterStore } from '$lib/stores/meters.svelte';
+  import { urnChecksum } from '$lib/utils/checksum';
   import Speaker from '@lucide/svelte/icons/speaker';
   import Headphones from '@lucide/svelte/icons/headphones';
   import Plus from '@lucide/svelte/icons/plus';
@@ -30,7 +31,12 @@
     data.allRooms.filter((r) => !data.sourceRooms.some((source) => source.id === r.id))
   );
 
-  const deviceChecksum = $derived.by(() => {
+  const deviceHash = $derived.by(() => {
+    const raw = data.device.urn || data.device.id || '';
+    return urnChecksum(raw);
+  });
+
+  const deviceTail = $derived.by(() => {
     const raw = data.device.urn || data.device.id || '';
     if (raw.includes(':')) {
       const parts = raw.split(':');
@@ -39,30 +45,53 @@
     return '';
   });
 
-  // Meter levels from meterStore
+  // Meter levels from meterStore, dynamically resolved to the most recent active stream
   const deviceStream = $derived.by(() => {
+    const now = Date.now();
+    const candidates = [];
+
     for (const [sId, st] of Object.entries(meterStore.streams)) {
-      if (
+      // Must not be stale (frames received within last 1500ms or demo simulation)
+      if (st.streamId !== 'demo-multitrack-bus' && now - st.lastUpdated > 1500) {
+        continue;
+      }
+
+      const matchesDirect =
         sId.includes(data.device.id) ||
         (data.device.urn && sId.includes(data.device.urn)) ||
-        (deviceChecksum && sId.includes(deviceChecksum)) ||
-        (data.device.legacy_id && sId.includes(data.device.legacy_id)) ||
-        data.sourceRooms.some((r) => sId.includes(r.id))
-      ) {
-        return st;
+        (deviceHash && sId.includes(deviceHash)) ||
+        (deviceTail && sId.includes(deviceTail)) ||
+        (data.device.legacy_id && sId.includes(data.device.legacy_id));
+
+      const matchesRoom = data.sourceRooms.some((r) => {
+        if (!sId.includes(r.id)) return false;
+        // If room matches, verify it is for this output endpoint or room route
+        return (
+          matchesDirect ||
+          (deviceHash && sId.includes(deviceHash)) ||
+          sId.startsWith(`room-${r.id}`)
+        );
+      });
+
+      if (matchesDirect || matchesRoom) {
+        candidates.push(st);
       }
     }
-    return null;
+
+    if (candidates.length === 0) return null;
+    // Deterministic selection: always bind to the most recently updated stream
+    candidates.sort((a, b) => b.lastUpdated - a.lastUpdated);
+    return candidates[0];
   });
 
   const leftMeter = $derived(
     deviceStream?.channels[0] ??
-      (data.sourceRooms.length > 0 ? meterStore.activeChannelMeters[0] : null) ??
+      (meterStore.useSimulation && data.sourceRooms.length > 0 ? meterStore.activeChannelMeters[0] : null) ??
       { rmsDb: -96, peakDb: -96, clipped: false }
   );
   const rightMeter = $derived(
     deviceStream?.channels[1] ??
-      (data.sourceRooms.length > 0 ? meterStore.activeChannelMeters[1] : null) ??
+      (meterStore.useSimulation && data.sourceRooms.length > 0 ? meterStore.activeChannelMeters[1] : null) ??
       { rmsDb: -96, peakDb: -96, clipped: false }
   );
 
