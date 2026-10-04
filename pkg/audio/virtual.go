@@ -81,6 +81,8 @@ func (v *VirtualAudioDevice) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+const defaultMaxVirtualBuffer = 10 * 1024 * 1024 // 10MB upper bound guard
+
 // Write captures PCM frames written to the device.
 func (v *VirtualAudioDevice) Write(p []byte) (int, error) {
 	v.mu.Lock()
@@ -88,6 +90,16 @@ func (v *VirtualAudioDevice) Write(p []byte) (int, error) {
 
 	if v.closed {
 		return 0, io.ErrClosedPipe
+	}
+
+	// Prevent unbounded heap growth (CWE-400) during extended matrix tests
+	if len(v.captured)+len(p) > defaultMaxVirtualBuffer {
+		overflow := (len(v.captured) + len(p)) - defaultMaxVirtualBuffer
+		if overflow < len(v.captured) {
+			v.captured = v.captured[overflow:]
+		} else {
+			v.captured = nil
+		}
 	}
 
 	v.captured = append(v.captured, p...)
@@ -104,6 +116,13 @@ func (v *VirtualAudioDevice) CapturedBytes() []byte {
 	return out
 }
 
+// Reopen resets the closed flag on a VirtualAudioDevice, allowing it to be reused.
+func (v *VirtualAudioDevice) Reopen() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.closed = false
+}
+
 // Reset clears both the input and captured output buffers.
 func (v *VirtualAudioDevice) Reset() {
 	v.mu.Lock()
@@ -111,6 +130,7 @@ func (v *VirtualAudioDevice) Reset() {
 
 	v.inBuf = nil
 	v.captured = nil
+	v.closed = false
 }
 
 // SetPacing configures real-time simulation pacing on Read operations.

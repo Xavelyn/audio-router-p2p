@@ -46,6 +46,11 @@ type StreamKey struct {
 	Direction StreamDirection
 }
 
+// reopener represents streams that can reset their closed state for subsequent route bindings.
+type reopener interface {
+	Reopen()
+}
+
 // DeviceResolver maps canonical URNs and legacy aliases ("0", "1", "hw:0,0")
 // to Device metadata and audio streams, managing ghost device transitions,
 // reference-counted virtual stream handles, and multiplexed hardware routing.
@@ -418,8 +423,17 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 	var phys AudioStream
 	if rebound, ok := r.reboundStreams[key]; ok && rebound != nil {
 		phys = rebound
-		delete(r.reboundStreams, key)
+		if dev.IsVirtual {
+			if ro, ok := phys.(reopener); ok {
+				ro.Reopen()
+			}
+		} else {
+			delete(r.reboundStreams, key)
+		}
 		log.Printf("[AUDIO:DEV] Using rebound physical input stream for URN=%q", dev.URN)
+	} else if dev.IsVirtual {
+		log.Printf("[AUDIO:DEV] WARN: virtual device URN=%q has no physical stream, using GhostAudioStream", dev.URN)
+		phys = NewGhostAudioStream(sampleRate, channels)
 	} else if dev.Status == "quarantined" || dev.Status == "disconnected" || r.quarantined[dev.URN] {
 		log.Printf("[AUDIO:DEV] WARN: device URN=%q status is %q. Returning GhostAudioStream handle (silent)", dev.URN, dev.Status)
 		phys = NewGhostAudioStream(sampleRate, channels)
@@ -524,8 +538,17 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 	var phys AudioStream
 	if rebound, ok := r.reboundStreams[key]; ok && rebound != nil {
 		phys = rebound
-		delete(r.reboundStreams, key)
+		if dev.IsVirtual {
+			if ro, ok := phys.(reopener); ok {
+				ro.Reopen()
+			}
+		} else {
+			delete(r.reboundStreams, key)
+		}
 		log.Printf("[AUDIO:DEV] Using rebound physical output stream for URN=%q", dev.URN)
+	} else if dev.IsVirtual {
+		log.Printf("[AUDIO:DEV] WARN: virtual device URN=%q has no physical stream, using GhostAudioStream", dev.URN)
+		phys = NewGhostAudioStream(sampleRate, channels)
 	} else if dev.Status == "quarantined" || dev.Status == "disconnected" || r.quarantined[dev.URN] {
 		log.Printf("[AUDIO:DEV] WARN: device URN=%q status is %q. Returning GhostAudioStream handle (silent)", dev.URN, dev.Status)
 		phys = NewGhostAudioStream(sampleRate, channels)
@@ -581,9 +604,8 @@ func (r *DeviceResolver) rebindDirectionalLocked(ref string, dir StreamDirection
 	key := StreamKey{URN: devURN, Direction: dir}
 	if ctrl, ok := r.controllers[key]; ok {
 		ctrl.swapPhysicalStream(physicalStream)
-	} else {
-		r.reboundStreams[key] = physicalStream
 	}
+	r.reboundStreams[key] = physicalStream
 }
 
 // Rebind atomically swaps out the underlying physical stream for any active
@@ -635,18 +657,14 @@ func (r *DeviceResolver) Rebind(ref string, physicalStream AudioStream) {
 		}
 	}
 
-	swapped := false
 	for key, ctrl := range r.controllers {
 		if key.URN == devURN {
 			ctrl.swapPhysicalStream(physicalStream)
-			swapped = true
 		}
 	}
 
-	if !swapped {
-		r.reboundStreams[StreamKey{URN: devURN, Direction: DirectionInput}] = physicalStream
-		r.reboundStreams[StreamKey{URN: devURN, Direction: DirectionOutput}] = physicalStream
-	}
+	r.reboundStreams[StreamKey{URN: devURN, Direction: DirectionInput}] = physicalStream
+	r.reboundStreams[StreamKey{URN: devURN, Direction: DirectionOutput}] = physicalStream
 }
 
 // ListDevices returns all registered devices with their current statuses.
@@ -681,6 +699,7 @@ func (r *DeviceResolver) Close() error {
 		ctrls = append(ctrls, ctrl)
 	}
 	r.controllers = make(map[StreamKey]*deviceStreamController)
+	rebound := r.reboundStreams
 	r.reboundStreams = make(map[StreamKey]AudioStream)
 	r.mu.Unlock()
 
@@ -688,6 +707,13 @@ func (r *DeviceResolver) Close() error {
 	for _, ctrl := range ctrls {
 		if err := ctrl.close(); err != nil && firstErr == nil {
 			firstErr = err
+		}
+	}
+	for _, st := range rebound {
+		if st != nil {
+			if err := st.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
@@ -908,7 +934,11 @@ func (c *deviceStreamController) teardown() {
 	if c.resolver.controllers[c.key] == c {
 		delete(c.resolver.controllers, c.key)
 	}
-	delete(c.resolver.reboundStreams, c.key)
+	dev, isDev := c.resolver.devices[c.key.URN]
+	isVirtual := isDev && dev.IsVirtual
+	if !isVirtual {
+		delete(c.resolver.reboundStreams, c.key)
+	}
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	phys := c.physical
 	c.physical = nil

@@ -315,6 +315,7 @@ type streamManager struct {
 	hub      *apiTelemetry.TelemetryHub
 
 	mu     sync.Mutex
+	closed bool
 	routes map[string]*activeStream
 }
 
@@ -364,6 +365,9 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 }
 
 func (m *streamManager) startLocked(route router.StreamRoute) error {
+	if m.closed {
+		return errors.New("stream manager closed")
+	}
 	sr := route
 	if sr.SampleRate <= 0 {
 		sr.SampleRate = 44100
@@ -714,6 +718,7 @@ func (m *streamManager) StopRoute(routeID string) error {
 func (m *streamManager) StopAll() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.closed = true
 	for id, as := range m.routes {
 		delete(m.routes, id)
 		m.stopLocked(as)
@@ -750,22 +755,28 @@ func (m *streamManager) stopLocked(as *activeStream) {
 	if m.hub != nil {
 		m.hub.UnregisterTap(as.route.ID)
 	}
-	as.st.Stop()
-	done := make(chan struct{})
-	go func() {
-		_ = as.st.Wait()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		log.Printf("route %s: stream did not stop in time", as.route.ID)
+	if as.st != nil {
+		as.st.Stop()
 	}
 	if as.in != nil {
 		_ = as.in.Close()
+		as.in = nil
+	}
+	if as.st != nil {
+		done := make(chan struct{})
+		go func() {
+			_ = as.st.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			log.Printf("route %s: stream did not stop in time", as.route.ID)
+		}
 	}
 	if as.out != nil {
 		_ = as.out.Close()
+		as.out = nil
 	}
 }
 
