@@ -28,7 +28,7 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
   let restoreFetch: () => void;
   let restoreEventSource: () => void;
 
-  const isLiveBackend = !!process.env.VITE_API_URL;
+  const isLiveBackend = process.env.VITE_LIVE_BACKEND === 'true';
 
   beforeEach(async () => {
     // 1. Install hermetic MockLocalStorage
@@ -39,14 +39,18 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
     restoreEventSource = setupMockEventSource();
 
     // 3. Setup Backend Transport (Live or Mock)
-    if (isLiveBackend) {
-      apiClient.setBaseUrl(process.env.VITE_API_URL!);
+    if (isLiveBackend && process.env.VITE_API_URL) {
+      apiClient.setBaseUrl(process.env.VITE_API_URL);
       apiClient.setToken(process.env.VITE_AUTH_TOKEN || 'managed-e2e-matrix-token');
+      authStore.setDaemonUrl(process.env.VITE_API_URL);
+      authStore.setToken(process.env.VITE_AUTH_TOKEN || 'managed-e2e-matrix-token');
     } else {
       mockBackend = new MockBackendServer();
       restoreFetch = mockBackend.install();
       apiClient.setBaseUrl('http://localhost:8000');
       apiClient.setToken('test-token');
+      authStore.setDaemonUrl('http://localhost:8000');
+      authStore.setToken('test-token');
     }
 
     // Reset Stores to fresh state

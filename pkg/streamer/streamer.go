@@ -894,8 +894,15 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 // transport. We only unregister our receive handler so we stop consuming
 // packets targeting other routes.
 func (s *Streamer) Stop() {
+	s.StopFast()
+}
+
+// StopFast commands the streamer pipeline to immediately stop audio streaming:
+// - Closes/cancels stopCh immediately if not already closed.
+// - Calls Reset() on all peer jitter buffers to flush buffered audio instantly (< 1ms).
+// - Unregisters the transport receive callback immediately so no incoming packets are queued.
+func (s *Streamer) StopFast() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopCh != nil {
 		s.stopOnce.Do(func() { close(s.stopCh) })
 	}
@@ -903,6 +910,15 @@ func (s *Streamer) Stop() {
 		s.unregister()
 		s.unregister = nil
 	}
+	s.mu.Unlock()
+
+	s.peersMu.RLock()
+	for _, peer := range s.peers {
+		if peer.JitterBuf != nil {
+			peer.JitterBuf.Reset()
+		}
+	}
+	s.peersMu.RUnlock()
 }
 
 // Wait blocks until the streamer exits and returns its result.

@@ -10,6 +10,7 @@ import (
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/api/telemetry"
+	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
@@ -99,6 +100,11 @@ func NewV1Server(
 		hub:       hub,
 		devReg:    NewDeviceRegistry(),
 		startTime: time.Now(),
+	}
+	if roomMgr != nil {
+		if l, ok := roomMgr.(audio.DeviceLifecycleListener); ok {
+			s.devReg.RegisterListener(l)
+		}
 	}
 	return s
 }

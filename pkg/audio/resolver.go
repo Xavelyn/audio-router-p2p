@@ -303,6 +303,51 @@ func (r *DeviceResolver) Quarantine(ref string) {
 	}
 }
 
+// FastTeardown immediately marks a device as quarantined and terminates or bypasses
+// the grace period of any active directional controllers targeting ref.
+func (r *DeviceResolver) FastTeardown(ref string) {
+	r.mu.Lock()
+	devURN := ref
+	if mapped, ok := r.aliases[ref]; ok {
+		devURN = mapped
+	}
+
+	if dev, ok := r.devices[devURN]; ok {
+		r.quarantined[devURN] = true
+		dev.Status = "quarantined"
+		r.devices[devURN] = dev
+	} else {
+		r.quarantined[devURN] = true
+	}
+
+	delete(r.reboundStreams, StreamKey{URN: devURN, Direction: DirectionInput})
+	delete(r.reboundStreams, StreamKey{URN: devURN, Direction: DirectionOutput})
+
+	var ctrlsToTeardown []*deviceStreamController
+	for key, ctrl := range r.controllers {
+		if key.URN == devURN {
+			ghost := NewGhostAudioStream(ctrl.sampleRate, ctrl.channels)
+			ctrl.swapPhysicalStream(ghost)
+
+			ctrl.mu.Lock()
+			ctrl.gracePeriod = 0
+			if ctrl.graceTimer != nil {
+				ctrl.graceTimer.Stop()
+				ctrl.graceTimer = nil
+				ctrlsToTeardown = append(ctrlsToTeardown, ctrl)
+			} else if ctrl.refCount <= 0 {
+				ctrlsToTeardown = append(ctrlsToTeardown, ctrl)
+			}
+			ctrl.mu.Unlock()
+		}
+	}
+	r.mu.Unlock()
+
+	for _, ctrl := range ctrlsToTeardown {
+		ctrl.teardown()
+	}
+}
+
 // Activate marks a quarantined device as active.
 func (r *DeviceResolver) Activate(ref string) {
 	r.mu.Lock()
@@ -411,9 +456,10 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 				ctrl.graceTimer = nil
 			}
 			ctrl.refCount++
+			curRefCount := ctrl.refCount
 			handle := ctrl.newInputHandleLocked()
 			ctrl.mu.Unlock()
-			log.Printf("[AUDIO:DEV] SUCCESS: reusing active input stream controller for URN=%q refCount=%d", dev.URN, ctrl.refCount)
+			log.Printf("[AUDIO:DEV] SUCCESS: reusing active input stream controller for URN=%q refCount=%d", dev.URN, curRefCount)
 			return handle, nil
 		}
 		ctrl.mu.Unlock()
@@ -526,9 +572,10 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 				ctrl.graceTimer = nil
 			}
 			ctrl.refCount++
+			curRefCount := ctrl.refCount
 			handle := ctrl.newOutputHandleLocked()
 			ctrl.mu.Unlock()
-			log.Printf("[AUDIO:DEV] SUCCESS: reusing active output stream controller for URN=%q refCount=%d", dev.URN, ctrl.refCount)
+			log.Printf("[AUDIO:DEV] SUCCESS: reusing active output stream controller for URN=%q refCount=%d", dev.URN, curRefCount)
 			return handle, nil
 		}
 		ctrl.mu.Unlock()
@@ -912,10 +959,21 @@ func (c *deviceStreamController) releaseHandle(h *RefStreamHandle) {
 	c.refCount--
 	if c.refCount <= 0 {
 		c.refCount = 0
-		if !c.closed && c.graceTimer == nil {
-			c.graceTimer = time.AfterFunc(c.gracePeriod, func() {
+		if !c.closed {
+			if c.gracePeriod <= 0 {
+				if c.graceTimer != nil {
+					c.graceTimer.Stop()
+					c.graceTimer = nil
+				}
+				c.mu.Unlock()
 				c.teardown()
-			})
+				return
+			}
+			if c.graceTimer == nil {
+				c.graceTimer = time.AfterFunc(c.gracePeriod, func() {
+					c.teardown()
+				})
+			}
 		}
 	}
 	c.mu.Unlock()

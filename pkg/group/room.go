@@ -505,16 +505,25 @@ func (r *Room) RemoveInput(args ...string) error {
 	}
 
 	log.Printf("[ROOM:ROUTE] RemoveInput called: room=%s devID=%q", r.id, devID)
-	idx := -1
-	for i, id := range r.inputs {
-		if id == devID {
-			idx = i
-			break
+	localNodeID := r.localID
+	var remaining []string
+	removedAny := false
+	for _, id := range r.inputs {
+		if EndpointMatches(localNodeID, id, devID) {
+			removedAny = true
+			delete(r.inputGains, id)
+			delete(r.inputGains, devID)
+		} else {
+			remaining = append(remaining, id)
 		}
 	}
-	if idx >= 0 {
-		r.inputs = append(r.inputs[:idx], r.inputs[idx+1:]...)
-		delete(r.inputGains, devID)
+	for gKey := range r.inputGains {
+		if EndpointMatches(localNodeID, gKey, devID) {
+			delete(r.inputGains, gKey)
+		}
+	}
+	if removedAny {
+		r.inputs = remaining
 		r.recompileRoutesLocked()
 		log.Printf("[ROOM:ROUTE] RemoveInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
 		r.mu.Unlock()
@@ -580,16 +589,25 @@ func (r *Room) RemoveOutput(args ...string) error {
 	}
 
 	log.Printf("[ROOM:ROUTE] RemoveOutput called: room=%s devID=%q", r.id, devID)
-	idx := -1
-	for i, id := range r.outputs {
-		if id == devID {
-			idx = i
-			break
+	localNodeID := r.localID
+	var remaining []string
+	removedAny := false
+	for _, id := range r.outputs {
+		if EndpointMatches(localNodeID, id, devID) {
+			removedAny = true
+			delete(r.outputGains, id)
+			delete(r.outputGains, devID)
+		} else {
+			remaining = append(remaining, id)
 		}
 	}
-	if idx >= 0 {
-		r.outputs = append(r.outputs[:idx], r.outputs[idx+1:]...)
-		delete(r.outputGains, devID)
+	for gKey := range r.outputGains {
+		if EndpointMatches(localNodeID, gKey, devID) {
+			delete(r.outputGains, gKey)
+		}
+	}
+	if removedAny {
+		r.outputs = remaining
 		r.recompileRoutesLocked()
 		log.Printf("[ROOM:ROUTE] RemoveOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
 		r.mu.Unlock()
@@ -1048,6 +1066,18 @@ func (r *Room) recompileRoutesLocked() {
 	}
 }
 
+// CompiledRoutes returns a slice of active compiled route IDs.
+func (r *Room) CompiledRoutes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	routes := make([]string, 0, len(r.compiledRoutes))
+	for id := range r.compiledRoutes {
+		routes = append(routes, id)
+	}
+	sort.Strings(routes)
+	return routes
+}
+
 // Members returns all current members
 func (r *Room) Members() []*RoomMember {
 	r.mu.RLock()
@@ -1095,6 +1125,107 @@ func (r *Room) Leave() error {
 	r.clearCompiledRoutesLocked()
 	r.mu.Unlock()
 	return nil
+}
+
+// Close gracefully terminates the room and cleans up resources.
+func (r *Room) Close() error {
+	return r.Leave()
+}
+
+// RecompileRoutes manually triggers route re-synthesis across the crossbar matrix.
+func (r *Room) RecompileRoutes() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recompileRoutesLocked()
+}
+
+// OnDeviceLifecycle reactively handles physical and virtual device arrival or teardown.
+func (r *Room) OnDeviceLifecycle(evt audio.DeviceLifecycleEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	switch evt.Type {
+	case audio.DeviceRemoved, audio.DeviceQuarantined:
+		changed := false
+		var remainingInputs []string
+		for _, in := range r.inputs {
+			matched := false
+			if evt.DeviceURN != "" && EndpointMatches(r.localID, in, evt.DeviceURN) {
+				matched = true
+			}
+			if !matched && evt.LegacyID != "" && EndpointMatches(r.localID, in, evt.LegacyID) {
+				matched = true
+			}
+			if matched {
+				changed = true
+				delete(r.inputGains, in)
+				if evt.DeviceURN != "" {
+					delete(r.inputGains, evt.DeviceURN)
+				}
+				if evt.LegacyID != "" {
+					delete(r.inputGains, evt.LegacyID)
+				}
+			} else {
+				remainingInputs = append(remainingInputs, in)
+			}
+		}
+
+		var remainingOutputs []string
+		for _, out := range r.outputs {
+			matched := false
+			if evt.DeviceURN != "" && EndpointMatches(r.localID, out, evt.DeviceURN) {
+				matched = true
+			}
+			if !matched && evt.LegacyID != "" && EndpointMatches(r.localID, out, evt.LegacyID) {
+				matched = true
+			}
+			if matched {
+				changed = true
+				delete(r.outputGains, out)
+				if evt.DeviceURN != "" {
+					delete(r.outputGains, evt.DeviceURN)
+				}
+				if evt.LegacyID != "" {
+					delete(r.outputGains, evt.LegacyID)
+				}
+			} else {
+				remainingOutputs = append(remainingOutputs, out)
+			}
+		}
+
+		if changed {
+			r.inputs = remainingInputs
+			r.outputs = remainingOutputs
+			r.recompileRoutesLocked()
+		}
+
+	case audio.DeviceCreated, audio.DeviceRestored:
+		hasMatch := false
+		for _, in := range r.inputs {
+			if (evt.DeviceURN != "" && EndpointMatches(r.localID, in, evt.DeviceURN)) ||
+				(evt.LegacyID != "" && EndpointMatches(r.localID, in, evt.LegacyID)) {
+				hasMatch = true
+				break
+			}
+		}
+		if !hasMatch {
+			for _, out := range r.outputs {
+				if (evt.DeviceURN != "" && EndpointMatches(r.localID, out, evt.DeviceURN)) ||
+					(evt.LegacyID != "" && EndpointMatches(r.localID, out, evt.LegacyID)) {
+					hasMatch = true
+					break
+				}
+			}
+		}
+		if hasMatch {
+			r.recompileRoutesLocked()
+		}
+	}
+}
+
+// OnDeviceLifecycleEvent implements audio.DeviceLifecycleListener.
+func (r *Room) OnDeviceLifecycleEvent(evt audio.DeviceLifecycleEvent) {
+	r.OnDeviceLifecycle(evt)
 }
 
 // SetCallbacks registers room event callbacks.

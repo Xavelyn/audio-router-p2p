@@ -142,6 +142,9 @@ type DefaultRoomManager struct {
 	crdt      *LWWSet
 	closed    bool
 
+	debounceTimer *time.Timer
+	pendingEvents []audio.DeviceLifecycleEvent
+
 	// OnLeaderChange is an optional notification hook for testing or external monitoring.
 	OnLeaderChange func(roomID string, newLeader string)
 }
@@ -194,6 +197,7 @@ func NewDefaultRoomManager(
 	if disc != nil {
 		disc.SetStateDelegate(mgr)
 	}
+	audio.GlobalEventHub().RegisterListener(mgr)
 	return mgr
 }
 
@@ -643,12 +647,20 @@ func (m *DefaultRoomManager) LeaveRoom(id string) error {
 
 // Close gracefully closes all managed rooms and tears down active streamers.
 func (m *DefaultRoomManager) Close() error {
+	audio.GlobalEventHub().UnregisterListener(m)
+
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return nil
 	}
 	m.closed = true
+
+	if m.debounceTimer != nil {
+		m.debounceTimer.Stop()
+		m.debounceTimer = nil
+	}
+	m.pendingEvents = nil
 
 	activeStreamers := make([]*GroupStreamer, 0, len(m.rooms))
 	roomsToLeave := make([]*Room, 0, len(m.rooms))
@@ -673,6 +685,156 @@ func (m *DefaultRoomManager) Close() error {
 	}
 	_ = m.Save()
 	return nil
+}
+
+// OnDeviceLifecycleEvent implements audio.DeviceLifecycleListener, reactively driving
+// route teardown on device disconnection and fast-path reconnection on device arrival.
+func (m *DefaultRoomManager) OnDeviceLifecycleEvent(evt audio.DeviceLifecycleEvent) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	rooms := make([]*Room, 0, len(m.rooms))
+	for _, mr := range m.rooms {
+		if mr.room != nil {
+			rooms = append(rooms, mr.room)
+		}
+	}
+	m.mu.Unlock()
+
+	switch evt.Type {
+	case audio.DeviceRemoved, audio.DeviceQuarantined:
+		// Immediate route pruning and stream shutdown (< 1ms)
+		for _, r := range rooms {
+			r.OnDeviceLifecycle(evt)
+		}
+
+		// Update CRDT tombstones symmetrically - scoped to rooms containing a matching endpoint
+		m.mu.Lock()
+		localNode := ""
+		if m.disc != nil {
+			localNode = m.disc.NodeID()
+		}
+
+		changedAny := false
+		for roomID := range m.rooms {
+			rec, ok := m.crdt.GetRecord(roomID)
+			if !ok || rec.Deleted {
+				continue
+			}
+
+			hasInput := false
+			for _, in := range rec.Inputs {
+				if (evt.DeviceURN != "" && EndpointMatches(localNode, in, evt.DeviceURN)) ||
+					(evt.LegacyID != "" && EndpointMatches(localNode, in, evt.LegacyID)) {
+					hasInput = true
+					break
+				}
+			}
+
+			hasOutput := false
+			for _, out := range rec.Outputs {
+				if (evt.DeviceURN != "" && EndpointMatches(localNode, out, evt.DeviceURN)) ||
+					(evt.LegacyID != "" && EndpointMatches(localNode, out, evt.LegacyID)) {
+					hasOutput = true
+					break
+				}
+			}
+
+			if hasInput {
+				if evt.DeviceURN != "" {
+					if updated, err := m.crdt.RemoveInputSymmetric(roomID, evt.DeviceURN); err == nil {
+						m.broadcastDelta(updated)
+						changedAny = true
+					}
+				}
+				if evt.LegacyID != "" && evt.LegacyID != evt.DeviceURN {
+					if curRec, ok := m.crdt.GetRecord(roomID); ok {
+						stillHas := false
+						for _, in := range curRec.Inputs {
+							if EndpointMatches(localNode, in, evt.LegacyID) {
+								stillHas = true
+								break
+							}
+						}
+						if stillHas {
+							if updated, err := m.crdt.RemoveInputSymmetric(roomID, evt.LegacyID); err == nil {
+								m.broadcastDelta(updated)
+								changedAny = true
+							}
+						}
+					}
+				}
+			}
+
+			if hasOutput {
+				if evt.DeviceURN != "" {
+					if updated, err := m.crdt.RemoveOutputSymmetric(roomID, evt.DeviceURN); err == nil {
+						m.broadcastDelta(updated)
+						changedAny = true
+					}
+				}
+				if evt.LegacyID != "" && evt.LegacyID != evt.DeviceURN {
+					if curRec, ok := m.crdt.GetRecord(roomID); ok {
+						stillHas := false
+						for _, out := range curRec.Outputs {
+							if EndpointMatches(localNode, out, evt.LegacyID) {
+								stillHas = true
+								break
+							}
+						}
+						if stillHas {
+							if updated, err := m.crdt.RemoveOutputSymmetric(roomID, evt.LegacyID); err == nil {
+								m.broadcastDelta(updated)
+								changedAny = true
+							}
+						}
+					}
+				}
+			}
+		}
+		m.mu.Unlock()
+		if changedAny {
+			_ = m.Save()
+		}
+
+	case audio.DeviceCreated, audio.DeviceRestored:
+		// Fast-path reconnection with a 5ms debounce window aggregating multi-device bursts
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			return
+		}
+		m.pendingEvents = append(m.pendingEvents, evt)
+		if m.debounceTimer != nil {
+			m.debounceTimer.Stop()
+		}
+		m.debounceTimer = time.AfterFunc(5*time.Millisecond, func() {
+			m.mu.Lock()
+			if m.closed {
+				m.pendingEvents = nil
+				m.mu.Unlock()
+				return
+			}
+			events := m.pendingEvents
+			m.pendingEvents = nil
+			rms := make([]*Room, 0, len(m.rooms))
+			for _, mr := range m.rooms {
+				if mr.room != nil {
+					rms = append(rms, mr.room)
+				}
+			}
+			m.mu.Unlock()
+
+			for _, e := range events {
+				for _, r := range rms {
+					r.OnDeviceLifecycle(e)
+				}
+			}
+		})
+		m.mu.Unlock()
+	}
 }
 
 func (m *DefaultRoomManager) handleLeaderChange(roomID RoomID, newLeader string) {

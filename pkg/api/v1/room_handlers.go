@@ -424,7 +424,8 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 			targetDevID := devID
 			hasExact := false
 			for _, in := range room.Inputs {
-				if in == devID {
+				if in == devID || strings.EqualFold(in, devID) || strings.HasSuffix(strings.ToLower(in), "/"+strings.ToLower(devID)) {
+					targetDevID = in
 					hasExact = true
 					break
 				}
@@ -454,7 +455,8 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 			targetDevID := devID
 			hasExact := false
 			for _, out := range room.Outputs {
-				if out == devID {
+				if out == devID || strings.EqualFold(out, devID) || strings.HasSuffix(strings.ToLower(out), "/"+strings.ToLower(devID)) {
+					targetDevID = out
 					hasExact = true
 					break
 				}

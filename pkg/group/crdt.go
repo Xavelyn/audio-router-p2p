@@ -267,6 +267,7 @@ func (s *LWWSet) AddInput(id, devID string) (RoomRecord, error) {
 }
 
 // RemoveInput unbinds an input device from a room using nested LWW-Element-Set semantics.
+// All matching active keys (evaluated via EndpointMatches) are tombstoned with the current HLT timestamp.
 func (s *LWWSet) RemoveInput(id, devID string) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -281,10 +282,27 @@ func (s *LWWSet) RemoveInput(id, devID string) (RoomRecord, error) {
 		rec.InputRemoves = make(map[string]HLT)
 	}
 	rec.InputRemoves[devID] = ts
+
+	for k := range rec.InputAdds {
+		if EndpointMatches(s.localNode, k, devID) {
+			rec.InputRemoves[k] = ts
+		}
+	}
+	for _, k := range rec.Inputs {
+		if EndpointMatches(s.localNode, k, devID) {
+			rec.InputRemoves[k] = ts
+		}
+	}
+
 	rec.Timestamp = ts
 	recomputeInputs(&rec)
 	s.records[id] = rec.Clone()
 	return rec.Clone(), nil
+}
+
+// RemoveInputSymmetric unbinds an input device from a room using symmetric canonical endpoint matching.
+func (s *LWWSet) RemoveInputSymmetric(id, devID string) (RoomRecord, error) {
+	return s.RemoveInput(id, devID)
 }
 
 // AddOutput binds an output device to a room using nested LWW-Element-Set semantics.
@@ -309,6 +327,7 @@ func (s *LWWSet) AddOutput(id, devID string) (RoomRecord, error) {
 }
 
 // RemoveOutput unbinds an output device from a room using nested LWW-Element-Set semantics.
+// All matching active keys (evaluated via EndpointMatches) are tombstoned with the current HLT timestamp.
 func (s *LWWSet) RemoveOutput(id, devID string) (RoomRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -323,10 +342,27 @@ func (s *LWWSet) RemoveOutput(id, devID string) (RoomRecord, error) {
 		rec.OutputRemoves = make(map[string]HLT)
 	}
 	rec.OutputRemoves[devID] = ts
+
+	for k := range rec.OutputAdds {
+		if EndpointMatches(s.localNode, k, devID) {
+			rec.OutputRemoves[k] = ts
+		}
+	}
+	for _, k := range rec.Outputs {
+		if EndpointMatches(s.localNode, k, devID) {
+			rec.OutputRemoves[k] = ts
+		}
+	}
+
 	rec.Timestamp = ts
 	recomputeOutputs(&rec)
 	s.records[id] = rec.Clone()
 	return rec.Clone(), nil
+}
+
+// RemoveOutputSymmetric unbinds an output device from a room using symmetric canonical endpoint matching.
+func (s *LWWSet) RemoveOutputSymmetric(id, devID string) (RoomRecord, error) {
+	return s.RemoveOutput(id, devID)
 }
 
 // SetRoomBindings updates inputs, outputs, and sync state in one atomic transaction.

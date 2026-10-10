@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/audio/urn"
@@ -32,6 +33,7 @@ type DeviceRegistry struct {
 	virtualDevs  map[string]*VirtualDeviceEntry // Keyed by canonical URN
 	deviceStates map[string]*DeviceState        // Keyed by canonical URN
 	nextVirtID   int
+	hub          *audio.DeviceEventHub
 }
 
 // NewDeviceRegistry creates a thread-safe device registry.
@@ -40,6 +42,26 @@ func NewDeviceRegistry() *DeviceRegistry {
 		virtualDevs:  make(map[string]*VirtualDeviceEntry),
 		deviceStates: make(map[string]*DeviceState),
 		nextVirtID:   1,
+		hub:          audio.GlobalEventHub(),
+	}
+}
+
+// EventHub returns the device lifecycle event bus.
+func (reg *DeviceRegistry) EventHub() *audio.DeviceEventHub {
+	return reg.hub
+}
+
+// RegisterListener registers a subscriber on the device lifecycle event bus.
+func (reg *DeviceRegistry) RegisterListener(l audio.DeviceLifecycleListener) {
+	if reg.hub != nil {
+		reg.hub.RegisterListener(l)
+	}
+}
+
+// UnregisterListener unregisters a subscriber from the device lifecycle event bus.
+func (reg *DeviceRegistry) UnregisterListener(l audio.DeviceLifecycleListener) {
+	if reg.hub != nil {
+		reg.hub.UnregisterListener(l)
 	}
 }
 
@@ -360,6 +382,16 @@ func (reg *DeviceRegistry) CreateVirtualDevice(req CreateVirtualDeviceRequest) (
 		}
 	}
 
+	evt := audio.DeviceLifecycleEvent{
+		Type:      audio.DeviceCreated,
+		DeviceURN: virtURN,
+		LegacyID:  legacyID,
+		Timestamp: time.Now(),
+	}
+	if reg.hub != nil {
+		reg.hub.Dispatch(evt)
+	}
+
 	return dev, nil
 }
 
@@ -381,14 +413,12 @@ func (reg *DeviceRegistry) GetVirtualDeviceStream(id string) (*audio.VirtualAudi
 
 // DeleteVirtualDevice removes and closes an in-memory loopback device by URN or legacy ID.
 func (reg *DeviceRegistry) DeleteVirtualDevice(id string) bool {
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
-
 	id = strings.TrimSpace(id)
 	if unescaped, err := url.PathUnescape(id); err == nil && unescaped != "" {
 		id = unescaped
 	}
 
+	reg.mu.Lock()
 	entry, ok := reg.virtualDevs[id]
 	if !ok {
 		// Search by LegacyID or internal ID
@@ -402,23 +432,43 @@ func (reg *DeviceRegistry) DeleteVirtualDevice(id string) bool {
 	}
 
 	if !ok {
+		reg.mu.Unlock()
 		return false
 	}
 
+	devURN := entry.Device.URN
+	legacyID := entry.Device.LegacyID
+	vDev := entry.Dev
+
+	delete(reg.virtualDevs, devURN)
+	delete(reg.deviceStates, devURN)
+	if legacyID != "" {
+		delete(reg.deviceStates, legacyID)
+	}
+	reg.mu.Unlock()
+
 	resolver := audio.GlobalResolver()
 	if resolver != nil {
-		resolver.Quarantine(entry.Device.URN)
-		if entry.Device.LegacyID != "" {
-			resolver.Quarantine(entry.Device.LegacyID)
+		resolver.FastTeardown(devURN)
+		if legacyID != "" {
+			resolver.FastTeardown(legacyID)
 		}
 	}
 
-	entry.Dev.Close()
-	delete(reg.virtualDevs, entry.Device.URN)
-	delete(reg.deviceStates, entry.Device.URN)
-	if entry.Device.LegacyID != "" {
-		delete(reg.deviceStates, entry.Device.LegacyID)
+	if vDev != nil {
+		_ = vDev.Close()
 	}
+
+	evt := audio.DeviceLifecycleEvent{
+		Type:      audio.DeviceRemoved,
+		DeviceURN: devURN,
+		LegacyID:  legacyID,
+		Timestamp: time.Now(),
+	}
+	if reg.hub != nil {
+		reg.hub.Dispatch(evt)
+	}
+
 	return true
 }
 

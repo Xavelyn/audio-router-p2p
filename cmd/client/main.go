@@ -326,10 +326,11 @@ type streamManager struct {
 }
 
 type activeStream struct {
-	route router.StreamRoute
-	st    *streamer.Streamer
-	in    audio.AudioStream
-	out   audio.AudioStream
+	route  router.StreamRoute
+	st     *streamer.Streamer
+	in     audio.AudioStream
+	out    audio.AudioStream
+	cancel context.CancelFunc
 }
 
 func newStreamManager(cfg *config.Config, trans streamer.Transport, localIPs []string, disc *discovery.Discovery) *streamManager {
@@ -386,8 +387,8 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 
 	if old, ok := m.routes[sr.ID]; ok {
 		log.Printf("[STREAM:MGR] Stopping pre-existing stream for route=%s", sr.ID)
-		m.stopLocked(old)
 		delete(m.routes, sr.ID)
+		m.stopActiveStream(old)
 	}
 
 	localNodeID := ""
@@ -456,7 +457,9 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 			log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to ingress route=%s (%d channels)", sr.ID, chans)
 		}
 
-		m.routes[sr.ID] = &activeStream{route: sr, st: st, in: nil, out: out}
+		ctx, cancel := context.WithCancel(context.Background())
+		_ = ctx
+		m.routes[sr.ID] = &activeStream{route: sr, st: st, in: nil, out: out, cancel: cancel}
 		log.Printf("[STREAM:MGR] Ingress route %s active: receiving from node %s -> local output %s (%d Hz, %d ch)", sr.ID, sr.SourceNodeID, dstRef, sampleRate, chans)
 		return nil
 	}
@@ -633,7 +636,9 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 
 	// Save the potentially updated route (with peer binding and validated destinations)
 	sr.Destinations = destAddrs
-	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out}
+	ctx, cancel := context.WithCancel(context.Background())
+	_ = ctx
+	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out, cancel: cancel}
 	log.Printf("[STREAM:MGR] route %s: streaming device %s -> %d destinations (peer: %s, hasLocalOut: %t)",
 		sr.ID, srcRef, len(destAddrs), sr.PeerID, out != nil)
 	return nil
@@ -707,27 +712,34 @@ func openOutputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRat
 	}
 }
 
-// StopRoute stops and releases a route's streams.
+// StopRoute stops and releases a route's streams immediately and asynchronously.
 func (m *streamManager) StopRoute(routeID string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	as, ok := m.routes[routeID]
 	if !ok {
+		m.mu.Unlock()
 		return nil
 	}
 	delete(m.routes, routeID)
-	m.stopLocked(as)
+	m.mu.Unlock()
+
+	m.stopActiveStream(as)
 	return nil
 }
 
-// StopAll stops every active stream.
+// StopAll stops every active stream concurrently and asynchronously.
 func (m *streamManager) StopAll() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.closed = true
+	toStop := make([]*activeStream, 0, len(m.routes))
 	for id, as := range m.routes {
+		toStop = append(toStop, as)
 		delete(m.routes, id)
-		m.stopLocked(as)
+	}
+	m.mu.Unlock()
+
+	for _, as := range toStop {
+		m.stopActiveStream(as)
 	}
 }
 
@@ -758,32 +770,40 @@ func (m *streamManager) StreamLinkStats() []telemetry.StreamLinkStats {
 }
 
 func (m *streamManager) stopLocked(as *activeStream) {
+	m.stopActiveStream(as)
+}
+
+func (m *streamManager) stopActiveStream(as *activeStream) {
+	if as == nil {
+		return
+	}
 	if m.hub != nil {
 		m.hub.UnregisterTap(as.route.ID)
 	}
-	if as.st != nil {
-		as.st.Stop()
-	}
-	if as.in != nil {
-		_ = as.in.Close()
-		as.in = nil
+	if as.cancel != nil {
+		as.cancel()
 	}
 	if as.st != nil {
-		done := make(chan struct{})
-		go func() {
-			_ = as.st.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			log.Printf("route %s: stream did not stop in time", as.route.ID)
+		as.st.StopFast()
+	}
+	in := as.in
+	out := as.out
+	st := as.st
+	routeID := as.route.ID
+	as.in = nil
+	as.out = nil
+
+	go func(inStream, outStream audio.AudioStream, streamerInst *streamer.Streamer, rID string) {
+		if inStream != nil {
+			_ = inStream.Close()
 		}
-	}
-	if as.out != nil {
-		_ = as.out.Close()
-		as.out = nil
-	}
+		if outStream != nil {
+			_ = outStream.Close()
+		}
+		if streamerInst != nil {
+			_ = streamerInst.Wait()
+		}
+	}(in, out, st, routeID)
 }
 
 // ensureTLS generates a self-signed certificate when no cert/key pair exists,

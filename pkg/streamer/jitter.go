@@ -17,6 +17,7 @@ type JitterBufferInterface interface {
 	PushWithFlags(seq uint32, timestamp int64, data []byte, flags uint8) (int, error)
 	PopNonBlock() ([]byte, uint32, error)
 	Stats() JitterBufferStats
+	Reset()
 	Close() error
 }
 
@@ -460,6 +461,25 @@ type JitterBufferStats struct {
 	ResampleRatio     float64       `json:"resampleRatio,omitempty"`
 	SmoothedWatermark float64       `json:"smoothedWatermark,omitempty"`
 	PLC               dsp.PLCStats  `json:"plc,omitempty"`
+}
+
+// Reset instantly flushes all queued frames and resets playout tracking.
+func (jb *JitterBuffer) Reset() {
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+
+	for i := range jb.frames {
+		jb.frames[i].valid = false
+	}
+	jb.seqInitialized = false
+	jb.originSeq = 0
+	jb.nextSeq = 0
+	jb.playoutTime = time.Time{}
+	jb.originTime = time.Time{}
+	jb.atomicBuffered.Store(0)
+	if jb.driftCtrl != nil {
+		jb.driftCtrl.Reset()
+	}
 }
 
 func (jb *JitterBuffer) Close() error {
