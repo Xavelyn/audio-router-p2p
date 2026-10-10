@@ -9,25 +9,34 @@ class RoomStore {
 
   clearLastError() {
     this.lastError = null;
+    this.error = null;
   }
 
-  async loadRooms() {
-    this.isLoading = true;
-    this.error = null;
+  async loadRooms(silent = false) {
+    if (!silent) this.isLoading = true;
     try {
       const list = await apiClient.listRooms();
       // Ensure inputs, outputs, synced exist even if older API returned partial data
-      this.rooms = list.map((r) => ({
+      const normalized = list.map((r) => ({
         ...r,
         inputs: r.inputs || [],
         outputs: r.outputs || [],
         synced: r.synced ?? false,
       }));
+      if (JSON.stringify(normalized) !== JSON.stringify(this.rooms)) {
+        this.rooms = normalized;
+      }
+      this.error = null;
+      this.lastError = null;
     } catch (err: any) {
-      this.error = err.message || 'Failed to enumerate audio conference rooms';
-      this.rooms = [];
+      const msg = err.message || 'Failed to enumerate audio conference rooms';
+      this.error = msg;
+      this.lastError = msg;
+      if (!silent) {
+        this.rooms = [];
+      }
     } finally {
-      this.isLoading = false;
+      if (!silent) this.isLoading = false;
     }
   }
 

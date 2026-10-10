@@ -41,6 +41,12 @@ class MeterStore {
     this.setupTransport();
   }
 
+  public ensureConnected() {
+    if (!this.isConnected && (!this.ws || this.ws.state === 'disconnected' || this.ws.state === 'error')) {
+      this.setupTransport();
+    }
+  }
+
   public setupTransport() {
     // Teardown existing
     if (this.ws) {

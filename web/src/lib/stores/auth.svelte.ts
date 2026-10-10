@@ -57,9 +57,10 @@ class AuthStore {
     apiClient.setToken(this.authToken);
   }
 
-  async checkConnection(): Promise<boolean> {
-    this.connectionStatus = 'connecting';
-    this.lastError = null;
+  async checkConnection(silent = false): Promise<boolean> {
+    if (!silent && this.connectionStatus !== 'connected') {
+      this.connectionStatus = 'connecting';
+    }
     this.applyCredentials();
 
     try {
@@ -67,6 +68,7 @@ class AuthStore {
       this.connectionStatus = 'connected';
       this.version = status.version;
       this.uptimeSeconds = status.uptime_seconds;
+      this.lastError = null;
       return true;
     } catch (err: any) {
       if (err.status === 401 || err.code === 'ERR_UNAUTHORIZED') {

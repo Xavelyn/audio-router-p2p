@@ -64,17 +64,21 @@ class DeviceStore {
     return ports;
   });
 
-  async loadDevices(kind?: 'all' | 'input' | 'output' | 'virtual') {
-    this.isLoading = true;
-    this.error = null;
+  async loadDevices(kind?: 'all' | 'input' | 'output' | 'virtual', silent = false) {
+    if (!silent) this.isLoading = true;
     try {
       const fetched = await apiClient.listDevices(kind);
-      this.devices = fetched;
+      if (JSON.stringify(fetched) !== JSON.stringify(this.devices)) {
+        this.devices = fetched;
+      }
+      this.error = null;
     } catch (err: any) {
       this.error = err.message || 'Failed to enumerate audio devices';
-      this.devices = [];
+      if (!silent) {
+        this.devices = [];
+      }
     } finally {
-      this.isLoading = false;
+      if (!silent) this.isLoading = false;
     }
   }
 

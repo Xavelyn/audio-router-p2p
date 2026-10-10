@@ -861,6 +861,11 @@
     const _staged = flowLayoutStore.enabledDevices;
 
     untrack(() => {
+      // If canvas has never been configured and rooms/devices just arrived (e.g. after initial gateway disconnect), stage defaults
+      if (!flowLayoutStore.hasSavedLayout && flowLayoutStore.enabledDevices.size === 0 && roomStore.rooms.length > 0) {
+        ensureRoomDevicesStaged();
+        ensureDefaultStaging();
+      }
       syncFlowGraph(false);
     });
   });
@@ -889,14 +894,14 @@
     aria-label="Audio Flow Canvas"
   >
     <!-- Prominent Sticky Error Notification Banner -->
-    {#if roomStore.lastError || deviceStore.error || invalidConnectionNotice}
+    {#if roomStore.lastError || roomStore.error || deviceStore.error || invalidConnectionNotice}
       <div
         class="absolute top-20 left-1/2 -translate-x-1/2 z-50 w-11/12 max-w-2xl rounded-xl bg-red-950/95 border border-red-500/50 p-3 shadow-2xl backdrop-blur-md flex items-center justify-between gap-3 text-xs text-red-200 animate-in fade-in slide-in-from-top-2 duration-200"
       >
         <div class="flex items-center gap-2 min-w-0">
           <AlertCircle class="w-4 h-4 text-red-400 shrink-0" />
           <span class="truncate font-mono">
-            {invalidConnectionNotice || roomStore.lastError || deviceStore.error}
+            {invalidConnectionNotice || roomStore.lastError || roomStore.error || deviceStore.error}
           </span>
         </div>
         <button

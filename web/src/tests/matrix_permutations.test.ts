@@ -4,6 +4,7 @@ import { roomStore } from '$lib/stores/rooms.svelte';
 import { deviceStore } from '$lib/stores/devices.svelte';
 import { matrixStore } from '$lib/stores/matrix.svelte';
 import { clusterStore } from '$lib/stores/cluster.svelte';
+import { authStore } from '$lib/stores/auth.svelte';
 import { flowLayoutStore, STORAGE_KEY_V1 } from '$lib/stores/flowLayout.svelte';
 import { SSEManager } from '$lib/api/sse';
 import { apiClient } from '$lib/api/client';
@@ -897,5 +898,69 @@ describe('WebUI Permutation Matrices (ADR 0024)', () => {
     expect(flowLayoutStore.isDeviceEnabled(devId, nodeB)).toBe(true);
     expect(flowLayoutStore.getPosition(`input-${nodeAKey}`)).toBeUndefined();
     expect(flowLayoutStore.getPosition(`input-${nodeBKey}`)).toEqual({ x: 200, y: 200 });
+  });
+
+  // ==========================================================================
+  // Matrix 16: Gateway Unreachable Boot & Auto-Recovery Rehydration
+  // Simulates gateway down on initial load: fetch rejects with "Failed to fetch",
+  // stores hold error states and room list is empty.
+  // Gateway becomes reachable: cluster poll cycle rehydrates rooms, devices,
+  // clears "Failed to fetch" error, and groups/rooms appear without page refresh.
+  // ==========================================================================
+  it('Matrix 16: Gateway Unreachable Boot & Auto-Recovery Rehydration - recovers rooms and clears fetch errors without page refresh', async () => {
+    // Ensure mock backend has a configured conference room group
+    if (mockBackend) {
+      mockBackend.rooms = [
+        {
+          id: 'room-alpha-group',
+          name: 'Main Stage Studio Group',
+          state: 'active',
+          inputs: ['hw:2,0'],
+          outputs: ['hw:1,0'],
+          synced: true,
+        },
+      ];
+    }
+
+    // 1. Simulate gateway offline: global fetch rejects with TypeError("Failed to fetch")
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = async () => {
+      throw new TypeError('Failed to fetch');
+    };
+
+    // 2. Initial boot failure simulation
+    await roomStore.loadRooms();
+    await deviceStore.loadDevices();
+    await authStore.checkConnection();
+    await clusterStore.pollCluster();
+    await tick();
+
+    // Verify error state
+    expect(roomStore.error).toContain('Failed to fetch');
+    expect(roomStore.lastError).toContain('Failed to fetch');
+    expect(deviceStore.error).toContain('Failed to fetch');
+    expect(authStore.connectionStatus).toBe('error');
+    expect(authStore.lastError).toContain('Failed to fetch');
+    expect(roomStore.rooms.length).toBe(0);
+
+    // 3. Restore gateway reachability (restore mock backend fetch)
+    globalThis.fetch = originalFetch;
+
+    // 4. Trigger single cluster polling cycle (as scheduled by startPolling)
+    await clusterStore.pollCluster();
+    await tick();
+
+    // 5. Invariants:
+    // a) Failed to fetch errors are completely cleared
+    expect(roomStore.error).toBeNull();
+    expect(roomStore.lastError).toBeNull();
+    expect(deviceStore.error).toBeNull();
+    expect(authStore.lastError).toBeNull();
+    expect(authStore.connectionStatus).toBe('connected');
+
+    // b) Groups (rooms) and devices are rehydrated without page refresh
+    expect(roomStore.rooms.length).toBeGreaterThan(0);
+    expect(clusterStore.nodes.length).toBeGreaterThan(0);
+    expect(deviceStore.devices.length).toBeGreaterThan(0);
   });
 });

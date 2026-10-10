@@ -17,6 +17,12 @@
   let activeTab = $state<TabId>('flow');
   let dismissBanner = $state(false);
 
+  $effect(() => {
+    if (authStore.connectionStatus === 'connected') {
+      dismissBanner = false;
+    }
+  });
+
   onMount(() => {
     authStore.checkConnection();
     meterStore.init();

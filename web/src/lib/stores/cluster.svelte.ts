@@ -8,6 +8,10 @@ import type {
   DeviceMutationRequest,
 } from '$lib/api/types';
 import { apiClient } from '$lib/api/client';
+import { roomStore } from './rooms.svelte';
+import { deviceStore } from './devices.svelte';
+import { authStore } from './auth.svelte';
+import { meterStore } from './meters.svelte';
 
 class ClusterStore {
   nodes = $state<ClusterNodeSummary[]>([]);
@@ -128,10 +132,12 @@ class ClusterStore {
   async pollCluster() {
     this.isLoading = true;
     try {
-      const [nodesResp, devicesResp, healthResp] = await Promise.allSettled([
+      const [nodesResp, devicesResp, healthResp, _roomsResp, _localDevicesResp] = await Promise.allSettled([
         apiClient.getClusterNodes(),
         apiClient.getClusterDevices(),
         apiClient.getNetworkHealth(),
+        roomStore.loadRooms(true),
+        deviceStore.loadDevices(undefined, true),
       ]);
 
       let gotNodes = false;
@@ -139,7 +145,10 @@ class ClusterStore {
 
       if (nodesResp.status === 'fulfilled' && nodesResp.value) {
         const val: ClusterNodesResponse = nodesResp.value;
-        this.nodes = val.nodes || [];
+        const newNodes = val.nodes || [];
+        if (JSON.stringify(newNodes) !== JSON.stringify(this.nodes)) {
+          this.nodes = newNodes;
+        }
         this.totalNodes = val.total_nodes ?? this.nodes.length;
         this.healthyNodes = val.healthy_nodes ?? this.nodes.filter((n) => n.health_score >= 75).length;
         this.degradedNodes = val.degraded_nodes ?? (this.totalNodes - this.healthyNodes);
@@ -151,7 +160,10 @@ class ClusterStore {
 
       if (devicesResp.status === 'fulfilled' && devicesResp.value) {
         const val: ClusterDevicesResponse = devicesResp.value;
-        this.devices = val.devices || [];
+        const newDevices = val.devices || [];
+        if (JSON.stringify(newDevices) !== JSON.stringify(this.devices)) {
+          this.devices = newDevices;
+        }
         gotDevices = true;
       }
 
@@ -174,10 +186,17 @@ class ClusterStore {
         this.healthyNodes = 0;
         this.degradedNodes = 0;
         this.activeNodes = 0;
+        const reason = nodesResp.status === 'rejected' ? (nodesResp.reason?.message || 'Failed to poll cluster') : 'Failed to poll cluster';
+        this.error = reason;
+      } else {
+        this.error = null;
+        this.lastUpdated = new Date();
+        // When gateway connectivity is established/restored, ensure auth status & meter transport
+        if (authStore.connectionStatus !== 'connected') {
+          await authStore.checkConnection(true);
+        }
+        meterStore.ensureConnected();
       }
-
-      this.error = null;
-      this.lastUpdated = new Date();
     } catch (err: any) {
       this.error = err.message || 'Failed to poll cluster';
       this.nodes = [];
