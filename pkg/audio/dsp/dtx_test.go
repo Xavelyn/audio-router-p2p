@@ -249,3 +249,50 @@ func TestDTX_ConcurrentAccess(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestDTX_SilenceThresholdAndHysteresis(t *testing.T) {
+	cfg := DefaultDTXConfig()
+	if cfg.SilenceThreshold != -75.0 {
+		t.Fatalf("expected DefaultDTXConfig.SilenceThreshold == -75.0, got %v", cfg.SilenceThreshold)
+	}
+
+	ctrl := NewDTXController(DTXConfig{Enabled: true})
+	if ctrl.config.SilenceThreshold != -75.0 {
+		t.Fatalf("expected NewDTXController fallback SilenceThreshold == -75.0, got %v", ctrl.config.SilenceThreshold)
+	}
+
+	// 960 samples mono
+	samplesPerFrame := 960
+	// amp 7 gives ~ -73.4 dBFS (above -75 dBFS activation threshold)
+	activeFrame := makeFrame(samplesPerFrame, 7)
+	// amp 5 gives ~ -76.3 dBFS (between -75 dBFS and -78 dBFS hysteresis threshold)
+	hysteresisFrame := makeFrame(samplesPerFrame, 5)
+	// amp 2 gives ~ -84.3 dBFS (below -78 dBFS deactivation threshold)
+	quietFrame := makeFrame(samplesPerFrame, 2)
+
+	// 1. Initial quiet frame should not activate
+	ctrl.ProcessFrame(quietFrame, 1)
+	if ctrl.State() == DTXStateActive {
+		t.Fatalf("quiet frame should not activate DTX controller")
+	}
+
+	// 2. Active frame (> -75 dBFS) activates
+	ctrl.ProcessFrame(activeFrame, 1)
+	if ctrl.State() != DTXStateActive {
+		t.Fatalf("activeFrame (~-73.4 dBFS) should transition to Active, got %v", ctrl.State())
+	}
+
+	// 3. Fluctuation into hysteresis zone (~-76.3 dBFS) should REMAIN Active (not chatter to Hangover)
+	for i := 0; i < 10; i++ {
+		ctrl.ProcessFrame(hysteresisFrame, 1)
+		if ctrl.State() != DTXStateActive {
+			t.Fatalf("frame %d: hysteresisFrame (~-76.3 dBFS) should stay Active via hysteresis, got %v", i, ctrl.State())
+		}
+	}
+
+	// 4. True drop below hysteresis threshold (~-84.3 dBFS) transitions to Hangover
+	ctrl.ProcessFrame(quietFrame, 1)
+	if ctrl.State() != DTXStateHangover {
+		t.Fatalf("quietFrame (~-84.3 dBFS) should transition to Hangover, got %v", ctrl.State())
+	}
+}

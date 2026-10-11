@@ -351,9 +351,13 @@ func (m *streamManager) SetHub(hub *apiTelemetry.TelemetryHub) {
 	log.Printf("[STREAM:MGR] TelemetryHub attached; binding taps retroactively...")
 	for id, as := range m.routes {
 		if as.st != nil {
-			tap := m.hub.RegisterTap(id, as.route.Channels)
+			tapID := id
+			if as.in == nil && as.out != nil {
+				tapID = id + ":out"
+			}
+			tap := m.hub.RegisterTap(tapID, as.route.Channels)
 			as.st.SetAudioTap(tap)
-			log.Printf("[STREAM:MGR] [AUDIO:METER] retroactively attached tap to route=%s (%d channels)", id, as.route.Channels)
+			log.Printf("[STREAM:MGR] [AUDIO:METER] retroactively attached tap to route=%s (%d channels)", tapID, as.route.Channels)
 		}
 	}
 }
@@ -543,9 +547,9 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 		}
 
 		if m.hub != nil {
-			tap := m.hub.RegisterTap(sr.ID, chans)
+			tap := m.hub.RegisterTap(sr.ID+":out", chans)
 			st.SetAudioTap(tap)
-			log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to ingress route=%s (%d channels)", sr.ID, chans)
+			log.Printf("[STREAM:MGR] [AUDIO:METER] attached tap to ingress route=%s (%d channels)", sr.ID+":out", chans)
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
@@ -896,6 +900,7 @@ func (m *streamManager) stopActiveStream(as *activeStream) {
 	}
 	if m.hub != nil {
 		m.hub.UnregisterTap(as.route.ID)
+		m.hub.UnregisterTap(as.route.ID + ":out")
 	}
 	if as.cancel != nil {
 		as.cancel()

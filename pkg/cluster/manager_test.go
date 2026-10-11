@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -617,5 +618,97 @@ func TestMutateRemoteDevice_NaNValidation(t *testing.T) {
 	})
 	if !errors.Is(err, ErrInvalidParameter) {
 		t.Errorf("expected ErrInvalidParameter on Inf volume, got %v", err)
+	}
+}
+
+type mockBroadcaster struct {
+	mu       sync.Mutex
+	payloads [][]byte
+	ch       chan []byte
+}
+
+func newMockBroadcaster() *mockBroadcaster {
+	return &mockBroadcaster{
+		ch: make(chan []byte, 100),
+	}
+}
+
+func (b *mockBroadcaster) BroadcastRelayed(msg []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cp := make([]byte, len(msg))
+	copy(cp, msg)
+	b.payloads = append(b.payloads, cp)
+	select {
+	case b.ch <- cp:
+	default:
+	}
+}
+
+func TestClusterManager_PeerTelemetryRelay(t *testing.T) {
+	// Setup remote peer server with SSE meter endpoint
+	peerMux := http.NewServeMux()
+	peerMux.HandleFunc("/api/v1/telemetry/meters", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		// Send 3 test meter frames
+		for i := 1; i <= 3; i++ {
+			msg := fmt.Sprintf(`{"stream_id":"peer-stream-%d","dtx_state":"Active"}`, i)
+			fmt.Fprintf(w, "event: meter\ndata: %s\n\n", msg)
+			flusher.Flush()
+			time.Sleep(10 * time.Millisecond)
+		}
+		<-r.Context().Done()
+	})
+	peerMux.HandleFunc("/api/v1/network/health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(telemetry.NetworkHealthSnapshot{HealthScore: 100})
+	})
+	peerMux.HandleFunc("/api/v1/devices", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]AudioDeviceSummary{})
+	})
+
+	peerServer := httptest.NewServer(peerMux)
+	defer peerServer.Close()
+
+	local := &mockLocalNode{nodeID: "local-node"}
+	disc := newMockDiscovery("local-node")
+	disc.addPeer(discovery.Peer{
+		ID:       "remote-peer-1",
+		APIAddr:  peerServer.URL,
+		LastSeen: time.Now(),
+	}, "alive")
+
+	broadcaster := newMockBroadcaster()
+	mgr := NewManager(Config{
+		ScrapeInterval: 50 * time.Millisecond,
+		ScrapeTimeout:  time.Second,
+	}, local, disc)
+	mgr.SetTelemetryBroadcaster(broadcaster)
+	defer mgr.Stop()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	mgr.Start(ctx)
+
+	// Await relayed messages from remote peer
+	receivedCount := 0
+	deadline := time.After(2 * time.Second)
+	for receivedCount < 3 {
+		select {
+		case msg := <-broadcaster.ch:
+			receivedCount++
+			if !strings.Contains(string(msg), "peer-stream-") {
+				t.Fatalf("unexpected relayed frame payload: %s", string(msg))
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for relayed frames; received %d of 3", receivedCount)
+		}
 	}
 }

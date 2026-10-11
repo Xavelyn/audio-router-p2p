@@ -452,3 +452,55 @@ func TestTelemetryHub_UnregisterTap_NoMeterFrameAfterTombstone(t *testing.T) {
 		}
 	}
 }
+
+func TestTelemetryHub_SubscribeLocalOnly_AntiEcho(t *testing.T) {
+	hub := NewTelemetryHub(30)
+	normalSub := hub.Subscribe(8)
+	defer hub.Unsubscribe(normalSub)
+
+	localOnlySub := hub.SubscribeLocalOnly(8)
+	defer hub.Unsubscribe(localOnlySub)
+
+	relayedMsg := []byte(`{"stream_id":"relayed-peer-stream","dtx_state":"Active"}`)
+	hub.BroadcastRelayed(relayedMsg)
+
+	// normalSub must receive relayed message
+	select {
+	case msg := <-normalSub.Ch:
+		if string(msg) != string(relayedMsg) {
+			t.Fatalf("normalSub expected %s, got %s", string(relayedMsg), string(msg))
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("normalSub timed out waiting for relayed message")
+	}
+
+	// localOnlySub must NOT receive relayed message
+	select {
+	case msg := <-localOnlySub.Ch:
+		t.Fatalf("localOnlySub unexpectedly received relayed message: %s", string(msg))
+	case <-time.After(50 * time.Millisecond):
+		// Expected: localOnly suppressed the message
+	}
+
+	// Direct broadcast (local) must reach both
+	localMsg := []byte(`{"stream_id":"local-stream","dtx_state":"Active"}`)
+	hub.Broadcast(localMsg)
+
+	select {
+	case msg := <-normalSub.Ch:
+		if string(msg) != string(localMsg) {
+			t.Fatalf("normalSub expected %s, got %s", string(localMsg), string(msg))
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("normalSub timed out waiting for local message")
+	}
+
+	select {
+	case msg := <-localOnlySub.Ch:
+		if string(msg) != string(localMsg) {
+			t.Fatalf("localOnlySub expected %s, got %s", string(localMsg), string(msg))
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("localOnlySub timed out waiting for local message")
+	}
+}

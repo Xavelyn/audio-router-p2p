@@ -157,6 +157,9 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 
 	// Pre-initialize telemetry hub and canonical v1 server
 	_ = s.Hub()
+	if s.clusterMgr != nil {
+		s.clusterMgr.SetTelemetryBroadcaster(s.hub)
+	}
 	_ = s.V1()
 	s.V1().SetAggregator(s.aggregator)
 	s.V1().SetClusterManager(s.clusterMgr)
@@ -194,6 +197,9 @@ func (s *Server) ClusterManager() *cluster.Manager {
 // SetClusterManager configures an external or custom cluster manager.
 func (s *Server) SetClusterManager(mgr *cluster.Manager) {
 	s.clusterMgr = mgr
+	if s.hub != nil && mgr != nil {
+		mgr.SetTelemetryBroadcaster(s.hub)
+	}
 	if s.v1Server != nil {
 		s.v1Server.SetClusterManager(mgr)
 	}
@@ -428,6 +434,9 @@ func (a *streamProviderAdapter) StreamLinkStats() []netTelemetry.StreamLinkStats
 func (s *Server) Hub() *telemetry.TelemetryHub {
 	if s.hub == nil {
 		s.hub = telemetry.NewTelemetryHub(30)
+		if s.clusterMgr != nil {
+			s.clusterMgr.SetTelemetryBroadcaster(s.hub)
+		}
 	}
 	return s.hub
 }

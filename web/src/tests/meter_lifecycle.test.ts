@@ -102,5 +102,35 @@ describe('ADR-0026: Meter Telemetry Lifecycle and Deterministic Binding', () => 
       // activeChannelMeters must select the newer stream (-6 dB peak, not -24 dB)
       expect(meterStore.activeChannelMeters[0].peakDb).toBe(-6);
     });
+
+    it('ingests and tracks multi-node cluster streams and distinct :out ingress taps', () => {
+      vi.setSystemTime(5000);
+      // Source node emits input stream meter frame
+      meterStore.handleMeterFrame({
+        stream_id: 'room-conf-nodeA-mic1-nodeB-spk1',
+        timestamp_ns: 5000 * 1000000,
+        dtx_state: 'Active',
+        channels: [
+          { channel: 0, rms_dbfs: -18.0, peak_dbfs: -12.0, clipped: false },
+        ],
+      });
+
+      // Destination node emits ingress output stream meter frame
+      meterStore.handleMeterFrame({
+        stream_id: 'room-conf-nodeA-mic1-nodeB-spk1:out',
+        timestamp_ns: 5000 * 1000000,
+        dtx_state: 'Active',
+        channels: [
+          { channel: 0, rms_dbfs: -20.0, peak_dbfs: -14.0, clipped: false },
+        ],
+      });
+
+      // Both must exist simultaneously without overwriting
+      expect(meterStore.streams['room-conf-nodeA-mic1-nodeB-spk1']).toBeDefined();
+      expect(meterStore.streams['room-conf-nodeA-mic1-nodeB-spk1:out']).toBeDefined();
+
+      expect(meterStore.streams['room-conf-nodeA-mic1-nodeB-spk1'].channels[0].peakDb).toBe(-12.0);
+      expect(meterStore.streams['room-conf-nodeA-mic1-nodeB-spk1:out'].channels[0].peakDb).toBe(-14.0);
+    });
   });
 });

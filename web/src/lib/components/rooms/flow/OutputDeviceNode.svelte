@@ -79,8 +79,15 @@
     }
 
     if (candidates.length === 0) return null;
-    // Deterministic selection: always bind to the most recently updated stream
-    candidates.sort((a, b) => b.lastUpdated - a.lastUpdated);
+    // Deterministic selection: prioritize explicit :out streams, then most recently updated stream
+    candidates.sort((a, b) => {
+      const aIsOut = a.streamId.endsWith(':out') ? 1 : 0;
+      const bIsOut = b.streamId.endsWith(':out') ? 1 : 0;
+      if (aIsOut !== bIsOut) {
+        return bIsOut - aIsOut;
+      }
+      return b.lastUpdated - a.lastUpdated;
+    });
     return candidates[0];
   });
 

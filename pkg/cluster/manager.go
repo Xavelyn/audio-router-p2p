@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -72,6 +73,12 @@ type Manager struct {
 	peerFailures map[string]int
 	circuitOpen  map[string]time.Time
 
+	// Telemetry mesh relay
+	broadcaster   TelemetryBroadcaster
+	broadcasterMu sync.RWMutex
+	peerStreamsMu sync.Mutex
+	peerStreams   map[string]context.CancelFunc
+
 	// Lifecycle management
 	started  atomic.Bool
 	stopOnce sync.Once
@@ -124,6 +131,7 @@ func NewManager(cfg Config, local LocalNodeProvider, disc DiscoveryProvider, cus
 		httpClient:   client,
 		peerFailures: make(map[string]int),
 		circuitOpen:  make(map[string]time.Time),
+		peerStreams:  make(map[string]context.CancelFunc),
 		stopCh:       make(chan struct{}),
 	}
 
@@ -169,6 +177,12 @@ func (m *Manager) Stop() {
 		if m.cancel != nil {
 			m.cancel()
 		}
+		m.peerStreamsMu.Lock()
+		for _, cancel := range m.peerStreams {
+			cancel()
+		}
+		m.peerStreams = make(map[string]context.CancelFunc)
+		m.peerStreamsMu.Unlock()
 		m.wg.Wait()
 	})
 }
@@ -486,6 +500,7 @@ peerLoop:
 	}
 
 	m.snapshot.Store(snap)
+	m.syncPeerTelemetryStreams()
 	return snap
 }
 
@@ -899,4 +914,136 @@ func (m *Manager) MutateRemoteDevice(ctx context.Context, nodeID string, deviceI
 		Muted:     devResult.Muted,
 		UpdatedAt: time.Now(),
 	}, nil
+}
+
+// SetTelemetryBroadcaster attaches the telemetry broadcaster to relay peer meter frames.
+func (m *Manager) SetTelemetryBroadcaster(b TelemetryBroadcaster) {
+	m.broadcasterMu.Lock()
+	m.broadcaster = b
+	m.broadcasterMu.Unlock()
+	m.syncPeerTelemetryStreams()
+}
+
+func (m *Manager) syncPeerTelemetryStreams() {
+	m.broadcasterMu.RLock()
+	broadcaster := m.broadcaster
+	m.broadcasterMu.RUnlock()
+	if broadcaster == nil || m.disc == nil {
+		return
+	}
+
+	livePeers := m.disc.LivePeers()
+	localID := m.disc.NodeID()
+
+	m.peerStreamsMu.Lock()
+	defer m.peerStreamsMu.Unlock()
+
+	activeSet := make(map[string]bool)
+	for _, peer := range livePeers {
+		if peer.ID == "" || peer.ID == localID || peer.APIAddr == "" {
+			continue
+		}
+		activeSet[peer.ID] = true
+		if _, exists := m.peerStreams[peer.ID]; !exists {
+			parentCtx := m.ctx
+			if parentCtx == nil {
+				parentCtx = context.Background()
+			}
+			ctx, cancel := context.WithCancel(parentCtx)
+			m.peerStreams[peer.ID] = cancel
+			m.wg.Add(1)
+			go m.runPeerTelemetryStream(ctx, peer.ID, peer.APIAddr)
+		}
+	}
+
+	for id, cancel := range m.peerStreams {
+		if !activeSet[id] {
+			cancel()
+			delete(m.peerStreams, id)
+		}
+	}
+}
+
+func (m *Manager) runPeerTelemetryStream(ctx context.Context, peerID, apiAddr string) {
+	defer m.wg.Done()
+
+	apiURL := apiAddr
+	if !strings.HasPrefix(apiURL, "http://") && !strings.HasPrefix(apiURL, "https://") {
+		apiURL = "http://" + apiURL
+	}
+	meterURL := strings.TrimRight(apiURL, "/") + "/api/v1/telemetry/meters?local_only=true&rate=30"
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.stopCh:
+			return
+		default:
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, meterURL, nil)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		if m.cfg.AuthToken != "" {
+			req.Header.Set("Authorization", "Bearer "+m.cfg.AuthToken)
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("X-Cluster-Relay", "true")
+
+		resp, err := m.httpClient.Do(req)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+				continue
+			}
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				trimmed := bytes.TrimSpace(line)
+				if bytes.HasPrefix(trimmed, []byte("data: ")) {
+					payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data: ")))
+					if len(payload) > 0 {
+						m.broadcasterMu.RLock()
+						b := m.broadcaster
+						m.broadcasterMu.RUnlock()
+						if b != nil {
+							b.BroadcastRelayed(payload)
+						}
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		resp.Body.Close()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
 }

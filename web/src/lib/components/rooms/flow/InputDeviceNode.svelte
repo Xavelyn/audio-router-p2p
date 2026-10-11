@@ -56,6 +56,11 @@
         continue;
       }
 
+      // Ignore ingress output taps for input device meters
+      if (sId.endsWith(':out')) {
+        continue;
+      }
+
       const matchesDirect =
         sId.includes(data.device.id) ||
         (data.device.urn && sId.includes(data.device.urn)) ||

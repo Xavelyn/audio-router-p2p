@@ -42,7 +42,7 @@ type DTXConfig struct {
 func DefaultDTXConfig() DTXConfig {
 	return DTXConfig{
 		Enabled:          true,
-		SilenceThreshold: -50.0,
+		SilenceThreshold: -75.0,
 		HangoverDuration: 5 * time.Second,
 		SIDInterval:      500 * time.Millisecond,
 		FrameDuration:    20 * time.Millisecond,
@@ -77,7 +77,7 @@ func NewDTXController(cfg DTXConfig) *DTXController {
 		cfg.SIDInterval = 500 * time.Millisecond
 	}
 	if cfg.SilenceThreshold == 0 {
-		cfg.SilenceThreshold = -50.0
+		cfg.SilenceThreshold = -75.0
 	}
 
 	hFrames := int(math.Ceil(float64(cfg.HangoverDuration) / float64(cfg.FrameDuration)))
@@ -121,7 +121,21 @@ func (d *DTXController) ProcessFrame(pcm []byte, channels int) (shouldSend bool,
 		return true, false, metrics
 	}
 
-	isActive := metrics.RMSdBFS >= d.config.SilenceThreshold
+	// Hysteresis: entering Active from Silence or Hangover requires crossing above
+	// SilenceThreshold (e.g. -75.0 dBFS). Once in Active state, maintain Active
+	// until level drops below SilenceThreshold - HysteresisMargin (3.0 dB) to prevent
+	// rapid state chattering / thrashing near the threshold.
+	const hysteresisMargin = 3.0
+	var isActive bool
+	if d.state == DTXStateActive {
+		threshold := d.config.SilenceThreshold - hysteresisMargin
+		if threshold < SilenceFloorDBFS {
+			threshold = SilenceFloorDBFS
+		}
+		isActive = metrics.RMSdBFS >= threshold
+	} else {
+		isActive = metrics.RMSdBFS >= d.config.SilenceThreshold
+	}
 
 	if isActive {
 		// Active audio detected: transition directly to Active state

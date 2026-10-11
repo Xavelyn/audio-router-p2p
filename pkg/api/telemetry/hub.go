@@ -191,6 +191,7 @@ type Subscriber struct {
 	Ch            chan []byte
 	DroppedFrames atomic.Uint64
 	closed        atomic.Bool
+	LocalOnly     bool
 }
 
 // Client is an alias for Subscriber.
@@ -277,14 +278,25 @@ func (h *TelemetryHub) GetTap(streamID string) (*StreamTap, bool) {
 
 // Subscribe registers a new subscriber with a bounded channel (default capacity 4).
 func (h *TelemetryHub) Subscribe(bufCap ...int) *Subscriber {
+	return h.subscribeWithOpts(false, bufCap...)
+}
+
+// SubscribeLocalOnly registers a new subscriber that only receives frames generated from local taps.
+// Relayed frames from remote cluster peers are skipped to prevent network echo loops.
+func (h *TelemetryHub) SubscribeLocalOnly(bufCap ...int) *Subscriber {
+	return h.subscribeWithOpts(true, bufCap...)
+}
+
+func (h *TelemetryHub) subscribeWithOpts(localOnly bool, bufCap ...int) *Subscriber {
 	capSize := 4
 	if len(bufCap) > 0 && bufCap[0] > 0 {
 		capSize = bufCap[0]
 	}
 	subID := fmt.Sprintf("sub-%d", h.nextSubID.Add(1))
 	sub := &Subscriber{
-		ID: subID,
-		Ch: make(chan []byte, capSize),
+		ID:        subID,
+		Ch:        make(chan []byte, capSize),
+		LocalOnly: localOnly,
 	}
 
 	h.mu.Lock()
@@ -334,6 +346,29 @@ func (h *TelemetryHub) Broadcast(msg []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	h.broadcastLocked(msg)
+}
+
+// BroadcastRelayed dispatches a relayed meter message originating from a remote cluster peer
+// to regular frontend subscribers, suppressing delivery to LocalOnly relay connections.
+func (h *TelemetryHub) BroadcastRelayed(msg []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.broadcastRelayedLocked(msg)
+}
+
+func (h *TelemetryHub) broadcastRelayedLocked(msg []byte) {
+	for _, client := range h.subscribers {
+		if client.LocalOnly {
+			continue
+		}
+		select {
+		case client.Ch <- msg:
+			// Frame delivered
+		default:
+			// Slow consumer: drop frame to prevent backpressure
+			client.DroppedFrames.Add(1)
+		}
+	}
 }
 
 // Start begins the ticker-driven broadcast loop.

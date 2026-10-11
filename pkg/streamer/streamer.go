@@ -675,8 +675,8 @@ func (s *Streamer) playout() {
 				curStreamIDHex, frames, metrics.RMSdBFS, metrics.PeakdBFS, peer.totalUnderruns.Load(), ratio, peer.Addr)
 		}
 
+		playData := data
 		if peer.Output != nil {
-			playData := data
 			if peer.ASRC != nil {
 				// Deadband: engage ASRC resampling when ratio diverges by > 1.0 ppm (1.0e-6).
 				// Preserves exact byte nominal passthrough under negligible jitter/noise.
@@ -696,6 +696,19 @@ func (s *Streamer) playout() {
 				if transport.ShouldLogRateLimited(&peer.lastWriteErrorLogNano, int64(time.Second)) {
 					log.Printf("[AUDIO:PLAY] ERROR: output.Write failed: %v", err)
 				}
+			}
+		}
+
+		s.audioTapMu.RLock()
+		tap := s.audioTap
+		s.audioTapMu.RUnlock()
+		if tap != nil {
+			tap.RecordBlock(playData, s.config.Channels)
+			playMetrics := dsp.AnalyzeLoudness(playData, s.config.Channels)
+			if playMetrics.RMSdBFS >= -75.0 {
+				tap.SetDTXState("Active")
+			} else {
+				tap.SetDTXState("Silence")
 			}
 		}
 	}

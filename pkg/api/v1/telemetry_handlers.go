@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/api/telemetry"
 	"golang.org/x/net/websocket"
 )
 
@@ -105,7 +106,13 @@ func (s *V1Server) handleTelemetryMetersSSE(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	sub := s.hub.Subscribe(4)
+	localOnly := r.URL.Query().Get("local_only") == "true" || r.Header.Get("X-Cluster-Relay") == "true"
+	var sub *telemetry.Subscriber
+	if localOnly {
+		sub = s.hub.SubscribeLocalOnly(4)
+	} else {
+		sub = s.hub.Subscribe(4)
+	}
 	defer s.hub.Unsubscribe(sub)
 
 	ctx := r.Context()
