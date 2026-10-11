@@ -9,34 +9,50 @@ import (
 	"io"
 	"log"
 	"net"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/audio/discovery"
+	"github.com/audio-router-p2p/pkg/audio/urn"
 	"github.com/gordonklaus/portaudio"
 )
 
 const blocksPerBuffer = 256
 
-var paInitCount atomic.Int32
+var (
+	paMu             sync.Mutex
+	paInitCount      int32
+	urnCardDevRegex  = regexp.MustCompile(`c=([a-zA-Z0-9_\-]+)(?:.*:d=(\d+))?`)
+)
 
 func initPortAudio() error {
+	paMu.Lock()
+	defer paMu.Unlock()
 	return withSuppressedStderrErr(func() error {
-		if paInitCount.Add(1) == 1 {
+		if paInitCount == 0 {
 			if err := portaudio.Initialize(); err != nil {
-				paInitCount.Add(-1)
 				return err
 			}
 		}
+		paInitCount++
 		return nil
 	})
 }
 
 func termPortAudio() {
-	if paInitCount.Add(-1) == 0 {
-		suppressStderr(func() {
-			_ = portaudio.Terminate()
-		})
+	paMu.Lock()
+	defer paMu.Unlock()
+	if paInitCount > 0 {
+		paInitCount--
+		if paInitCount == 0 {
+			suppressStderr(func() {
+				_ = portaudio.Terminate()
+			})
+		}
 	}
 }
 
@@ -60,8 +76,14 @@ type portaudioInput struct {
 	isRealPA     bool
 }
 
-func buildRateCandidates(requested, defaultRate int) []int {
-	raw := []int{requested, defaultRate, 48000, 44100, 96000}
+func buildRateCandidates(requested, defaultRate int, activeRates ...int) []int {
+	raw := make([]int, 0, len(activeRates)+5)
+	for _, ar := range activeRates {
+		if ar > 0 {
+			raw = append(raw, ar)
+		}
+	}
+	raw = append(raw, requested, defaultRate, 48000, 44100, 96000)
 	candidates := make([]int, 0, len(raw))
 	seen := make(map[int]bool, len(raw))
 	for _, r := range raw {
@@ -73,7 +95,88 @@ func buildRateCandidates(requested, defaultRate int) []int {
 	return candidates
 }
 
-func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
+func extractAlsaCardAndDevice(name string, fallbackNames ...string) (int, int, bool) {
+	allNames := append([]string{name}, fallbackNames...)
+	for _, candidate := range allNames {
+		if candidate == "" {
+			continue
+		}
+		// 1. Check (hw:C,D) or hw:C,D or plughw:C,D
+		if matches := hwIndexRegex.FindStringSubmatch(candidate); len(matches) >= 2 {
+			c, err := strconv.Atoi(matches[1])
+			if err == nil {
+				d := 0
+				if len(matches) >= 3 && matches[2] != "" {
+					if parsedD, err := strconv.Atoi(matches[2]); err == nil {
+						d = parsedD
+					}
+				}
+				return c, d, true
+			}
+		}
+
+		// 2. Check CARD=...,DEV=...
+		if matches := alsaCardDevRegex.FindStringSubmatch(candidate); len(matches) >= 2 && matches[1] != "" {
+			cStr := matches[1]
+			d := 0
+			if len(matches) >= 3 && matches[2] != "" {
+				if parsedD, err := strconv.Atoi(matches[2]); err == nil {
+					d = parsedD
+				}
+			}
+			if c, err := strconv.Atoi(cStr); err == nil {
+				return c, d, true
+			}
+			hwDevs, _ := discovery.DiscoverDevices()
+			cLower := strings.ToLower(cStr)
+			for _, hd := range hwDevs {
+				if strings.ToLower(hd.CardID) == cLower || urn.Slugify(hd.CardName) == cLower {
+					return hd.CardIndex, d, true
+				}
+			}
+		}
+
+		// 3. Check c=...,d=... in URN
+		if matches := urnCardDevRegex.FindStringSubmatch(candidate); len(matches) >= 2 && matches[1] != "" {
+			cStr := matches[1]
+			d := 0
+			if len(matches) >= 3 && matches[2] != "" {
+				if parsedD, err := strconv.Atoi(matches[2]); err == nil {
+					d = parsedD
+				}
+			}
+			if c, err := strconv.Atoi(cStr); err == nil {
+				return c, d, true
+			}
+			hwDevs, _ := discovery.DiscoverDevices()
+			cLower := strings.ToLower(cStr)
+			for _, hd := range hwDevs {
+				if strings.ToLower(hd.CardID) == cLower || urn.Slugify(hd.CardName) == cLower {
+					return hd.CardIndex, d, true
+				}
+			}
+		}
+
+		// 4. Check loopback keyword
+		if strings.Contains(strings.ToLower(candidate), "loopback") {
+			hwDevs, _ := discovery.DiscoverDevices()
+			for _, hd := range hwDevs {
+				if strings.Contains(strings.ToLower(hd.CardID), "loopback") || strings.Contains(strings.ToLower(hd.CardName), "loopback") {
+					d := hd.DeviceIndex
+					if strings.Contains(candidate, ",1") || strings.Contains(candidate, "DEV=1") || strings.Contains(candidate, ":1") || strings.Contains(candidate, "d=1") {
+						d = 1
+					} else if strings.Contains(candidate, ",0") || strings.Contains(candidate, "DEV=0") || strings.Contains(candidate, ":0") || strings.Contains(candidate, "d=0") {
+						d = 0
+					}
+					return hd.CardIndex, d, true
+				}
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+func resolveInputDevice(deviceID int, fallbackNames ...string) (*portaudio.DeviceInfo, error) {
 	return withSuppressedStderr(func() (*portaudio.DeviceInfo, error) {
 		if deviceID < 0 {
 			return portaudio.DefaultInputDevice()
@@ -83,11 +186,25 @@ func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
 			return nil, err
 		}
 		for _, d := range devs {
-			if d.Index == deviceID {
-				if d.MaxInputChannels < 1 {
-					return nil, fmt.Errorf("device %q has no input channels", d.Name)
-				}
+			if d.Index == deviceID && d.MaxInputChannels >= 1 {
 				return d, nil
+			}
+		}
+		// Device index may be stale or shifted; scan by name or path
+		for _, fn := range fallbackNames {
+			if fn == "" {
+				continue
+			}
+			fnLower := strings.ToLower(fn)
+			for _, d := range devs {
+				if d.MaxInputChannels < 1 {
+					continue
+				}
+				dNameLower := strings.ToLower(d.Name)
+				if dNameLower == fnLower || strings.Contains(dNameLower, fnLower) || strings.Contains(fnLower, dNameLower) {
+					log.Printf("[AUDIO:IO] Re-resolved stale PortAudio input device %d -> %d (%q)", deviceID, d.Index, d.Name)
+					return d, nil
+				}
 			}
 		}
 		return nil, fmt.Errorf("input device %d not found", deviceID)
@@ -96,8 +213,8 @@ func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
 
 // OpenInput returns an AudioStream for the given device ID. With useEmulator it
 // returns a synthetic sine-wave source; otherwise it opens a real PortAudio
-// device.
-func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
+// device. Optional fallback devNames help re-resolve devices if deviceID is stale.
+func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool, devNames ...string) (AudioStream, error) {
 	if useEmulator {
 		return newEmulatorInput(deviceID, sampleRate, channels), nil
 	}
@@ -110,7 +227,7 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 	if err := initPortAudio(); err != nil {
 		return nil, err
 	}
-	dev, err := resolveInputDevice(deviceID)
+	dev, err := resolveInputDevice(deviceID, devNames...)
 	if err != nil {
 		termPortAudio()
 		return nil, err
@@ -127,7 +244,25 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 	}
 	log.Printf("[AUDIO:IO] Opening PortAudio input: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
 
-	candidates := buildRateCandidates(sampleRate, int(dev.DefaultSampleRate))
+	var activeRate int
+	if card, dIdx, ok := extractAlsaCardAndDevice(dev.Name, devNames...); ok {
+		if ar, detected := discovery.DetectActiveHardwareRate(card, dIdx, "c"); detected {
+			activeRate = ar
+			log.Printf("[AUDIO:IO] Detected active hardware rate for card %d dev %d: %d Hz", card, dIdx, activeRate)
+		} else if strings.Contains(strings.ToLower(dev.Name), "loopback") {
+			// On snd-aloop, Cable 0 capture (dev 1) is locked by Cable 0 playback (dev 0).
+			// Inspect the paired subdevice playback side if capture is idle.
+			pairedDev := 1 - dIdx
+			if pairedDev >= 0 {
+				if ar, detected := discovery.DetectActiveHardwareRate(card, pairedDev, "p"); detected {
+					activeRate = ar
+					log.Printf("[AUDIO:IO] Detected active hardware rate from paired loopback playback card %d dev %d: %d Hz", card, pairedDev, activeRate)
+				}
+			}
+		}
+	}
+
+	candidates := buildRateCandidates(sampleRate, int(dev.DefaultSampleRate), activeRate)
 	var actualRate int
 	var st *portaudio.Stream
 	var buf []int16
@@ -283,7 +418,7 @@ type portaudioOutput struct {
 	lastUnderflow atomic.Int64
 }
 
-func resolveOutputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
+func resolveOutputDevice(deviceID int, fallbackNames ...string) (*portaudio.DeviceInfo, error) {
 	return withSuppressedStderr(func() (*portaudio.DeviceInfo, error) {
 		if deviceID < 0 {
 			return portaudio.DefaultOutputDevice()
@@ -293,11 +428,24 @@ func resolveOutputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
 			return nil, err
 		}
 		for _, d := range devs {
-			if d.Index == deviceID {
-				if d.MaxOutputChannels < 1 {
-					return nil, fmt.Errorf("device %q has no output channels", d.Name)
-				}
+			if d.Index == deviceID && d.MaxOutputChannels >= 1 {
 				return d, nil
+			}
+		}
+		for _, fn := range fallbackNames {
+			if fn == "" {
+				continue
+			}
+			fnLower := strings.ToLower(fn)
+			for _, d := range devs {
+				if d.MaxOutputChannels < 1 {
+					continue
+				}
+				dNameLower := strings.ToLower(d.Name)
+				if dNameLower == fnLower || strings.Contains(dNameLower, fnLower) || strings.Contains(fnLower, dNameLower) {
+					log.Printf("[AUDIO:IO] Re-resolved stale PortAudio output device %d -> %d (%q)", deviceID, d.Index, d.Name)
+					return d, nil
+				}
 			}
 		}
 		return nil, fmt.Errorf("output device %d not found", deviceID)
@@ -306,7 +454,8 @@ func resolveOutputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
 
 // OpenOutput returns an AudioStream for the given device ID. With useEmulator
 // it returns an in-memory buffer; otherwise it opens a real PortAudio device.
-func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
+// Optional fallback devNames help re-resolve devices if deviceID is stale.
+func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool, devNames ...string) (AudioStream, error) {
 	if useEmulator {
 		return newEmulatorOutput(deviceID), nil
 	}
@@ -316,7 +465,7 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 	if err := initPortAudio(); err != nil {
 		return nil, err
 	}
-	dev, err := resolveOutputDevice(deviceID)
+	dev, err := resolveOutputDevice(deviceID, devNames...)
 	if err != nil {
 		termPortAudio()
 		return nil, err
@@ -333,7 +482,25 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool) (Audio
 	}
 	log.Printf("[AUDIO:IO] Opening PortAudio output: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
 
-	candidates := buildRateCandidates(sampleRate, int(dev.DefaultSampleRate))
+	var activeRate int
+	if card, dIdx, ok := extractAlsaCardAndDevice(dev.Name, devNames...); ok {
+		if ar, detected := discovery.DetectActiveHardwareRate(card, dIdx, "p"); detected {
+			activeRate = ar
+			log.Printf("[AUDIO:IO] Detected active hardware rate for card %d dev %d: %d Hz", card, dIdx, activeRate)
+		} else if strings.Contains(strings.ToLower(dev.Name), "loopback") {
+			// On snd-aloop, Cable 0 playback (dev 0) is locked by Cable 0 capture (dev 1).
+			// Inspect the paired subdevice capture side if playback is idle.
+			pairedDev := 1 - dIdx
+			if pairedDev >= 0 {
+				if ar, detected := discovery.DetectActiveHardwareRate(card, pairedDev, "c"); detected {
+					activeRate = ar
+					log.Printf("[AUDIO:IO] Detected active hardware rate from paired loopback capture card %d dev %d: %d Hz", card, pairedDev, activeRate)
+				}
+			}
+		}
+	}
+
+	candidates := buildRateCandidates(sampleRate, int(dev.DefaultSampleRate), activeRate)
 	var actualRate int
 	var st *portaudio.Stream
 	var buf []int16
@@ -449,3 +616,14 @@ func (o *portaudioOutput) Close() error {
 	termPortAudio()
 	return err
 }
+
+func isPortAudioStreamDirection(s AudioStream) (isInput, isOutput bool) {
+	switch s.(type) {
+	case *portaudioInput:
+		return true, false
+	case *portaudioOutput:
+		return false, true
+	}
+	return false, false
+}
+

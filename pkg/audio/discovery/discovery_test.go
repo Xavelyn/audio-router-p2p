@@ -202,3 +202,62 @@ func TestDiscoverWithRoots_MissingDirectory(t *testing.T) {
 		t.Errorf("expected 0 devices, got %d", len(devs))
 	}
 }
+
+func TestDetectActiveHardwareRate(t *testing.T) {
+	tmpDir := t.TempDir()
+	procRoot := filepath.Join(tmpDir, "proc", "asound")
+
+	// 1. Create active capture subdevice: card 0, pcm 1, capture, rate 44100
+	pcm1cDir := filepath.Join(procRoot, "card0", "pcm1c", "sub0")
+	if err := os.MkdirAll(pcm1cDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	hwParamsActive := `access: MMAP_INTERLEAVED
+format: S16_LE
+subformat: STD
+channels: 2
+rate: 44100 (44100/1)
+period_size: 1024
+buffer_size: 4096
+`
+	if err := os.WriteFile(filepath.Join(pcm1cDir, "hw_params"), []byte(hwParamsActive), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Create closed subdevice: card 0, pcm 0, playback, "closed"
+	pcm0pDir := filepath.Join(procRoot, "card0", "pcm0p", "sub0")
+	if err := os.MkdirAll(pcm0pDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(pcm0pDir, "hw_params"), []byte("closed\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Test active capture rate detection
+	rate, ok := DetectActiveHardwareRateWithRoot(procRoot, 0, 1, "c")
+	if !ok || rate != 44100 {
+		t.Fatalf("expected rate 44100, ok true; got rate=%d, ok=%t", rate, ok)
+	}
+
+	// Test direction string variants ("capture", "input")
+	rate, ok = DetectActiveHardwareRateWithRoot(procRoot, 0, 1, "capture")
+	if !ok || rate != 44100 {
+		t.Fatalf("expected rate 44100 for 'capture', got rate=%d, ok=%t", rate, ok)
+	}
+	rate, ok = DetectActiveHardwareRateWithRoot(procRoot, 0, 1, "input")
+	if !ok || rate != 44100 {
+		t.Fatalf("expected rate 44100 for 'input', got rate=%d, ok=%t", rate, ok)
+	}
+
+	// Test closed subdevice
+	rate, ok = DetectActiveHardwareRateWithRoot(procRoot, 0, 0, "p")
+	if ok || rate != 0 {
+		t.Fatalf("expected ok false for closed subdevice, got rate=%d, ok=%t", rate, ok)
+	}
+
+	// Test non-existent card/device
+	rate, ok = DetectActiveHardwareRateWithRoot(procRoot, 99, 0, "c")
+	if ok || rate != 0 {
+		t.Fatalf("expected ok false for non-existent card, got rate=%d, ok=%t", rate, ok)
+	}
+}

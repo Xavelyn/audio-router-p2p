@@ -55,24 +55,31 @@ type reopener interface {
 // to Device metadata and audio streams, managing ghost device transitions,
 // reference-counted virtual stream handles, and multiplexed hardware routing.
 type DeviceResolver struct {
-	mu             sync.RWMutex
-	devices        map[string]Device                     // Keyed by canonical URN
-	aliases        map[string]string                     // Alias -> Canonical URN
-	quarantined    map[string]bool                       // URN -> isQuarantined
-	controllers    map[StreamKey]*deviceStreamController // Active directional controllers
-	reboundStreams map[StreamKey]AudioStream             // Stored pre-bind streams if no controller active
-	gracePeriod    time.Duration
+	mu                sync.RWMutex
+	devices           map[string]Device                     // Keyed by canonical URN
+	aliases           map[string]string                     // Alias -> Canonical URN
+	quarantineUntil   map[string]time.Time                  // URN -> quarantine expiration timestamp
+	quarantineBackoff map[string]time.Duration              // URN -> exponential backoff duration
+	controllers       map[StreamKey]*deviceStreamController // Active directional controllers
+	reboundStreams    map[StreamKey]AudioStream             // Stored pre-bind streams if no controller active
+	gracePeriod       time.Duration
 }
+
+const (
+	minQuarantineBackoff = 500 * time.Millisecond
+	maxQuarantineBackoff = 30 * time.Second
+)
 
 // NewDeviceResolver creates a thread-safe device resolver.
 func NewDeviceResolver() *DeviceResolver {
 	r := &DeviceResolver{
-		devices:        make(map[string]Device),
-		aliases:        make(map[string]string),
-		quarantined:    make(map[string]bool),
-		controllers:    make(map[StreamKey]*deviceStreamController),
-		reboundStreams: make(map[StreamKey]AudioStream),
-		gracePeriod:    defaultGracePeriod,
+		devices:           make(map[string]Device),
+		aliases:           make(map[string]string),
+		quarantineUntil:   make(map[string]time.Time),
+		quarantineBackoff: make(map[string]time.Duration),
+		controllers:       make(map[StreamKey]*deviceStreamController),
+		reboundStreams:    make(map[StreamKey]AudioStream),
+		gracePeriod:       defaultGracePeriod,
 	}
 	_ = r.Refresh()
 	return r
@@ -119,6 +126,123 @@ func (r *DeviceResolver) Register(dev Device) {
 	r.registerLocked(dev)
 }
 
+func (r *DeviceResolver) isQuarantinedLocked(devURN string) bool {
+	until, ok := r.quarantineUntil[devURN]
+	if !ok {
+		return false
+	}
+	return time.Now().Before(until)
+}
+
+func (r *DeviceResolver) quarantineLocked(devURN string) {
+	bo, exists := r.quarantineBackoff[devURN]
+	if !exists || bo < minQuarantineBackoff {
+		bo = minQuarantineBackoff
+	} else {
+		bo *= 2
+		if bo > maxQuarantineBackoff {
+			bo = maxQuarantineBackoff
+		}
+	}
+	r.quarantineBackoff[devURN] = bo
+	r.quarantineUntil[devURN] = time.Now().Add(bo)
+
+	if dev, ok := r.devices[devURN]; ok {
+		dev.Status = "quarantined"
+		r.devices[devURN] = dev
+	}
+}
+
+func (r *DeviceResolver) clearQuarantineLocked(devURN string) {
+	delete(r.quarantineUntil, devURN)
+	delete(r.quarantineBackoff, devURN)
+	if dev, ok := r.devices[devURN]; ok {
+		dev.Status = "active"
+		r.devices[devURN] = dev
+	}
+}
+
+// NormalizeLoopbackDevice pairs ALSA snd-aloop subdevices across playback and capture cables.
+// For capture (DirectionInput), Cable 0 playback (hw:Loopback,0) emerges on Cable 0 capture (hw:Loopback,1).
+// For playback (DirectionOutput), playing into Cable 0 capture (hw:Loopback,1) routes to Cable 0 playback (hw:Loopback,0).
+func NormalizeLoopbackDevice(ref string, direction StreamDirection) string {
+	refTrimmed := strings.TrimSpace(ref)
+	refLower := strings.ToLower(refTrimmed)
+	if !strings.Contains(refLower, "loopback") {
+		return refTrimmed
+	}
+
+	if direction == DirectionInput {
+		// Capture requests targeting device 0 migrate to device 1
+		if refLower == "hw:loopback" || refLower == "hw:loopback,0" || refLower == "plughw:loopback,0" {
+			return "hw:Loopback,1"
+		}
+		if refLower == "hw:loopback,0,0" || refLower == "plughw:loopback,0,0" {
+			return "hw:Loopback,1,0"
+		}
+		if strings.Contains(refTrimmed, "DEV=0") {
+			return strings.Replace(refTrimmed, "DEV=0", "DEV=1", 1)
+		}
+		if strings.Contains(refLower, "dev=0") {
+			idx := strings.Index(refLower, "dev=0")
+			return refTrimmed[:idx] + "DEV=1" + refTrimmed[idx+5:]
+		}
+		if strings.Contains(refTrimmed, ":d=0") {
+			return strings.Replace(refTrimmed, ":d=0", ":d=1", 1)
+		}
+		if strings.HasSuffix(refTrimmed, ":0") {
+			return strings.TrimSuffix(refTrimmed, ":0") + ":1"
+		}
+	} else if direction == DirectionOutput {
+		// Playback requests targeting device 1 migrate to device 0
+		if refLower == "hw:loopback,1" || refLower == "plughw:loopback,1" {
+			return "hw:Loopback,0"
+		}
+		if refLower == "hw:loopback,1,0" || refLower == "plughw:loopback,1,0" {
+			return "hw:Loopback,0,0"
+		}
+		if strings.Contains(refTrimmed, "DEV=1") {
+			return strings.Replace(refTrimmed, "DEV=1", "DEV=0", 1)
+		}
+		if strings.Contains(refLower, "dev=1") {
+			idx := strings.Index(refLower, "dev=1")
+			return refTrimmed[:idx] + "DEV=0" + refTrimmed[idx+5:]
+		}
+		if strings.Contains(refTrimmed, ":d=1") {
+			return strings.Replace(refTrimmed, ":d=1", ":d=0", 1)
+		}
+		if strings.HasSuffix(refTrimmed, ":1") {
+			return strings.TrimSuffix(refTrimmed, ":1") + ":0"
+		}
+	}
+
+	return refTrimmed
+}
+
+func isLoopback(name, urnStr string) bool {
+	return strings.Contains(strings.ToLower(name), "loopback") || strings.Contains(strings.ToLower(urnStr), "loopback")
+}
+
+func isLoopbackDev0(d Device) bool {
+	if !isLoopback(d.Name, d.URN) {
+		return false
+	}
+	urnLower := strings.ToLower(d.URN)
+	nameLower := strings.ToLower(d.Name)
+	return strings.Contains(urnLower, ":d=0") || strings.HasSuffix(urnLower, ":0") ||
+		strings.Contains(nameLower, ",0") || strings.Contains(nameLower, "dev=0")
+}
+
+func isLoopbackDev1(d Device) bool {
+	if !isLoopback(d.Name, d.URN) {
+		return false
+	}
+	urnLower := strings.ToLower(d.URN)
+	nameLower := strings.ToLower(d.Name)
+	return strings.Contains(urnLower, ":d=1") || strings.HasSuffix(urnLower, ":1") ||
+		strings.Contains(nameLower, ",1") || strings.Contains(nameLower, "dev=1")
+}
+
 func (r *DeviceResolver) registerLocked(dev Device) {
 	if dev.URN == "" {
 		if dev.ID != "" {
@@ -129,7 +253,7 @@ func (r *DeviceResolver) registerLocked(dev Device) {
 	}
 	dev.ID = dev.URN
 
-	if r.quarantined[dev.URN] {
+	if r.isQuarantinedLocked(dev.URN) {
 		dev.Status = "quarantined"
 	} else if dev.Status == "" {
 		dev.Status = "active"
@@ -189,9 +313,7 @@ func (r *DeviceResolver) Refresh() error {
 			continue
 		}
 		if _, stillPresent := activeSet[urnKey]; !stillPresent {
-			r.quarantined[urnKey] = true
-			dev.Status = "quarantined"
-			r.devices[urnKey] = dev
+			r.quarantineLocked(urnKey)
 
 			// Swap any active controllers for this URN to GhostAudioStream
 			for key, ctrl := range r.controllers {
@@ -273,7 +395,7 @@ func (r *DeviceResolver) ResolveOutput(ref string) (Device, bool) {
 	return dev, found
 }
 
-// Quarantine marks a device as disconnected/quarantined.
+// Quarantine marks a device as disconnected/quarantined with decaying TTL backoff.
 // If an active controller exists, swaps its physical stream to GhostAudioStream.
 func (r *DeviceResolver) Quarantine(ref string) {
 	r.mu.Lock()
@@ -284,13 +406,7 @@ func (r *DeviceResolver) Quarantine(ref string) {
 		devURN = mapped
 	}
 
-	if dev, ok := r.devices[devURN]; ok {
-		r.quarantined[devURN] = true
-		dev.Status = "quarantined"
-		r.devices[devURN] = dev
-	} else {
-		r.quarantined[devURN] = true
-	}
+	r.quarantineLocked(devURN)
 
 	delete(r.reboundStreams, StreamKey{URN: devURN, Direction: DirectionInput})
 	delete(r.reboundStreams, StreamKey{URN: devURN, Direction: DirectionOutput})
@@ -312,13 +428,7 @@ func (r *DeviceResolver) FastTeardown(ref string) {
 		devURN = mapped
 	}
 
-	if dev, ok := r.devices[devURN]; ok {
-		r.quarantined[devURN] = true
-		dev.Status = "quarantined"
-		r.devices[devURN] = dev
-	} else {
-		r.quarantined[devURN] = true
-	}
+	r.quarantineLocked(devURN)
 
 	delete(r.reboundStreams, StreamKey{URN: devURN, Direction: DirectionInput})
 	delete(r.reboundStreams, StreamKey{URN: devURN, Direction: DirectionOutput})
@@ -348,7 +458,7 @@ func (r *DeviceResolver) FastTeardown(ref string) {
 	}
 }
 
-// Activate marks a quarantined device as active.
+// Activate marks a quarantined device as active and resets its quarantine backoff.
 func (r *DeviceResolver) Activate(ref string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -358,14 +468,11 @@ func (r *DeviceResolver) Activate(ref string) {
 		devURN = mapped
 	}
 
-	delete(r.quarantined, devURN)
-	if dev, ok := r.devices[devURN]; ok {
-		dev.Status = "active"
-		r.devices[devURN] = dev
-	}
+	r.clearQuarantineLocked(devURN)
 }
 
 // IsQuarantined checks if a device is currently quarantined.
+// If its quarantine TTL has expired, it returns false (device has transitioned to probing).
 func (r *DeviceResolver) IsQuarantined(ref string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -374,26 +481,296 @@ func (r *DeviceResolver) IsQuarantined(ref string) bool {
 	if mapped, ok := r.aliases[ref]; ok {
 		devURN = mapped
 	}
-	return r.quarantined[devURN]
+	return r.isQuarantinedLocked(devURN)
 }
 
 func (r *DeviceResolver) findSiblingDeviceLocked(ref string, wantInput bool) (Device, bool) {
-	idx := strings.LastIndex(ref, ":d=")
-	if idx == -1 {
-		return Device{}, false
+	refLower := strings.ToLower(ref)
+	isLb := strings.Contains(refLower, "loopback")
+	if !isLb {
+		if mapped, ok := r.aliases[ref]; ok {
+			isLb = strings.Contains(strings.ToLower(mapped), "loopback")
+		}
 	}
-	base := ref[:idx]
-	for _, dev := range r.devices {
-		if strings.HasPrefix(dev.URN, base+":d=") {
-			if wantInput && dev.MaxInput > 0 {
-				return dev, true
+
+	// 1. Loopback subdevice pairing (Cable 0: Playback on dev 0 <-> Capture on dev 1)
+	if isLb {
+		for _, dev := range r.devices {
+			if !isLoopback(dev.Name, dev.URN) {
+				continue
 			}
-			if !wantInput && dev.MaxOutput > 0 {
-				return dev, true
+			if wantInput {
+				if isLoopbackDev1(dev) && dev.MaxInput > 0 {
+					return dev, true
+				}
+			} else {
+				if isLoopbackDev0(dev) && dev.MaxOutput > 0 {
+					return dev, true
+				}
 			}
 		}
 	}
+
+	// 2. Standard sibling search by ":d=" suffix or prefix
+	idx := strings.LastIndex(ref, ":d=")
+	if idx != -1 {
+		base := ref[:idx]
+		for _, dev := range r.devices {
+			if strings.HasPrefix(dev.URN, base+":d=") && dev.URN != ref {
+				if wantInput && dev.MaxInput > 0 {
+					return dev, true
+				}
+				if !wantInput && dev.MaxOutput > 0 {
+					return dev, true
+				}
+			}
+		}
+	}
+
+	// 3. Fallback: alias target sibling
+	if mapped, ok := r.aliases[ref]; ok && mapped != ref {
+		return r.findSiblingDeviceLocked(mapped, wantInput)
+	}
+
 	return Device{}, false
+}
+
+// OpenCushion creates or reuses an active controller cushioned with GhostAudioStream,
+// returning a RefStreamHandle immediately. When physical hardware is opened later,
+// RebindDirectional or swapPhysicalStream will promote the stream in-place.
+func (r *DeviceResolver) OpenCushion(ref string, dir StreamDirection, sampleRate, channels int) AudioStream {
+	normalizedRef := NormalizeLoopbackDevice(ref, dir)
+	dev, found := r.Resolve(normalizedRef)
+	if !found {
+		dev, found = r.Resolve(ref)
+	}
+	devURN := ref
+	if found {
+		devURN = dev.URN
+	} else if mapped, ok := r.aliases[ref]; ok {
+		devURN = mapped
+	}
+
+	key := StreamKey{URN: devURN, Direction: dir}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if ctrl, ok := r.controllers[key]; ok {
+		ctrl.mu.Lock()
+		if !ctrl.closed {
+			if ctrl.graceTimer != nil {
+				ctrl.graceTimer.Stop()
+				ctrl.graceTimer = nil
+			}
+			ctrl.refCount++
+			var handle *RefStreamHandle
+			if dir == DirectionInput {
+				handle = ctrl.newInputHandleLocked()
+			} else {
+				handle = ctrl.newOutputHandleLocked()
+			}
+			ctrl.mu.Unlock()
+			return handle
+		}
+		ctrl.mu.Unlock()
+	}
+
+	gp := r.gracePeriod
+	if gp <= 0 {
+		gp = defaultGracePeriod
+	}
+
+	ghost := NewGhostAudioStream(sampleRate, channels)
+	ctrl := newDeviceStreamController(r, key, ghost, sampleRate, channels, gp)
+	r.controllers[key] = ctrl
+
+	ctrl.mu.Lock()
+	ctrl.refCount = 1
+	var handle *RefStreamHandle
+	if dir == DirectionInput {
+		handle = ctrl.newInputHandleLocked()
+		ctrl.mu.Unlock()
+		go ctrl.captureWorker()
+	} else {
+		handle = ctrl.newOutputHandleLocked()
+		ctrl.mu.Unlock()
+		go ctrl.playbackMixerWorker()
+	}
+
+	return handle
+}
+
+func (r *DeviceResolver) promoteHardwareStream(ctrl *deviceStreamController, dev Device, dir StreamDirection, sampleRate, channels int, useEmulator bool) {
+	log.Printf("[AUDIO:DEV] Starting background promotion worker for URN=%q (%s)", dev.URN, dir)
+	var (
+		phys AudioStream
+		err  error
+	)
+	if dir == DirectionInput {
+		phys, err = OpenInput(dev.RuntimeID, sampleRate, channels, useEmulator, dev.Name, dev.URN)
+	} else {
+		phys, err = OpenOutput(dev.RuntimeID, sampleRate, channels, useEmulator, dev.Name, dev.URN)
+	}
+
+	if err != nil {
+		log.Printf("[AUDIO:DEV] Background promotion failed for URN=%q (%s): %v", dev.URN, dir, err)
+		r.mu.Lock()
+		r.quarantineLocked(dev.URN)
+		r.mu.Unlock()
+		return
+	}
+
+	if ctrl.isClosed() {
+		log.Printf("[AUDIO:DEV] Controller was closed before promotion completed for URN=%q; closing physical stream", dev.URN)
+		_ = phys.Close()
+		return
+	}
+
+	log.Printf("[AUDIO:DEV] Seamless asynchronous promotion: swapping Ghost cushion to live hardware stream for URN=%q", dev.URN)
+	ctrl.swapPhysicalStream(phys)
+
+	r.mu.Lock()
+	r.clearQuarantineLocked(dev.URN)
+	r.mu.Unlock()
+}
+
+// OpenInputAsync returns a RefStreamHandle cushioned with GhostAudioStream in < 1ms,
+// launching background hardware acquisition and promoting atomically when ready.
+func (r *DeviceResolver) OpenInputAsync(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
+	normalizedRef := NormalizeLoopbackDevice(ref, DirectionInput)
+	dev, found := r.Resolve(normalizedRef)
+	if !found {
+		dev, found = r.Resolve(ref)
+	}
+
+	if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev0(dev) {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(dev.URN, true); ok {
+			r.aliases[ref] = sibling.URN
+			dev = sibling
+		}
+		r.mu.Unlock()
+	} else if !found || dev.MaxInput == 0 {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(ref, true); ok {
+			if !strings.Contains(ref, ":d=") {
+				r.aliases[ref] = sibling.URN
+			}
+			dev = sibling
+			found = true
+		}
+		r.mu.Unlock()
+	}
+
+	if !found {
+		_ = r.Refresh()
+		dev, found = r.Resolve(normalizedRef)
+		if !found {
+			dev, found = r.Resolve(ref)
+		}
+		if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev0(dev) {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(dev.URN, true); ok {
+				r.aliases[ref] = sibling.URN
+				dev = sibling
+			}
+			r.mu.Unlock()
+		} else if !found || dev.MaxInput == 0 {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(ref, true); ok {
+				dev = sibling
+				found = true
+			}
+			r.mu.Unlock()
+		}
+	}
+
+	handle := r.OpenCushion(ref, DirectionInput, sampleRate, channels)
+	refHandle, ok := handle.(*RefStreamHandle)
+	if !ok {
+		return handle, nil
+	}
+	if !found {
+		return handle, nil
+	}
+
+	// If device is actively quarantined and backoff timer has not expired, do not launch promotion yet
+	if r.IsQuarantined(dev.URN) {
+		return handle, nil
+	}
+
+	go r.promoteHardwareStream(refHandle.controller, dev, DirectionInput, sampleRate, channels, useEmulator)
+	return handle, nil
+}
+
+// OpenOutputAsync returns a RefStreamHandle cushioned with GhostAudioStream in < 1ms,
+// launching background hardware acquisition and promoting atomically when ready.
+func (r *DeviceResolver) OpenOutputAsync(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
+	normalizedRef := NormalizeLoopbackDevice(ref, DirectionOutput)
+	dev, found := r.Resolve(normalizedRef)
+	if !found {
+		dev, found = r.Resolve(ref)
+	}
+
+	if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev1(dev) {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(dev.URN, false); ok {
+			r.aliases[ref] = sibling.URN
+			dev = sibling
+		}
+		r.mu.Unlock()
+	} else if !found || dev.MaxOutput == 0 {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(ref, false); ok {
+			if !strings.Contains(ref, ":d=") {
+				r.aliases[ref] = sibling.URN
+			}
+			dev = sibling
+			found = true
+		}
+		r.mu.Unlock()
+	}
+
+	if !found {
+		_ = r.Refresh()
+		dev, found = r.Resolve(normalizedRef)
+		if !found {
+			dev, found = r.Resolve(ref)
+		}
+		if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev1(dev) {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(dev.URN, false); ok {
+				r.aliases[ref] = sibling.URN
+				dev = sibling
+			}
+			r.mu.Unlock()
+		} else if !found || dev.MaxOutput == 0 {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(ref, false); ok {
+				dev = sibling
+				found = true
+			}
+			r.mu.Unlock()
+		}
+	}
+
+	handle := r.OpenCushion(ref, DirectionOutput, sampleRate, channels)
+	refHandle, ok := handle.(*RefStreamHandle)
+	if !ok {
+		return handle, nil
+	}
+	if !found {
+		return handle, nil
+	}
+
+	// If device is actively quarantined and backoff timer has not expired, do not launch promotion yet
+	if r.IsQuarantined(dev.URN) {
+		return handle, nil
+	}
+
+	go r.promoteHardwareStream(refHandle.controller, dev, DirectionOutput, sampleRate, channels, useEmulator)
+	return handle, nil
 }
 
 // OpenInput resolves the device identifier and opens an input stream handle.
@@ -401,8 +778,21 @@ func (r *DeviceResolver) findSiblingDeviceLocked(ref string, wantInput bool) (De
 // wrapping GhostAudioStream is returned.
 func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
 	log.Printf("[AUDIO:DEV] OpenInput called: ref=%q sampleRate=%d channels=%d emulator=%t", ref, sampleRate, channels, useEmulator)
-	dev, found := r.Resolve(ref)
-	if !found || dev.MaxInput == 0 {
+	normalizedRef := NormalizeLoopbackDevice(ref, DirectionInput)
+	dev, found := r.Resolve(normalizedRef)
+	if !found {
+		dev, found = r.Resolve(ref)
+	}
+
+	if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev0(dev) {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(dev.URN, true); ok {
+			log.Printf("[AUDIO:DEV] Sibling auto-migration: loopback input ref=%q auto-migrated to capture sibling URN=%q", ref, sibling.URN)
+			r.aliases[ref] = sibling.URN
+			dev = sibling
+		}
+		r.mu.Unlock()
+	} else if !found || dev.MaxInput == 0 {
 		r.mu.Lock()
 		if sibling, ok := r.findSiblingDeviceLocked(ref, true); ok {
 			if !strings.Contains(ref, ":d=") {
@@ -413,6 +803,30 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 			log.Printf("[AUDIO:DEV] Sibling auto-migration: ref=%q has no input channels, migrating to capture sibling URN=%q (runtimeID=%d)", ref, sibling.URN, sibling.RuntimeID)
 		}
 		r.mu.Unlock()
+	}
+
+	if !found {
+		// Attempt refresh to discover hotplugged or newly started audio endpoints
+		_ = r.Refresh()
+		dev, found = r.Resolve(normalizedRef)
+		if !found {
+			dev, found = r.Resolve(ref)
+		}
+		if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev0(dev) {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(dev.URN, true); ok {
+				r.aliases[ref] = sibling.URN
+				dev = sibling
+			}
+			r.mu.Unlock()
+		} else if !found || dev.MaxInput == 0 {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(ref, true); ok {
+				dev = sibling
+				found = true
+			}
+			r.mu.Unlock()
+		}
 	}
 
 	if !found {
@@ -432,7 +846,7 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 			})
 			return r.OpenInput(ref, sampleRate, channels, true)
 		}
-		log.Printf("[AUDIO:DEV] WARN: device ref=%q not found in resolver catalog. Falling back to GhostAudioStream (silent)", ref)
+		log.Printf("[AUDIO:DEV] WARN: device ref=%q not found in resolver catalog. Returning GhostAudioStream cushion", ref)
 		r.Quarantine(ref)
 		r.Register(Device{
 			ID:        ref,
@@ -440,14 +854,12 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 			Name:      fmt.Sprintf("Quarantined Device %s", ref),
 			Status:    "quarantined",
 		})
-		return r.OpenInput(ref, sampleRate, channels, useEmulator)
+		return r.OpenCushion(ref, DirectionInput, sampleRate, channels), nil
 	}
 
 	key := StreamKey{URN: dev.URN, Direction: DirectionInput}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if ctrl, ok := r.controllers[key]; ok {
 		ctrl.mu.Lock()
 		if !ctrl.closed {
@@ -459,6 +871,7 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 			curRefCount := ctrl.refCount
 			handle := ctrl.newInputHandleLocked()
 			ctrl.mu.Unlock()
+			r.mu.Unlock()
 			log.Printf("[AUDIO:DEV] SUCCESS: reusing active input stream controller for URN=%q refCount=%d", dev.URN, curRefCount)
 			return handle, nil
 		}
@@ -467,6 +880,9 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 
 	// Prepare physical stream
 	var phys AudioStream
+	isQuarantined := r.isQuarantinedLocked(dev.URN)
+	isProbing := !isQuarantined && (dev.Status == "quarantined" || dev.Status == "probing")
+
 	if rebound, ok := r.reboundStreams[key]; ok && rebound != nil {
 		phys = rebound
 		if dev.IsVirtual {
@@ -480,22 +896,45 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 	} else if dev.IsVirtual {
 		log.Printf("[AUDIO:DEV] WARN: virtual device URN=%q has no physical stream, using GhostAudioStream", dev.URN)
 		phys = NewGhostAudioStream(sampleRate, channels)
-	} else if dev.Status == "quarantined" || dev.Status == "disconnected" || r.quarantined[dev.URN] {
-		log.Printf("[AUDIO:DEV] WARN: device URN=%q status is %q. Returning GhostAudioStream handle (silent)", dev.URN, dev.Status)
+	} else if isQuarantined {
+		log.Printf("[AUDIO:DEV] WARN: device URN=%q is quarantined (decaying TTL). Returning GhostAudioStream cushion", dev.URN)
+		phys = NewGhostAudioStream(sampleRate, channels)
+	} else if isProbing {
+		log.Printf("[AUDIO:DEV] Probing self-healing device URN=%q. Initializing GhostAudioStream cushion and launching async promotion", dev.URN)
 		phys = NewGhostAudioStream(sampleRate, channels)
 	} else {
 		log.Printf("[AUDIO:DEV] Resolved input ref=%q to device URN=%q runtimeID=%d (Name=%q)", ref, dev.URN, dev.RuntimeID, dev.Name)
-		st, err := OpenInput(dev.RuntimeID, sampleRate, channels, useEmulator)
+		r.mu.Unlock()
+		st, err := OpenInput(dev.RuntimeID, sampleRate, channels, useEmulator, dev.Name, dev.URN)
+		r.mu.Lock()
 		if err != nil {
 			log.Printf("[AUDIO:DEV] ERROR: failed to open hardware input URN=%q runtimeID=%d: %v", dev.URN, dev.RuntimeID, err)
+			r.mu.Unlock()
 			return nil, err
 		}
 		phys = st
+		r.clearQuarantineLocked(dev.URN)
 	}
 
 	gp := r.gracePeriod
 	if gp <= 0 {
 		gp = defaultGracePeriod
+	}
+
+	// Check if a controller already exists (e.g. opened via OpenCushion)
+	if existingCtrl, ok := r.controllers[key]; ok && !existingCtrl.isClosed() {
+		existingCtrl.swapPhysicalStream(phys)
+		existingCtrl.mu.Lock()
+		if existingCtrl.graceTimer != nil {
+			existingCtrl.graceTimer.Stop()
+			existingCtrl.graceTimer = nil
+		}
+		existingCtrl.refCount++
+		handle := existingCtrl.newInputHandleLocked()
+		existingCtrl.mu.Unlock()
+		r.mu.Unlock()
+		log.Printf("[AUDIO:DEV] SUCCESS: attached physical input to existing controller for URN=%q refCount=%d", dev.URN, existingCtrl.refCount)
+		return handle, nil
 	}
 
 	ctrl := newDeviceStreamController(r, key, phys, sampleRate, channels, gp)
@@ -508,6 +947,12 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 
 	go ctrl.captureWorker()
 
+	if isProbing {
+		go r.promoteHardwareStream(ctrl, dev, DirectionInput, sampleRate, channels, useEmulator)
+	}
+
+	r.mu.Unlock()
+
 	log.Printf("[AUDIO:DEV] SUCCESS: hardware input stream controller online for URN=%q", dev.URN)
 	return handle, nil
 }
@@ -517,8 +962,21 @@ func (r *DeviceResolver) OpenInput(ref string, sampleRate, channels int, useEmul
 // wrapping GhostAudioStream is returned.
 func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmulator bool) (AudioStream, error) {
 	log.Printf("[AUDIO:DEV] OpenOutput called: ref=%q sampleRate=%d channels=%d emulator=%t", ref, sampleRate, channels, useEmulator)
-	dev, found := r.Resolve(ref)
-	if !found || dev.MaxOutput == 0 {
+	normalizedRef := NormalizeLoopbackDevice(ref, DirectionOutput)
+	dev, found := r.Resolve(normalizedRef)
+	if !found {
+		dev, found = r.Resolve(ref)
+	}
+
+	if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev1(dev) {
+		r.mu.Lock()
+		if sibling, ok := r.findSiblingDeviceLocked(dev.URN, false); ok {
+			log.Printf("[AUDIO:DEV] Sibling auto-migration: loopback output ref=%q auto-migrated to playback sibling URN=%q", ref, sibling.URN)
+			r.aliases[ref] = sibling.URN
+			dev = sibling
+		}
+		r.mu.Unlock()
+	} else if !found || dev.MaxOutput == 0 {
 		r.mu.Lock()
 		if sibling, ok := r.findSiblingDeviceLocked(ref, false); ok {
 			if !strings.Contains(ref, ":d=") {
@@ -529,6 +987,29 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 			log.Printf("[AUDIO:DEV] Sibling auto-migration: ref=%q has no output channels, migrating to playback sibling URN=%q (runtimeID=%d)", ref, sibling.URN, sibling.RuntimeID)
 		}
 		r.mu.Unlock()
+	}
+
+	if !found {
+		_ = r.Refresh()
+		dev, found = r.Resolve(normalizedRef)
+		if !found {
+			dev, found = r.Resolve(ref)
+		}
+		if found && isLoopback(dev.Name, dev.URN) && isLoopbackDev1(dev) {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(dev.URN, false); ok {
+				r.aliases[ref] = sibling.URN
+				dev = sibling
+			}
+			r.mu.Unlock()
+		} else if !found || dev.MaxOutput == 0 {
+			r.mu.Lock()
+			if sibling, ok := r.findSiblingDeviceLocked(ref, false); ok {
+				dev = sibling
+				found = true
+			}
+			r.mu.Unlock()
+		}
 	}
 
 	if !found {
@@ -548,7 +1029,7 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 			})
 			return r.OpenOutput(ref, sampleRate, channels, true)
 		}
-		log.Printf("[AUDIO:DEV] WARN: device ref=%q not found in resolver catalog. Falling back to GhostAudioStream (silent)", ref)
+		log.Printf("[AUDIO:DEV] WARN: device ref=%q not found in resolver catalog. Returning GhostAudioStream cushion", ref)
 		r.Quarantine(ref)
 		r.Register(Device{
 			ID:        ref,
@@ -556,14 +1037,12 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 			Name:      fmt.Sprintf("Quarantined Device %s", ref),
 			Status:    "quarantined",
 		})
-		return r.OpenOutput(ref, sampleRate, channels, useEmulator)
+		return r.OpenCushion(ref, DirectionOutput, sampleRate, channels), nil
 	}
 
 	key := StreamKey{URN: dev.URN, Direction: DirectionOutput}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	if ctrl, ok := r.controllers[key]; ok {
 		ctrl.mu.Lock()
 		if !ctrl.closed {
@@ -575,6 +1054,7 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 			curRefCount := ctrl.refCount
 			handle := ctrl.newOutputHandleLocked()
 			ctrl.mu.Unlock()
+			r.mu.Unlock()
 			log.Printf("[AUDIO:DEV] SUCCESS: reusing active output stream controller for URN=%q refCount=%d", dev.URN, curRefCount)
 			return handle, nil
 		}
@@ -583,6 +1063,9 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 
 	// Prepare physical stream
 	var phys AudioStream
+	isQuarantined := r.isQuarantinedLocked(dev.URN)
+	isProbing := !isQuarantined && (dev.Status == "quarantined" || dev.Status == "probing")
+
 	if rebound, ok := r.reboundStreams[key]; ok && rebound != nil {
 		phys = rebound
 		if dev.IsVirtual {
@@ -596,22 +1079,45 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 	} else if dev.IsVirtual {
 		log.Printf("[AUDIO:DEV] WARN: virtual device URN=%q has no physical stream, using GhostAudioStream", dev.URN)
 		phys = NewGhostAudioStream(sampleRate, channels)
-	} else if dev.Status == "quarantined" || dev.Status == "disconnected" || r.quarantined[dev.URN] {
-		log.Printf("[AUDIO:DEV] WARN: device URN=%q status is %q. Returning GhostAudioStream handle (silent)", dev.URN, dev.Status)
+	} else if isQuarantined {
+		log.Printf("[AUDIO:DEV] WARN: device URN=%q is quarantined (decaying TTL). Returning GhostAudioStream cushion", dev.URN)
+		phys = NewGhostAudioStream(sampleRate, channels)
+	} else if isProbing {
+		log.Printf("[AUDIO:DEV] Probing self-healing device URN=%q. Initializing GhostAudioStream cushion and launching async promotion", dev.URN)
 		phys = NewGhostAudioStream(sampleRate, channels)
 	} else {
 		log.Printf("[AUDIO:DEV] Resolved output ref=%q to device URN=%q runtimeID=%d (Name=%q)", ref, dev.URN, dev.RuntimeID, dev.Name)
-		st, err := OpenOutput(dev.RuntimeID, sampleRate, channels, useEmulator)
+		r.mu.Unlock()
+		st, err := OpenOutput(dev.RuntimeID, sampleRate, channels, useEmulator, dev.Name, dev.URN)
+		r.mu.Lock()
 		if err != nil {
 			log.Printf("[AUDIO:DEV] ERROR: failed to open hardware output URN=%q runtimeID=%d: %v", dev.URN, dev.RuntimeID, err)
+			r.mu.Unlock()
 			return nil, err
 		}
 		phys = st
+		r.clearQuarantineLocked(dev.URN)
 	}
 
 	gp := r.gracePeriod
 	if gp <= 0 {
 		gp = defaultGracePeriod
+	}
+
+	// Check if a controller already exists (e.g. opened via OpenCushion)
+	if existingCtrl, ok := r.controllers[key]; ok && !existingCtrl.isClosed() {
+		existingCtrl.swapPhysicalStream(phys)
+		existingCtrl.mu.Lock()
+		if existingCtrl.graceTimer != nil {
+			existingCtrl.graceTimer.Stop()
+			existingCtrl.graceTimer = nil
+		}
+		existingCtrl.refCount++
+		handle := existingCtrl.newOutputHandleLocked()
+		existingCtrl.mu.Unlock()
+		r.mu.Unlock()
+		log.Printf("[AUDIO:DEV] SUCCESS: attached physical output to existing controller for URN=%q refCount=%d", dev.URN, existingCtrl.refCount)
+		return handle, nil
 	}
 
 	ctrl := newDeviceStreamController(r, key, phys, sampleRate, channels, gp)
@@ -623,6 +1129,12 @@ func (r *DeviceResolver) OpenOutput(ref string, sampleRate, channels int, useEmu
 	ctrl.mu.Unlock()
 
 	go ctrl.playbackMixerWorker()
+
+	if isProbing {
+		go r.promoteHardwareStream(ctrl, dev, DirectionOutput, sampleRate, channels, useEmulator)
+	}
+
+	r.mu.Unlock()
 
 	log.Printf("[AUDIO:DEV] SUCCESS: hardware output stream controller online for URN=%q", dev.URN)
 	return handle, nil
@@ -642,10 +1154,12 @@ func (r *DeviceResolver) rebindDirectionalLocked(ref string, dir StreamDirection
 		devURN = mapped
 	}
 
-	delete(r.quarantined, devURN)
-	if dev, ok := r.devices[devURN]; ok {
-		dev.Status = "active"
-		r.devices[devURN] = dev
+	r.clearQuarantineLocked(devURN)
+
+	if rh, ok := physicalStream.(*RefStreamHandle); ok {
+		if rh.controller != nil {
+			physicalStream = rh.controller.getPhysicalStream()
+		}
 	}
 
 	key := StreamKey{URN: devURN, Direction: dir}
@@ -667,20 +1181,18 @@ func (r *DeviceResolver) Rebind(ref string, physicalStream AudioStream) {
 		devURN = mapped
 	}
 
-	delete(r.quarantined, devURN)
-	if dev, ok := r.devices[devURN]; ok {
-		dev.Status = "active"
-		r.devices[devURN] = dev
-	}
+	r.clearQuarantineLocked(devURN)
 
 	// Determine direction if physicalStream is direction-specific
 	isInputOnly := false
 	isOutputOnly := false
 	switch physicalStream.(type) {
-	case *emulatorInput, *portaudioInput:
+	case *emulatorInput:
 		isInputOnly = true
-	case *emulatorOutput, *portaudioOutput:
+	case *emulatorOutput:
 		isOutputOnly = true
+	default:
+		isInputOnly, isOutputOnly = isPortAudioStreamDirection(physicalStream)
 	}
 
 	if isInputOnly {
@@ -721,8 +1233,10 @@ func (r *DeviceResolver) ListDevices() []Device {
 
 	out := make([]Device, 0, len(r.devices))
 	for _, d := range r.devices {
-		if r.quarantined[d.URN] {
+		if r.isQuarantinedLocked(d.URN) {
 			d.Status = "quarantined"
+		} else if d.Status == "quarantined" {
+			d.Status = "probing"
 		}
 		out = append(out, d)
 	}
@@ -885,6 +1399,13 @@ func (c *deviceStreamController) getPhysicalStream() AudioStream {
 
 func (c *deviceStreamController) swapPhysicalStream(newStream AudioStream) {
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		if newStream != nil {
+			_ = newStream.Close()
+		}
+		return
+	}
 	old := c.physical
 	c.physical = newStream
 	c.mu.Unlock()

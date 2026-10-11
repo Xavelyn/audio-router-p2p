@@ -126,3 +126,89 @@ func TestPortAudioInput_SpillDrainBeforeEOF(t *testing.T) {
 		t.Fatalf("expected EOF after spill drained, got n=%d err=%v", n, err)
 	}
 }
+
+func TestBuildRateCandidates_Prioritization(t *testing.T) {
+	// 1. Without activeRates: requested rate should come first
+	rates := buildRateCandidates(48000, 44100)
+	if len(rates) == 0 || rates[0] != 48000 {
+		t.Fatalf("expected 48000 at index 0, got %v", rates)
+	}
+
+	// 2. With activeRates (e.g. procfs detected 44100 locked hardware rate):
+	// Active rate MUST be index 0
+	rates = buildRateCandidates(48000, 48000, 44100)
+	if len(rates) == 0 || rates[0] != 44100 {
+		t.Fatalf("expected active rate 44100 at index 0, got %v", rates)
+	}
+
+	// Verify deduplication
+	seen := make(map[int]int)
+	for _, r := range rates {
+		seen[r]++
+		if seen[r] > 1 {
+			t.Errorf("duplicate rate %d in %v", r, rates)
+		}
+	}
+}
+
+func TestExtractAlsaCardAndDevice(t *testing.T) {
+	tests := []struct {
+		name     string
+		fallback []string
+		wantC    int
+		wantD    int
+		wantOk   bool
+	}{
+		{
+			name:   "hw:Loopback,1",
+			wantC:  0,
+			wantD:  0,
+			wantOk: false, // "Loopback" is not integer card number in hw:
+		},
+		{
+			name:   "hw:0,1",
+			wantC:  0,
+			wantD:  1,
+			wantOk: true,
+		},
+		{
+			name:   "plughw:2,0",
+			wantC:  2,
+			wantD:  0,
+			wantOk: true,
+		},
+		{
+			name:   "ALSA: HDA Intel PCH (hw:0,0)",
+			wantC:  0,
+			wantD:  0,
+			wantOk: true,
+		},
+		{
+			name:     "Invalid name with URN fallback",
+			fallback: []string{"urn:audio:hw:alsa:c=1:d=2"},
+			wantC:    1,
+			wantD:    2,
+			wantOk:   true,
+		},
+		{
+			name:     "Invalid name with card-only fallback",
+			fallback: []string{"hw:3"},
+			wantC:    3,
+			wantD:    0,
+			wantOk:   true,
+		},
+	}
+
+	for _, tc := range tests {
+		c, d, ok := extractAlsaCardAndDevice(tc.name, tc.fallback...)
+		if ok != tc.wantOk {
+			t.Errorf("[%s] expected ok=%t, got %t", tc.name, tc.wantOk, ok)
+			continue
+		}
+		if ok {
+			if c != tc.wantC || d != tc.wantD {
+				t.Errorf("[%s] expected card=%d dev=%d, got card=%d dev=%d", tc.name, tc.wantC, tc.wantD, c, d)
+			}
+		}
+	}
+}

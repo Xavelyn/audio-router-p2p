@@ -947,3 +947,222 @@ func TestDeviceResolver_HardwareOpenErrorBubblingWithoutCaching(t *testing.T) {
 	}
 	resolver.mu.Unlock()
 }
+
+func TestNormalizeLoopbackDevice(t *testing.T) {
+	tests := []struct {
+		input string
+		dir   StreamDirection
+		want  string
+	}{
+		{"hw:Loopback", DirectionInput, "hw:Loopback,1"},
+		{"hw:Loopback,0", DirectionInput, "hw:Loopback,1"},
+		{"hw:Loopback,0,0", DirectionInput, "hw:Loopback,1,0"},
+		{"sysdefault:CARD=Loopback,DEV=0", DirectionInput, "sysdefault:CARD=Loopback,DEV=1"},
+		{"urn:audio:hw:alsa:loopback:d=0", DirectionInput, "urn:audio:hw:alsa:loopback:d=1"},
+		{"urn:audio:hw:alsa:loopback:0", DirectionInput, "urn:audio:hw:alsa:loopback:1"},
+		{"hw:0,0", DirectionInput, "hw:0,0"},
+
+		{"hw:Loopback,1", DirectionOutput, "hw:Loopback,0"},
+		{"hw:Loopback,1,0", DirectionOutput, "hw:Loopback,0,0"},
+		{"sysdefault:CARD=Loopback,DEV=1", DirectionOutput, "sysdefault:CARD=Loopback,DEV=0"},
+		{"urn:audio:hw:alsa:loopback:d=1", DirectionOutput, "urn:audio:hw:alsa:loopback:d=0"},
+		{"urn:audio:hw:alsa:loopback:1", DirectionOutput, "urn:audio:hw:alsa:loopback:0"},
+		{"hw:1,0", DirectionOutput, "hw:1,0"},
+	}
+
+	for _, tc := range tests {
+		got := NormalizeLoopbackDevice(tc.input, tc.dir)
+		if got != tc.want {
+			t.Errorf("NormalizeLoopbackDevice(%q, %v) = %q; want %q", tc.input, tc.dir, got, tc.want)
+		}
+	}
+}
+
+func TestDeviceResolver_QuarantineDecayingTTL(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	devURN := "urn:audio:hw:test:decaying-dev"
+	resolver.Register(Device{
+		ID:        devURN,
+		URN:       devURN,
+		RuntimeID: 10,
+		Name:      "Decaying Test Device",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+
+	// 1. Initial quarantine
+	resolver.Quarantine(devURN)
+	if !resolver.IsQuarantined(devURN) {
+		t.Fatal("expected device to be quarantined immediately")
+	}
+
+	resolver.mu.RLock()
+	bo1 := resolver.quarantineBackoff[devURN]
+	until1 := resolver.quarantineUntil[devURN]
+	resolver.mu.RUnlock()
+
+	if bo1 != minQuarantineBackoff {
+		t.Fatalf("expected initial backoff %v, got %v", minQuarantineBackoff, bo1)
+	}
+	if time.Now().After(until1) {
+		t.Fatalf("expected quarantine until in future")
+	}
+
+	// 2. Second quarantine before clear: exponential backoff doubles
+	resolver.Quarantine(devURN)
+	resolver.mu.RLock()
+	bo2 := resolver.quarantineBackoff[devURN]
+	resolver.mu.RUnlock()
+
+	if bo2 != 2*minQuarantineBackoff {
+		t.Fatalf("expected doubled backoff %v, got %v", 2*minQuarantineBackoff, bo2)
+	}
+
+	// 3. Simulate TTL expiration
+	resolver.mu.Lock()
+	resolver.quarantineUntil[devURN] = time.Now().Add(-1 * time.Second)
+	resolver.mu.Unlock()
+
+	if resolver.IsQuarantined(devURN) {
+		t.Fatal("expected IsQuarantined to return false after TTL expiration")
+	}
+
+	// 4. OpenInput after TTL expired: transitions to probing and returns cushion
+	st, err := resolver.OpenInput(devURN, 48000, 2, true)
+	if err != nil {
+		t.Fatalf("expected OpenInput to return cushion during probing, got %v", err)
+	}
+	defer st.Close()
+
+	// 5. Activate device: clears quarantine state completely
+	resolver.Activate(devURN)
+	resolver.mu.RLock()
+	_, hasUntil := resolver.quarantineUntil[devURN]
+	_, hasBackoff := resolver.quarantineBackoff[devURN]
+	resolver.mu.RUnlock()
+
+	if hasUntil || hasBackoff {
+		t.Fatalf("expected Activate to clear quarantine maps")
+	}
+}
+
+func TestDeviceResolver_LoopbackSiblingAutoMigration(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	// Device 0: Playback only on Cable 0
+	playDev := Device{
+		ID:        "urn:audio:hw:alsa:c=Loopback:d=0",
+		URN:       "urn:audio:hw:alsa:c=Loopback:d=0",
+		RuntimeID: 20,
+		Name:      "Loopback,0,0",
+		MaxInput:  0,
+		MaxOutput: 2,
+		Status:    "active",
+	}
+	// Device 1: Capture only on Cable 0
+	capDev := Device{
+		ID:        "urn:audio:hw:alsa:c=Loopback:d=1",
+		URN:       "urn:audio:hw:alsa:c=Loopback:d=1",
+		RuntimeID: 21,
+		Name:      "Loopback,0,1",
+		MaxInput:  2,
+		MaxOutput: 0,
+		Status:    "active",
+	}
+
+	resolver.Register(playDev)
+	resolver.Register(capDev)
+
+	// User requests input from playback endpoint "hw:Loopback,0"
+	// Resolver should normalize / auto-migrate to capture subdevice 1
+	inStream, err := resolver.OpenInput("hw:Loopback,0", 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenInput on loopback playback endpoint failed: %v", err)
+	}
+	defer inStream.Close()
+
+	buf := make([]byte, 192)
+	n, err := inStream.Read(buf)
+	if err != nil || n != len(buf) {
+		t.Fatalf("expected to read audio from auto-migrated capture subdevice: n=%d, err=%v", n, err)
+	}
+
+	// User requests output to capture endpoint "hw:Loopback,1"
+	// Resolver should normalize / auto-migrate to playback subdevice 0
+	outStream, err := resolver.OpenOutput("hw:Loopback,1", 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenOutput on loopback capture endpoint failed: %v", err)
+	}
+	defer outStream.Close()
+
+	n, err = outStream.Write(buf)
+	if err != nil || n != len(buf) {
+		t.Fatalf("expected to write audio to auto-migrated playback subdevice: n=%d, err=%v", n, err)
+	}
+}
+
+func TestDeviceResolver_AsyncPromotion(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	devURN := "urn:audio:hw:test:async-promo"
+	resolver.Register(Device{
+		ID:        devURN,
+		URN:       devURN,
+		RuntimeID: 30,
+		Name:      "Async Promo Device",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+
+	// Open cushion stream immediately (< 5ms)
+	start := time.Now()
+	st, err := resolver.OpenInputAsync(devURN, 48000, 2, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("OpenInputAsync returned error: %v", err)
+	}
+	defer st.Close()
+
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("OpenInputAsync took too long: %v", elapsed)
+	}
+
+	// Reader can continuously read audio without blocking
+	buf := make([]byte, 384)
+	n, err := st.Read(buf)
+	if err != nil || n <= 0 {
+		t.Fatalf("expected immediate read from cushion stream: n=%d err=%v", n, err)
+	}
+
+	// Wait briefly for background promotion to complete
+	deadline := time.Now().Add(2 * time.Second)
+	promoted := false
+	for time.Now().Before(deadline) {
+		refHandle, ok := st.(*RefStreamHandle)
+		if ok && refHandle.Underlying() != nil {
+			if _, isGhost := refHandle.Underlying().(*GhostAudioStream); !isGhost {
+				promoted = true
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !promoted {
+		t.Fatalf("expected stream to be promoted to physical emulator stream")
+	}
+
+	// Continue reading after promotion to verify stream stability
+	for i := 0; i < 5; i++ {
+		n, err := st.Read(buf)
+		if err != nil || n <= 0 {
+			t.Fatalf("read %d after promotion failed: n=%d, err=%v", i, n, err)
+		}
+	}
+}

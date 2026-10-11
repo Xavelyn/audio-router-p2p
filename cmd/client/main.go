@@ -648,6 +648,13 @@ func openInputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRate
 	if resolver == nil {
 		return audio.NewGhostAudioStream(sampleRate, channels)
 	}
+	if timeout <= 0 {
+		st, err := resolver.OpenInputAsync(ref, sampleRate, channels, useEmulator)
+		if err == nil && st != nil {
+			return st
+		}
+		return resolver.OpenCushion(ref, audio.DirectionInput, sampleRate, channels)
+	}
 	type res struct {
 		stream audio.AudioStream
 		err    error
@@ -661,26 +668,39 @@ func openInputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRate
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			log.Printf("[STREAM:MGR] WARN: OpenInput(%s) error: %v, falling back to GhostAudioStream", ref, r.err)
-			return audio.NewGhostAudioStream(sampleRate, channels)
+			log.Printf("[STREAM:MGR] WARN: OpenInput(%s) error: %v, falling back to cushion handle", ref, r.err)
+			return resolver.OpenCushion(ref, audio.DirectionInput, sampleRate, channels)
 		}
 		return r.stream
 	case <-time.After(timeout):
-		log.Printf("[STREAM:MGR] WARN: OpenInput(%s) timed out after %v, falling back to GhostAudioStream", ref, timeout)
+		log.Printf("[STREAM:MGR] WARN: OpenInput(%s) timed out after %v, falling back to cushion handle", ref, timeout)
+		cushion := resolver.OpenCushion(ref, audio.DirectionInput, sampleRate, channels)
 		go func() {
 			r := <-ch
+			if r.err != nil {
+				log.Printf("[STREAM:MGR] WARN: Late OpenInput(%s) completed with error: %v", ref, r.err)
+				return
+			}
 			if r.stream != nil {
-				log.Printf("[STREAM:MGR] Closing late-opened input device %s after timeout", ref)
+				log.Printf("[STREAM:MGR] Late-opened input device %s acquired after timeout; promoting via RebindDirectional", ref)
+				resolver.RebindDirectional(ref, audio.DirectionInput, r.stream)
 				_ = r.stream.Close()
 			}
 		}()
-		return audio.NewGhostAudioStream(sampleRate, channels)
+		return cushion
 	}
 }
 
 func openOutputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRate, channels int, useEmulator bool, timeout time.Duration) audio.AudioStream {
 	if resolver == nil {
 		return audio.NewGhostAudioStream(sampleRate, channels)
+	}
+	if timeout <= 0 {
+		st, err := resolver.OpenOutputAsync(ref, sampleRate, channels, useEmulator)
+		if err == nil && st != nil {
+			return st
+		}
+		return resolver.OpenCushion(ref, audio.DirectionOutput, sampleRate, channels)
 	}
 	type res struct {
 		stream audio.AudioStream
@@ -695,20 +715,26 @@ func openOutputWithTimeout(resolver *audio.DeviceResolver, ref string, sampleRat
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			log.Printf("[STREAM:MGR] WARN: OpenOutput(%s) error: %v, falling back to GhostAudioStream", ref, r.err)
-			return audio.NewGhostAudioStream(sampleRate, channels)
+			log.Printf("[STREAM:MGR] WARN: OpenOutput(%s) error: %v, falling back to cushion handle", ref, r.err)
+			return resolver.OpenCushion(ref, audio.DirectionOutput, sampleRate, channels)
 		}
 		return r.stream
 	case <-time.After(timeout):
-		log.Printf("[STREAM:MGR] WARN: OpenOutput(%s) timed out after %v, falling back to GhostAudioStream", ref, timeout)
+		log.Printf("[STREAM:MGR] WARN: OpenOutput(%s) timed out after %v, falling back to cushion handle", ref, timeout)
+		cushion := resolver.OpenCushion(ref, audio.DirectionOutput, sampleRate, channels)
 		go func() {
 			r := <-ch
+			if r.err != nil {
+				log.Printf("[STREAM:MGR] WARN: Late OpenOutput(%s) completed with error: %v", ref, r.err)
+				return
+			}
 			if r.stream != nil {
-				log.Printf("[STREAM:MGR] Closing late-opened output device %s after timeout", ref)
+				log.Printf("[STREAM:MGR] Late-opened output device %s acquired after timeout; promoting via RebindDirectional", ref)
+				resolver.RebindDirectional(ref, audio.DirectionOutput, r.stream)
 				_ = r.stream.Close()
 			}
 		}()
-		return audio.NewGhostAudioStream(sampleRate, channels)
+		return cushion
 	}
 }
 

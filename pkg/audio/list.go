@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	hwIndexRegex     = regexp.MustCompile(`\(?(?:hw|plughw):(\d+)(?:,(\d+))?\)`)
+	hwIndexRegex     = regexp.MustCompile(`\(?(?:hw|plughw):(\d+)(?:,(\d+))?\)?`)
 	alsaCardDevRegex = regexp.MustCompile(`CARD=([a-zA-Z0-9_\-]+)(?:.*DEV=(\d+))?`)
 )
 
@@ -189,8 +189,23 @@ func ListDevices() ([]Device, error) {
 			}
 
 			score := devicePriorityScore(d.Name, d.MaxInputChannels, d.MaxOutputChannels)
-			if existing, ok := seen[canonicalURN]; !ok || score > existing.score {
+			if existing, ok := seen[canonicalURN]; !ok {
 				seen[canonicalURN] = candidate{dev: devItem, score: score}
+			} else {
+				mergedDev := existing.dev
+				if devItem.MaxInput > mergedDev.MaxInput {
+					mergedDev.MaxInput = devItem.MaxInput
+				}
+				if devItem.MaxOutput > mergedDev.MaxOutput {
+					mergedDev.MaxOutput = devItem.MaxOutput
+				}
+				if score > existing.score {
+					mergedDev.RuntimeID = devItem.RuntimeID
+					mergedDev.Name = devItem.Name
+					seen[canonicalURN] = candidate{dev: mergedDev, score: score}
+				} else {
+					seen[canonicalURN] = candidate{dev: mergedDev, score: existing.score}
+				}
 			}
 		}
 
