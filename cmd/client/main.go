@@ -371,6 +371,93 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	return m.startLocked(route)
 }
 
+func isRouteConfigIdentical(oldRoute, newRoute router.StreamRoute, isRemoteSource, isLocalDest bool, disc *discovery.Discovery, defaultPort string) bool {
+	if oldRoute.ID != newRoute.ID {
+		return false
+	}
+	if oldRoute.SourceNodeID != newRoute.SourceNodeID {
+		return false
+	}
+	if oldRoute.PeerID != newRoute.PeerID {
+		return false
+	}
+
+	// Compare source device
+	if newRoute.SourceDeviceURN != "" || oldRoute.SourceDeviceURN != "" {
+		if newRoute.SourceDeviceURN != oldRoute.SourceDeviceURN {
+			return false
+		}
+	} else if newRoute.SourceDevice != oldRoute.SourceDevice {
+		return false
+	}
+
+	// Compare destination device
+	if newRoute.DestDeviceURN != "" || oldRoute.DestDeviceURN != "" {
+		if newRoute.DestDeviceURN != oldRoute.DestDeviceURN {
+			return false
+		}
+	} else if newRoute.DestDevice != oldRoute.DestDevice {
+		return false
+	}
+
+	// Compare audio formatting
+	if newRoute.Channels > 0 && oldRoute.Channels > 0 && newRoute.Channels != oldRoute.Channels {
+		return false
+	}
+	if newRoute.OutChannels > 0 && oldRoute.OutChannels > 0 && newRoute.OutChannels != oldRoute.OutChannels {
+		return false
+	}
+	if newRoute.SampleRate > 0 && oldRoute.SampleRate > 0 && newRoute.SampleRate != oldRoute.SampleRate {
+		return false
+	}
+
+	// If this is an ingress route, destination is local playback on this node.
+	if isRemoteSource && isLocalDest {
+		return true
+	}
+
+	// Egress / remote route: check peer address resolution
+	if newRoute.PeerID != "" && newRoute.PeerID != "local" {
+		if disc != nil {
+			resolved, err := streamer.ResolvePeerDestination(newRoute, disc, defaultPort)
+			if err == nil && resolved != "" {
+				if oldRoute.PeerAddr == resolved {
+					return true
+				}
+				for _, d := range oldRoute.Destinations {
+					if d == resolved {
+						return true
+					}
+				}
+				return false
+			}
+		}
+		if len(newRoute.Destinations) == 0 {
+			return true
+		}
+	}
+
+	// Compare explicit destinations if provided
+	if len(newRoute.Destinations) > 0 {
+		if len(newRoute.Destinations) != len(oldRoute.Destinations) {
+			return false
+		}
+		for i := range newRoute.Destinations {
+			if newRoute.Destinations[i] != oldRoute.Destinations[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Purely local loop routes where newRoute.Destinations is empty
+	if isLocalDest && !isRemoteSource {
+		return true
+	}
+
+	return len(oldRoute.Destinations) == 0
+}
+
 func (m *streamManager) startLocked(route router.StreamRoute) error {
 	if m.closed {
 		return errors.New("stream manager closed")
@@ -385,12 +472,6 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 	log.Printf("[STREAM:MGR] StartRoute called: routeID=%s srcNode=%q srcURN=%q dstNode=%q dstURN=%q peerID=%q dests=%v sr=%d ch=%d",
 		sr.ID, sr.SourceNodeID, sr.SourceDeviceURN, sr.PeerID, sr.DestDeviceURN, sr.PeerID, sr.Destinations, sr.SampleRate, sr.Channels)
 
-	if old, ok := m.routes[sr.ID]; ok {
-		log.Printf("[STREAM:MGR] Stopping pre-existing stream for route=%s", sr.ID)
-		delete(m.routes, sr.ID)
-		m.stopActiveStream(old)
-	}
-
 	localNodeID := ""
 	if m.disc != nil {
 		localNodeID = m.disc.NodeID()
@@ -398,6 +479,16 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 
 	isRemoteSource := sr.SourceNodeID != "" && sr.SourceNodeID != "local" && (localNodeID == "" || sr.SourceNodeID != localNodeID)
 	isLocalDest := sr.PeerID == "" || sr.PeerID == "local" || (localNodeID != "" && sr.PeerID == localNodeID)
+
+	if old, ok := m.routes[sr.ID]; ok {
+		if old.st != nil && isRouteConfigIdentical(old.route, sr, isRemoteSource, isLocalDest, m.disc, m.cfg.StreamPort) {
+			log.Printf("[STREAM:MGR] Preserving active stream for unchanged route=%s", sr.ID)
+			return nil
+		}
+		log.Printf("[STREAM:MGR] Stopping pre-existing stream for route=%s", sr.ID)
+		delete(m.routes, sr.ID)
+		m.stopActiveStream(old)
+	}
 
 	tokenHash := sha256.Sum256([]byte(m.cfg.AuthToken))
 	authFp := fmt.Sprintf("%x", tokenHash[:4])

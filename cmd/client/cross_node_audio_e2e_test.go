@@ -1032,3 +1032,236 @@ func TestClusterCrossNodeAudioRouting_RoomSynthesis_E2E(t *testing.T) {
 	t.Logf("SUCCESS: Room synthesized cross-node audio delivered to Node B (bytes=%d, peakAmp=%d / 32767)",
 		len(captured), maxAmp)
 }
+
+func TestClusterCrossNodeAudioRouting_MultiInput_RemoteAndLocal_E2E(t *testing.T) {
+	nodeA := spawnClusterNode(t, "node-multi-A")
+	defer nodeA.close()
+
+	nodeB := spawnClusterNode(t, "node-multi-B", nodeA.disc.OwnAddr())
+	defer nodeB.close()
+
+	// Wait for convergence
+	deadline := time.Now().Add(5 * time.Second)
+	converged := false
+	for time.Now().Before(deadline) {
+		snapA := nodeA.apiServer.ClusterManager().GetSnapshot()
+		snapB := nodeB.apiServer.ClusterManager().GetSnapshot()
+		if snapA != nil && snapB != nil && snapA.ActiveNodes >= 2 && snapB.ActiveNodes >= 2 {
+			converged = true
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !converged {
+		t.Fatalf("cluster failed to converge within 5s")
+	}
+
+	// 1. Provision Input on Node A and Output on Node B
+	micReqA := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-multi-micA",
+		Direction:        "input",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err := nodeA.post("/api/v1/devices/virtual", micReqA)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node A failed: %v", err)
+	}
+	var devMicA v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devMicA)
+	_ = resp.Body.Close()
+
+	spkReqB := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-multi-spkB",
+		Direction:        "output",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err = nodeB.post("/api/v1/devices/virtual", spkReqB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node B failed: %v", err)
+	}
+	var devSpkB v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devSpkB)
+	_ = resp.Body.Close()
+
+	// Provision Input B on Node B
+	micReqB := v1.CreateVirtualDeviceRequest{
+		Name:             "vdev-multi-micB",
+		Direction:        "input",
+		Channels:         2,
+		SampleRate:       48000,
+		BufferSizeFrames: 480,
+	}
+	resp, err = nodeB.post("/api/v1/devices/virtual", micReqB)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/devices/virtual Node B failed: %v", err)
+	}
+	var devMicB v1.AudioDevice
+	_ = json.NewDecoder(resp.Body).Decode(&devMicB)
+	_ = resp.Body.Close()
+
+	nodeA.apiServer.ClusterManager().ScrapeCluster(context.Background())
+	nodeB.apiServer.ClusterManager().ScrapeCluster(context.Background())
+
+	// 2. Create Room on Node A
+	roomReq := map[string]string{
+		"id":   "room-multi-input",
+		"name": "Multi Input Room",
+	}
+	resp, err = nodeA.post("/api/v1/rooms", roomReq)
+	if err != nil || resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST /api/v1/rooms failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// 3. Bind Input A (on Node A) and Output B (on Node B)
+	bindInReqA := v1.RoomDeviceBindingRequest{
+		DeviceID: devMicA.URN,
+		NodeID:   "node-multi-A",
+	}
+	resp, err = nodeA.post("/api/v1/rooms/room-multi-input/inputs", bindInReqA)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/rooms/.../inputs A failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	bindOutReqB := v1.RoomDeviceBindingRequest{
+		DeviceID: devSpkB.URN,
+		NodeID:   "node-multi-B",
+	}
+	resp, err = nodeA.post("/api/v1/rooms/room-multi-input/outputs", bindOutReqB)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/rooms/.../outputs B failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// 4. Verify initial playback from Node A
+	micStreamA, _ := nodeA.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devMicA.URN)
+	spkStreamB, _ := nodeB.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devSpkB.URN)
+	micStreamB, _ := nodeB.apiServer.V1().DeviceRegistry().GetVirtualDeviceStream(devMicB.URN)
+	_ = micStreamB
+
+	frames := 480
+	var phaseA float64
+	stepA := 2.0 * math.Pi * 440.0 / 48000.0
+	genSineA := func() []byte {
+		buf := make([]byte, frames*2*2)
+		for i := 0; i < frames; i++ {
+			val := int16(0.707 * 32767.0 * math.Sin(phaseA))
+			phaseA += stepA
+			if phaseA > 2.0*math.Pi {
+				phaseA -= 2.0 * math.Pi
+			}
+			binary.LittleEndian.PutUint16(buf[i*4:], uint16(val))
+			binary.LittleEndian.PutUint16(buf[i*4+2:], uint16(val))
+		}
+		return buf
+	}
+
+	var phaseB float64
+	stepB := 2.0 * math.Pi * 880.0 / 48000.0
+	genSineB := func() []byte {
+		buf := make([]byte, frames*2*2)
+		for i := 0; i < frames; i++ {
+			val := int16(0.707 * 32767.0 * math.Sin(phaseB))
+			phaseB += stepB
+			if phaseB > 2.0*math.Pi {
+				phaseB -= 2.0 * math.Pi
+			}
+			binary.LittleEndian.PutUint16(buf[i*4:], uint16(val))
+			binary.LittleEndian.PutUint16(buf[i*4+2:], uint16(val))
+		}
+		return buf
+	}
+
+	// 4. Start continuous remote audio stream from Node A (440 Hz)
+	stopA := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopA:
+				return
+			default:
+				_, _ = micStreamA.InjectPush(genSineA())
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+	defer close(stopA)
+
+	// Verify initial playback from Node A
+	time.Sleep(300 * time.Millisecond)
+	if len(spkStreamB.CapturedBytes()) == 0 {
+		t.Fatalf("expected audio from mic A on spk B initially")
+	}
+
+	// 5. Now connect Input B (local input from node B) to the room while Node A stream is active!
+	t.Log("Connecting input B (local input on node B) to room while Node A stream is active...")
+	bindInReqB := v1.RoomDeviceBindingRequest{
+		DeviceID: devMicB.URN,
+		NodeID:   "node-multi-B",
+	}
+	resp, err = nodeB.post("/api/v1/rooms/room-multi-input/inputs", bindInReqB)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/v1/rooms/.../inputs B failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	time.Sleep(300 * time.Millisecond)
+
+	// Start continuous local audio stream from Node B (880 Hz)
+	stopB := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stopB:
+				return
+			default:
+				_, _ = micStreamB.InjectPush(genSineB())
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+	}()
+	defer close(stopB)
+
+	time.Sleep(200 * time.Millisecond)
+
+	initialLen := len(spkStreamB.CapturedBytes())
+	time.Sleep(400 * time.Millisecond)
+
+	afterBoth := spkStreamB.CapturedBytes()
+	capturedChunk := afterBoth[initialLen:]
+	t.Logf("Captured chunk length: %d bytes", len(capturedChunk))
+
+	// Analyze across chunks of 100ms
+	totalFrames := len(capturedChunk) / 4
+	t.Logf("Total frames in capturedChunk: %d", totalFrames)
+	chunkFrames := 4800 // 100ms
+	foundConcurrentMix := false
+	for c := 0; c+chunkFrames <= totalFrames; c += chunkFrames {
+		var re440, im440, re880, im880 float64
+		for i := 0; i < chunkFrames; i++ {
+			sampleVal := float64(int16(binary.LittleEndian.Uint16(capturedChunk[(c+i)*4 : (c+i)*4+2])))
+			theta440 := 2.0 * math.Pi * 440.0 * float64(i) / 48000.0
+			re440 += sampleVal * math.Cos(theta440)
+			im440 += sampleVal * math.Sin(theta440)
+
+			theta880 := 2.0 * math.Pi * 880.0 * float64(i) / 48000.0
+			re880 += sampleVal * math.Cos(theta880)
+			im880 += sampleVal * math.Sin(theta880)
+		}
+		m440 := math.Hypot(re440, im440) / float64(chunkFrames)
+		m880 := math.Hypot(re880, im880) / float64(chunkFrames)
+		t.Logf("Chunk at %d ms: mag440=%.2f, mag880=%.2f", (c/48), m440, m880)
+		if m440 > 500.0 && m880 > 500.0 {
+			foundConcurrentMix = true
+		}
+	}
+
+	if !foundConcurrentMix {
+		t.Fatalf("expected concurrent non-silent m440 and m880 magnitudes in mixed playout, but none found")
+	}
+}

@@ -1052,6 +1052,9 @@ func (r *Room) recompileRoutesLocked() {
 		if err := r.router.AddMatrix(mr); err != nil {
 			log.Printf("[ROOM:ROUTE] ERROR adding matrix route %s: %v", routeID, err)
 		}
+		if _, alreadyCompiled := r.compiledRoutes[routeID]; alreadyCompiled {
+			continue
+		}
 		r.compiledRoutes[routeID] = struct{}{}
 		if r.streamMgr != nil {
 			sr := router.MatrixRouteToStreamRoute(mr)
@@ -1059,6 +1062,7 @@ func (r *Room) recompileRoutesLocked() {
 				sr.ID, sr.SourceDeviceURN, sr.DestDeviceURN, sr.Destinations)
 			if err := r.streamMgr.StartRoute(sr); err != nil {
 				log.Printf("[ROOM:ROUTE] CRITICAL: failed to start stream route %s: %v", routeID, err)
+				delete(r.compiledRoutes, routeID)
 			} else {
 				log.Printf("[ROOM:ROUTE] SUCCESS: stream route %s started", routeID)
 			}

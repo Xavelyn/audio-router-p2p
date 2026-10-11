@@ -1434,6 +1434,9 @@ func (c *deviceStreamController) newOutputHandleLocked() *RefStreamHandle {
 	id := c.nextOutID
 	sub := newOutputSubscriber(c.frameSize)
 	c.outSubs[id] = sub
+	if len(c.outSubs) > 1 && c.mixerCond != nil {
+		c.mixerCond.Broadcast()
+	}
 
 	return &RefStreamHandle{
 		controller: c,
@@ -1738,7 +1741,8 @@ func (c *deviceStreamController) writeOutput(h *RefStreamHandle, p []byte) (int,
 }
 
 // playbackMixerWorker sums frames from multiple active output handles,
-// applying soft-knee saturation to prevent digital wrap-around clipping.
+// pacing physical playback to clock intervals and applying soft-knee saturation
+// to prevent digital wrap-around clipping.
 func (c *deviceStreamController) playbackMixerWorker() {
 	frameSize := c.frameSize
 	if frameSize <= 0 {
@@ -1748,11 +1752,24 @@ func (c *deviceStreamController) playbackMixerWorker() {
 	if chans <= 0 {
 		chans = 2
 	}
+	sr := c.sampleRate
+	if sr <= 0 {
+		sr = 48000
+	}
 
-	const maxMixBytes = 4096
-	tempBuf := make([]byte, maxMixBytes)
-	outBuf := make([]byte, maxMixBytes)
-	accum := make([]float64, maxMixBytes/2)
+	period := 10 * time.Millisecond
+	blockFrames := sr * 10 / 1000
+	if blockFrames <= 0 {
+		blockFrames = 480
+	}
+	blockBytes := blockFrames * frameSize
+
+	tempBuf := make([]byte, blockBytes)
+	outBuf := make([]byte, blockBytes)
+	accum := make([]float64, blockFrames*chans)
+
+	ticker := time.NewTicker(period)
+	defer ticker.Stop()
 
 	for {
 		c.mu.Lock()
@@ -1773,45 +1790,36 @@ func (c *deviceStreamController) playbackMixerWorker() {
 		}
 
 		hasData := false
-		maxAvail := 0
 		for _, sub := range c.outSubs {
 			sub.mu.Lock()
 			if sub.buf.n > 0 {
 				hasData = true
-				if sub.buf.n > maxAvail {
-					maxAvail = sub.buf.n
-				}
 			}
 			sub.mu.Unlock()
 		}
 
-		if !hasData || maxAvail == 0 {
+		if !hasData {
 			c.mixerCond.Wait()
 			if c.closed {
 				c.mu.Unlock()
 				return
 			}
+			// Drain any pending ticks from idle sleep and reset cadence
+			for len(ticker.C) > 0 {
+				<-ticker.C
+			}
+			ticker.Reset(period)
 			c.mu.Unlock()
 			continue
 		}
 
-		mixLen := maxAvail
-		if mixLen > maxMixBytes {
-			mixLen = maxMixBytes
-		}
-		mixLen -= mixLen % frameSize
-		if mixLen == 0 {
-			c.mu.Unlock()
-			continue
-		}
-
-		numFrames := mixLen / frameSize
+		numFrames := blockFrames
 		numSamples := numFrames * chans
 		clear(accum[:numSamples])
 
 		for _, sub := range c.outSubs {
 			sub.mu.Lock()
-			n := sub.buf.read(tempBuf[:mixLen])
+			n := sub.buf.read(tempBuf[:blockBytes])
 			sub.mu.Unlock()
 
 			framesRead := n / frameSize
@@ -1846,8 +1854,14 @@ func (c *deviceStreamController) playbackMixerWorker() {
 
 		if phys != nil {
 			c.writeMu.Lock()
-			_, _ = phys.Write(outBuf[:mixLen])
+			_, _ = phys.Write(outBuf[:blockBytes])
 			c.writeMu.Unlock()
+		}
+
+		select {
+		case <-c.closeCh:
+			return
+		case <-ticker.C:
 		}
 	}
 }
