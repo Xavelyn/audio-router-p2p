@@ -7,11 +7,11 @@ import (
 
 // Default ClockDriftController tuning parameters per ADR 0004.
 const (
-	DefaultDriftAlpha    = 0.002   // EWMA filter smoothing factor (tau ~ 10s at 50 pps)
-	DefaultDriftKp       = 1.0e-5  // Proportional controller gain
-	DefaultDriftKi       = 1.0e-7  // Integral controller gain
-	DefaultMaxDriftPPM   = 500.0   // +/- 500 ppm (+/- 0.05%) acoustic safety clamp
-	DefaultDriftClamp    = DefaultMaxDriftPPM * 1.0e-6 // +/- 0.0005
+	DefaultDriftAlpha  = 0.002                       // EWMA filter smoothing factor (tau ~ 10s at 50 pps)
+	DefaultDriftKp     = 1.0e-5                      // Proportional controller gain
+	DefaultDriftKi     = 1.0e-7                      // Integral controller gain
+	DefaultMaxDriftPPM = 500.0                       // +/- 500 ppm (+/- 0.05%) acoustic safety clamp
+	DefaultDriftClamp  = DefaultMaxDriftPPM * 1.0e-6 // +/- 0.0005
 )
 
 // ClockDriftConfig holds configuration parameters for clock drift compensation.
@@ -182,8 +182,8 @@ func (c *ClockDriftController) SetTarget(target float64) {
 func (c *ClockDriftController) Reset() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.initialized = false
-	c.smoothedWatermark = 0
+	c.initialized = true
+	c.smoothedWatermark = c.cfg.TargetWatermark
 	c.integral = 0
 	c.deltaR = 0
 	c.ratio = 1.0

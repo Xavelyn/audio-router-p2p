@@ -22,9 +22,10 @@ type JitterBufferInterface interface {
 }
 
 var (
-	ErrBufferEmpty = errors.New("jitter buffer empty")
-	ErrBufferFull  = errors.New("jitter buffer full")
-	ErrClosed      = errors.New("jitter buffer closed")
+	ErrBufferEmpty      = errors.New("jitter buffer empty")
+	ErrBufferFull       = errors.New("jitter buffer full")
+	ErrClosed           = errors.New("jitter buffer closed")
+	ErrInvalidFrameSize = errors.New("invalid frame size")
 )
 
 // JitterBuffer implements an adaptive jitter buffer for audio playout.
@@ -39,11 +40,13 @@ type JitterBuffer struct {
 	channels   int
 
 	// Playout state
-	playoutTime    time.Time
-	originTime     time.Time
-	originSeq      uint32 // sequence number of the anchor (first) packet
-	nextSeq        uint32 // sequence number expected at the head of playout
-	seqInitialized bool
+	playoutTime          time.Time
+	originTime           time.Time
+	originSeq            uint32 // sequence number of the anchor (first) packet
+	nextSeq              uint32 // sequence number expected at the head of playout
+	seqInitialized       bool
+	lastRecvTime         time.Time
+	consecutiveUnderruns int
 
 	// DTX mode
 	dtxMode bool
@@ -124,6 +127,34 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 	return jb.PushWithFlags(seq, timestamp, data, transport.FlagActive)
 }
 
+// reanchor resets the playout timeline, ring buffer valid flags, and DSP states
+// to realign playout with an incoming frame. Must be called with jb.mu held.
+func (jb *JitterBuffer) reanchor(seq uint32, ts time.Time, now time.Time, isSID bool) {
+	jb.originSeq = seq
+	jb.nextSeq = seq
+	jb.originTime = ts
+	if isSID {
+		jb.playoutTime = now
+	} else {
+		jb.playoutTime = now.Add(jb.targetDelay)
+	}
+	jb.seqInitialized = true
+	jb.dtxMode = isSID
+	jb.consecutiveUnderruns = 0
+
+	for i := range jb.frames {
+		jb.frames[i].valid = false
+	}
+	jb.atomicBuffered.Store(0)
+
+	if jb.plc != nil {
+		jb.plc.Reset()
+	}
+	if jb.driftCtrl != nil {
+		jb.driftCtrl.Reset()
+	}
+}
+
 // PushWithFlags adds a frame to the jitter buffer with wire control flags.
 // When a packet carries FlagSID, it updates the playout sequence anchor and
 // marks the buffer as operating in DTX silence suppression mode.
@@ -134,46 +165,41 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	if jb.closed {
 		return 0, ErrClosed
 	}
-	if len(data) != jb.frameSize {
-		return 0, errors.New("invalid frame size")
+
+	isSID := (flags & transport.FlagSID) != 0
+
+	// Allow 0-byte payload for isSID. If isSID, len(data) == 0 or len(data) == jb.frameSize is valid.
+	// For normal frames, len(data) == jb.frameSize.
+	if isSID {
+		if len(data) != 0 && len(data) != jb.frameSize {
+			return 0, ErrInvalidFrameSize
+		}
+	} else if len(data) != jb.frameSize {
+		return 0, ErrInvalidFrameSize
 	}
 
 	now := time.Now()
 	ts := time.Unix(0, timestamp)
 
-	isSID := (flags & transport.FlagSID) != 0
+	buffered := int(jb.atomicBuffered.Load())
+	distFromNext := int32(seq - jb.nextSeq)
+	cap32 := int32(jb.capacity)
 
-	// Handle DTX mode transitions and sequence anchoring
-	if isSID {
-		jb.dtxMode = true
-		jb.originSeq = seq
-		jb.nextSeq = seq
-		jb.originTime = ts
-		jb.playoutTime = now.Add(jb.targetDelay)
-		jb.seqInitialized = true
-	} else if (flags & transport.FlagActive) != 0 {
-		if jb.dtxMode {
-			// Transition out of DTX silence mode back to active speech
-			jb.dtxMode = false
-			jb.originSeq = seq
-			jb.nextSeq = seq
-			jb.originTime = ts
-			jb.playoutTime = now.Add(jb.targetDelay)
-			jb.seqInitialized = true
-		}
+	dtxExit := jb.dtxMode && (flags&transport.FlagActive) != 0
+	seqDiscontinuity := distFromNext >= cap32 || (distFromNext <= -cap32 && buffered == 0)
+	timeGapExceeded := !jb.lastRecvTime.IsZero() && now.Sub(jb.lastRecvTime) >= 100*time.Millisecond
+	starvationRecovery := buffered == 0 && (jb.consecutiveUnderruns >= 2 || timeGapExceeded || distFromNext <= -5)
+
+	triggerReanchor := !jb.seqInitialized || isSID || dtxExit || seqDiscontinuity || starvationRecovery
+
+	if triggerReanchor {
+		jb.reanchor(seq, ts, now, isSID)
+		distFromNext = 0
 	}
 
-	// Initialize origin on first packet
-	if !jb.seqInitialized {
-		jb.originSeq = seq
-		jb.nextSeq = seq
-		jb.originTime = ts
-		jb.playoutTime = now.Add(jb.targetDelay)
-		jb.seqInitialized = true
-	}
+	jb.lastRecvTime = now
 
 	// Signed RFC 1982 serial number distance from next expected sequence
-	distFromNext := int32(seq - jb.nextSeq)
 	if distFromNext < 0 {
 		jb.latePackets++
 		return 0, nil
@@ -206,7 +232,11 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	}
 	f.seq = seq
 	f.timestamp = ts
-	copy(f.data, data)
+	if isSID || len(data) == 0 {
+		clear(f.data)
+	} else {
+		copy(f.data, data)
+	}
 	f.received = now
 	f.valid = true
 
@@ -217,13 +247,7 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 
 	// Update clock drift controller with current buffer depth
 	if jb.driftCtrl != nil && !isSID {
-		buffered := 0
-		for i := range jb.frames {
-			if jb.frames[i].valid {
-				buffered++
-			}
-		}
-		jb.driftCtrl.Update(float64(buffered))
+		jb.driftCtrl.Update(float64(jb.atomicBuffered.Load()))
 	}
 
 	return dropped, nil
@@ -251,6 +275,7 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 			frame.valid = false
 			jb.atomicBuffered.Add(-1)
 			jb.nextSeq++
+			jb.consecutiveUnderruns = 0
 			data := frame.data
 			if jb.plc != nil {
 				if jb.plc.ConsecutiveConcealed() > 0 {
@@ -266,7 +291,8 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 		// Check if it's time to play out silence or run PLC (underrun or DTX comfort noise)
 		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
 		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
-		if time.Now().After(expectedPlayout) {
+		if time.Now().After(expectedPlayout) || jb.dtxMode {
+			jb.consecutiveUnderruns++
 			if !jb.dtxMode {
 				jb.underruns++
 				jb.atomicUnderruns.Add(1)
@@ -310,7 +336,8 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 	if !frame.valid || frame.seq != jb.nextSeq {
 		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
 		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
-		if time.Now().After(expectedPlayout) {
+		if time.Now().After(expectedPlayout) || jb.dtxMode {
+			jb.consecutiveUnderruns++
 			if !jb.dtxMode {
 				jb.underruns++
 				jb.atomicUnderruns.Add(1)
@@ -332,6 +359,7 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 	frame.valid = false
 	jb.atomicBuffered.Add(-1)
 	jb.nextSeq++
+	jb.consecutiveUnderruns = 0
 	data := frame.data
 	if jb.plc != nil {
 		if jb.plc.ConsecutiveConcealed() > 0 {
@@ -477,8 +505,14 @@ func (jb *JitterBuffer) Reset() {
 	jb.playoutTime = time.Time{}
 	jb.originTime = time.Time{}
 	jb.atomicBuffered.Store(0)
+	jb.lastRecvTime = time.Time{}
+	jb.consecutiveUnderruns = 0
+	jb.dtxMode = false
 	if jb.driftCtrl != nil {
 		jb.driftCtrl.Reset()
+	}
+	if jb.plc != nil {
+		jb.plc.Reset()
 	}
 }
 

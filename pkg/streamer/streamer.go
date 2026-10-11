@@ -849,6 +849,18 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	// Separate control plane SID frames from audio media data frames per ADR 0033.
+	if (hdr.Flags & transport.FlagSID) != 0 {
+		if peer.JitterBuf != nil {
+			if dropped, err := peer.JitterBuf.PushWithFlags(hdr.Seq, int64(hdr.Timestamp), nil, hdr.Flags); err != nil {
+				log.Printf("streamer: jitter buffer push sid error: %v", err)
+			} else if dropped > 0 {
+				log.Printf("streamer: jitter buffer overrun for %s (sid)", peerAddr)
+			}
+		}
+		return
+	}
+
 	// For media packets, check if arriving packet solves a missing group
 	if peer.FECDecoder != nil {
 		reconstructed := peer.FECDecoder.ProcessMedia(hdr.Seq, payload)
@@ -867,10 +879,6 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 				}
 			}
 		}
-	}
-
-	if len(payload) == 0 && (hdr.Flags&transport.FlagSID) != 0 {
-		payload = make([]byte, s.packetBytes())
 	}
 
 	if peer.IngressAdapter != nil {
