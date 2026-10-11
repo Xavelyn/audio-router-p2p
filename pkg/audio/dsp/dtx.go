@@ -33,7 +33,7 @@ func (s DTXState) String() string {
 type DTXConfig struct {
 	Enabled          bool          `json:"enabled"`
 	SilenceThreshold float64       `json:"silence_threshold"` // in dBFS, e.g. -50.0
-	HangoverDuration time.Duration `json:"hangover_duration"`  // e.g. 400ms
+	HangoverDuration time.Duration `json:"hangover_duration"`  // default: 5s / 5000ms
 	SIDInterval      time.Duration `json:"sid_interval"`       // e.g. 500ms
 	FrameDuration    time.Duration `json:"frame_duration"`     // e.g. 20ms
 }
@@ -43,7 +43,7 @@ func DefaultDTXConfig() DTXConfig {
 	return DTXConfig{
 		Enabled:          true,
 		SilenceThreshold: -50.0,
-		HangoverDuration: 400 * time.Millisecond,
+		HangoverDuration: 5 * time.Second,
 		SIDInterval:      500 * time.Millisecond,
 		FrameDuration:    20 * time.Millisecond,
 	}
@@ -71,7 +71,7 @@ func NewDTXController(cfg DTXConfig) *DTXController {
 		cfg.FrameDuration = 20 * time.Millisecond
 	}
 	if cfg.HangoverDuration <= 0 {
-		cfg.HangoverDuration = 400 * time.Millisecond
+		cfg.HangoverDuration = 5 * time.Second
 	}
 	if cfg.SIDInterval <= 0 {
 		cfg.SIDInterval = 500 * time.Millisecond

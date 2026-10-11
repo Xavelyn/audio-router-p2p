@@ -536,8 +536,12 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		}
 
 		var flags uint8 = transport.FlagActive
+		var payloadToSend []byte
 		if isSID {
 			flags = transport.FlagSID
+			payloadToSend = nil
+		} else {
+			payloadToSend = packetBuf[:packetBytes]
 		}
 
 		s.mu.Lock()
@@ -553,7 +557,7 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			Flags:      flags,
 			StreamID:   sid,
 		}
-		pkt := transport.Marshal(hdr, packetBuf[:packetBytes])
+		pkt := transport.Marshal(hdr, payloadToSend)
 
 		s.peersMu.RLock()
 		for _, peer := range s.peers {
