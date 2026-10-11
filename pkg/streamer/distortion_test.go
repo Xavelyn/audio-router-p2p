@@ -131,6 +131,12 @@ func TestCheckUDPLoopback(t *testing.T) {
 
 	testPackets := generatePacedSineWave(rate, channels, numPackets, packetTime, 440.0)
 	go func() {
+		// Pre-buffer initial packets to simulate hardware ADC DMA cushion
+		if len(testPackets) > 2 {
+			inDev.InjectPush(testPackets[0])
+			inDev.InjectPush(testPackets[1])
+			testPackets = testPackets[2:]
+		}
 		for _, pkt := range testPackets {
 			inDev.InjectPush(pkt)
 			time.Sleep(20 * time.Millisecond)
