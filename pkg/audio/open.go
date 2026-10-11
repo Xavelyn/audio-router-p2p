@@ -21,9 +21,7 @@ import (
 	"github.com/gordonklaus/portaudio"
 )
 
-func isOutputUnderflowError(err error) bool {
-	return errors.Is(err, portaudio.OutputUnderflowed) || strings.Contains(strings.ToLower(err.Error()), "underflow")
-}
+const blocksPerBuffer = 256
 
 var (
 	paMu             sync.Mutex
@@ -482,10 +480,6 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool, devNam
 	if latency < 40*time.Millisecond {
 		latency = 40 * time.Millisecond
 	}
-	return openPortAudioOutputDevice(dev, sampleRate, channels, latency, devNames...)
-}
-
-func openPortAudioOutputDevice(dev *portaudio.DeviceInfo, sampleRate, channels int, latency time.Duration, devNames ...string) (AudioStream, error) {
 	log.Printf("[AUDIO:IO] Opening PortAudio output: device=%q channels=%d sampleRate=%d latency=%v", dev.Name, channels, sampleRate, latency)
 
 	var activeRate int
@@ -527,8 +521,10 @@ func openPortAudioOutputDevice(dev *portaudio.DeviceInfo, sampleRate, channels i
 			if oErr != nil {
 				return nil, oErr
 			}
-			// Do NOT call ps.Start() eagerly during probe/open.
-			// Hardware stream is kept unprimed until PrimedBufferedSink receives audio.
+			if sErr := ps.Start(); sErr != nil {
+				_ = ps.Close()
+				return nil, sErr
+			}
 			return ps, nil
 		})
 		if err == nil {
@@ -546,8 +542,13 @@ func openPortAudioOutputDevice(dev *portaudio.DeviceInfo, sampleRate, channels i
 		return nil, lastErr
 	}
 
-	log.Printf("[AUDIO:IO] PortAudio output online (unprimed): device=%q channels=%d sampleRate=%d (actual=%d)", dev.Name, channels, sampleRate, actualRate)
-	baseStream := NewPrimedBufferedSink(st, buf, actualRate, channels, WithOnClose(termPortAudio))
+	log.Printf("[AUDIO:IO] PortAudio output online: device=%q channels=%d sampleRate=%d (actual=%d)", dev.Name, channels, sampleRate, actualRate)
+	var baseStream AudioStream = &portaudioOutput{
+		stream:     st,
+		buf:        buf,
+		frameSize:  channels * 2,
+		blockBytes: len(buf) * 2,
+	}
 
 	if actualRate != sampleRate {
 		log.Printf("[AUDIO:IO] Wrapping output %q with ASRC resampler (%d -> %d Hz)", dev.Name, sampleRate, actualRate)
@@ -617,18 +618,12 @@ func (o *portaudioOutput) Close() error {
 }
 
 func isPortAudioStreamDirection(s AudioStream) (isInput, isOutput bool) {
-	if rs, ok := s.(interface{ Underlying() AudioStream }); ok {
-		if inner := rs.Underlying(); inner != nil {
-			s = inner
-		}
-	}
 	switch s.(type) {
 	case *portaudioInput:
 		return true, false
-	case *portaudioOutput, *PrimedBufferedSink:
+	case *portaudioOutput:
 		return false, true
 	}
 	return false, false
 }
-
 

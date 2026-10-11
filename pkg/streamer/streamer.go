@@ -198,10 +198,6 @@ type Streamer struct {
 	lastUnmarshalDropLogNano atomic.Int64
 	lastStreamIDDropLogNano  atomic.Int64
 	lastNilOutputDropLogNano atomic.Int64
-
-	// ADR 0032 Cadence Invariant Silence Buffer
-	silenceBuffer []byte
-	frameBytes    int
 }
 
 // AtomicShouldLogRateLimited forwards to transport.ShouldLogRateLimited for backward compatibility.
@@ -281,25 +277,23 @@ func NewStreamer(trans Transport, localIPs []string, config StreamConfig, localN
 	if _, err := rand.Read(sid[:]); err != nil {
 		return nil, err
 	}
-	pb := (config.SampleRate * config.PacketTime / 1000) * config.Channels * 2
-	if pb <= 0 {
-		pb = config.Channels * 2 * 256
-	}
 	s := &Streamer{
-		transport:     trans,
-		config:        config,
-		streamID:      sid,
-		localNodeID:   localNodeID,
-		peers:         make(map[string]*RemotePeer),
-		dtx:           dsp.NewDTXController(config.DTX),
-		silenceBuffer: make([]byte, pb),
-		frameBytes:    pb,
+		transport:   trans,
+		config:      config,
+		streamID:    sid,
+		localNodeID: localNodeID,
+		peers:       make(map[string]*RemotePeer),
+		dtx:         dsp.NewDTXController(config.DTX),
 	}
 
 	if config.FEC.Enabled {
 		groupSize := config.FEC.GroupSize
 		if groupSize <= 0 {
 			groupSize = 4
+		}
+		pb := (config.SampleRate * config.PacketTime / 1000) * config.Channels * 2
+		if pb <= 0 {
+			pb = config.Channels * 2 * 256
 		}
 		enc, err := transport.NewFECEncoder(groupSize, pb)
 		if err != nil {
@@ -663,16 +657,9 @@ func (s *Streamer) playout() {
 				log.Printf("[AUDIO:UNDERRUN] stream=%s peer=%s consecutive_underruns=%d drift_ratio=%.6f",
 					curStreamIDHex, peer.Addr, consec, ratio)
 			}
-			// Maintain an unbroken physical frame clock cadence by feeding pre-allocated silence (ADR 0032)
-			if len(s.silenceBuffer) >= s.frameBytes && s.frameBytes > 0 {
-				data = s.silenceBuffer[:s.frameBytes]
-			} else {
-				pb := s.packetBytes()
-				data = make([]byte, pb)
-			}
-		} else {
-			peer.consecutiveUnderruns.Store(0)
+			continue // underrun, silence
 		}
+		peer.consecutiveUnderruns.Store(0)
 
 		frames := peer.playoutFrames.Add(1)
 		if frames%50 == 0 {

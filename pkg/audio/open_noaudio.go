@@ -6,15 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"strings"
 )
-
-func isOutputUnderflowError(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "underflow")
-}
 
 // OpenInput returns a synthetic sine-wave source. The real-device path is not
 // available in the noaudio build.
@@ -40,22 +32,8 @@ func OpenOutput(deviceID int, sampleRate, channels int, useEmulator bool, devNam
 }
 
 func isPortAudioStreamDirection(s AudioStream) (isInput, isOutput bool) {
-	if rs, ok := s.(interface{ Underlying() AudioStream }); ok {
-		if inner := rs.Underlying(); inner != nil {
-			s = inner
-		}
-	}
-	switch s.(type) {
-	case *PrimedBufferedSink:
-		return false, true
-	}
 	return false, false
 }
-
-func isOutputUnderflowError(err error) bool {
-	return false
-}
-
 
 func buildRateCandidates(requested, defaultRate int, activeRates ...int) []int {
 	raw := make([]int, 0, len(activeRates)+5)

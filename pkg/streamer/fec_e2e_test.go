@@ -305,7 +305,7 @@ func TestFECE2E_BurstLossPLCConcealment(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	minExpectedBytes := len(testPackets[0]) * (numPackets / 3)
 	for time.Now().Before(deadline) {
-		if devB.Buffered() >= minExpectedBytes && streamerB.Stats().FEC.UnrecoverableGroupsTotal >= 1 {
+		if devB.Buffered() >= minExpectedBytes {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)

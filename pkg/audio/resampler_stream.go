@@ -307,10 +307,3 @@ func (s *resampledAudioStream) Close() error {
 	}
 	return nil
 }
-
-// Underlying returns the wrapped AudioStream.
-func (s *resampledAudioStream) Underlying() AudioStream {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.underlying
-}
