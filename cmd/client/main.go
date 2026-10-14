@@ -128,6 +128,13 @@ func main() {
 	streams.SetHub(apiSrv.Hub())
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
 
+	// Audio artifact telemetry aggregator (ADR 0034): 1 s sampling over a
+	// 10 s window. The stream manager provides both sources (route-scoped
+	// artifact counters and per-device XRun state); both it and the resolver
+	// are fully wired at this point.
+	artifactAgg := telemetry.NewArtifactAggregator(streams, streams, time.Second, 10*time.Second)
+	apiSrv.SetArtifactAggregator(artifactAgg)
+
 	if hub := apiSrv.Hub(); hub != nil {
 		hub.Start(context.Background())
 		defer hub.Stop()
@@ -137,6 +144,9 @@ func main() {
 		agg.Start(context.Background())
 		defer agg.Stop()
 	}
+
+	artifactAgg.Start(context.Background())
+	defer artifactAgg.Stop()
 
 	if cm := apiSrv.ClusterManager(); cm != nil {
 		roomMgr.SetClusterManager(cm)
@@ -234,6 +244,8 @@ func main() {
 	if agg := apiSrv.Aggregator(); agg != nil {
 		agg.Stop()
 	}
+
+	artifactAgg.Stop()
 
 	if cm := apiSrv.ClusterManager(); cm != nil {
 		cm.Stop()
@@ -871,10 +883,99 @@ func (m *streamManager) Stats() map[string]streamer.StreamerStats {
 	res := make(map[string]streamer.StreamerStats, len(m.routes))
 	for id, as := range m.routes {
 		if as.st != nil {
-			res[id] = as.st.Stats()
+			st := as.st.Stats()
+			// ADR 0034: augment with route-level device binding and ring-drop
+			// counters so the stream-stats handler can build the devices overlay.
+			st.SourceDeviceURN = as.route.SourceDeviceURN
+			st.DestDeviceURN = as.route.DestDeviceURN
+			if m.resolver != nil {
+				if urn := as.route.SourceDeviceURN; urn != "" {
+					st.SourceGhost = m.resolver.IsQuarantined(urn)
+				}
+				if urn := as.route.DestDeviceURN; urn != "" {
+					st.DestGhost = m.resolver.IsQuarantined(urn)
+				}
+			}
+			if as.in != nil {
+				if dc, ok := as.in.(audio.DropCounter); ok {
+					st.CaptureDropBytes = dc.DroppedBytes()
+					st.CaptureDropEvents = dc.DropEvents()
+				}
+			}
+			if as.out != nil {
+				if dc, ok := as.out.(audio.DropCounter); ok {
+					st.OutputDropBytes = dc.DroppedBytes()
+					st.OutputDropEvents = dc.DropEvents()
+				}
+			}
+			res[id] = st
 		}
 	}
 	return res
+}
+
+// RouteArtifactSamples implements telemetry.RouteArtifactSource (ADR 0034):
+// one lock-free artifact sample per active route, augmented with the route
+// identity, device URNs, ghost flags, and exact ring-drop counters.
+func (m *streamManager) RouteArtifactSamples() []telemetry.RouteArtifactSample {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]telemetry.RouteArtifactSample, 0, len(m.routes))
+	for _, as := range m.routes {
+		if as.st == nil {
+			continue
+		}
+		smp := as.st.ArtifactSample()
+		smp.RouteID = as.route.ID
+		smp.SourceDeviceURN = as.route.SourceDeviceURN
+		smp.DestDeviceURN = as.route.DestDeviceURN
+		if m.resolver != nil {
+			if urn := as.route.SourceDeviceURN; urn != "" {
+				smp.SourceGhost = m.resolver.IsQuarantined(urn)
+			}
+			if urn := as.route.DestDeviceURN; urn != "" {
+				smp.DestGhost = m.resolver.IsQuarantined(urn)
+			}
+		}
+		if as.in != nil {
+			if dc, ok := as.in.(audio.DropCounter); ok {
+				smp.CaptureDropBytes = dc.DroppedBytes()
+				smp.CaptureDropEvents = dc.DropEvents()
+			}
+		}
+		if as.out != nil {
+			if dc, ok := as.out.(audio.DropCounter); ok {
+				smp.OutputDropBytes = dc.DroppedBytes()
+				smp.OutputDropEvents = dc.DropEvents()
+			}
+		}
+		out = append(out, smp)
+	}
+	return out
+}
+
+// DeviceArtifactSamples implements telemetry.DeviceArtifactSource (ADR 0034):
+// one sample per active directional device controller, carrying the
+// direction-appropriate device-lifetime hardware XRun total.
+func (m *streamManager) DeviceArtifactSamples() []telemetry.DeviceArtifactSample {
+	if m.resolver == nil {
+		return nil
+	}
+	stats := m.resolver.ActiveControllerStats()
+	out := make([]telemetry.DeviceArtifactSample, 0, len(stats))
+	for _, ds := range stats {
+		xruns := ds.HWXrunsOut
+		if ds.Direction == audio.DirectionInput {
+			xruns = ds.HWXrunsIn
+		}
+		out = append(out, telemetry.DeviceArtifactSample{
+			URN:       ds.URN,
+			Direction: ds.Direction,
+			Ghost:     ds.Ghost,
+			HWXRuns:   xruns,
+		})
+	}
+	return out
 }
 
 // StreamLinkStats returns atomic link metrics across all active streams.

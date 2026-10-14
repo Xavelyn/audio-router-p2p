@@ -1,8 +1,20 @@
-import type { StreamStats, FECStats, PLCStats, ASRCStats, SystemMetrics } from '$lib/api/types';
+import type { StreamStats, FECStats, PLCStats, ASRCStats, SystemMetrics, DeviceHealth } from '$lib/api/types';
 import { apiClient } from '$lib/api/client';
 
 class TelemetryStore {
   streamStats = $state<Record<string, StreamStats>>({});
+  /**
+   * ADR 0034: URN-keyed per-device artifact health from
+   * GET /api/v1/telemetry/device-artifacts. Empty object when the daemon's
+   * ArtifactAggregator is unwired (byte-compatible fallback).
+   */
+  deviceArtifacts = $state<Record<string, DeviceHealth>>({});
+  /**
+   * Epoch-ms of the last successful telemetry tick (either endpoint).
+   * 0 = never fetched. Surfaces render nothing when this is stale
+   * (1500 ms convention, ADR 0026/0034) — "no data" must never look clean.
+   */
+  lastUpdated = $state(0);
   systemMetrics = $state<SystemMetrics>({
     cpu_percent: 0,
     memory_used_mb: 0,
@@ -44,11 +56,19 @@ class TelemetryStore {
   private pollInterval: ReturnType<typeof setInterval> | null = null;
 
   async fetchTelemetry() {
-    try {
-      const stats = await apiClient.getStreamStats();
-      this.streamStats = stats || {};
-    } catch {
-      this.streamStats = {};
+    // ADR 0034: device-artifacts piggybacks on the existing stream-stats
+    // polling tick (no separate timer). The two fetches settle
+    // independently so one endpoint failing never blanks the other.
+    const [stats, artifacts] = await Promise.allSettled([
+      apiClient.getStreamStats(),
+      apiClient.getDeviceArtifacts(),
+    ]);
+
+    this.streamStats = stats.status === 'fulfilled' ? stats.value || {} : {};
+    this.deviceArtifacts = artifacts.status === 'fulfilled' ? artifacts.value || {} : {};
+
+    if (stats.status === 'fulfilled' || artifacts.status === 'fulfilled') {
+      this.lastUpdated = Date.now();
     }
   }
 

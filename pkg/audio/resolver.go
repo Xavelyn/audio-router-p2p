@@ -119,6 +119,32 @@ func (r *DeviceResolver) ActiveControllerCount() int {
 	return len(r.controllers)
 }
 
+// ActiveControllerStats returns a point-in-time snapshot of every active
+// directional controller's identity and device-lifetime hardware XRun
+// counters (ADR 0034). There is one entry per StreamKey (URN + direction), so
+// a full-duplex device appears once per direction. The result is sorted by
+// URN then direction for deterministic consumers.
+func (r *DeviceResolver) ActiveControllerStats() []DeviceStreamStats {
+	r.mu.RLock()
+	ctrls := make([]*deviceStreamController, 0, len(r.controllers))
+	for _, c := range r.controllers {
+		ctrls = append(ctrls, c)
+	}
+	r.mu.RUnlock()
+
+	stats := make([]DeviceStreamStats, 0, len(ctrls))
+	for _, c := range ctrls {
+		stats = append(stats, c.stats())
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].URN != stats[j].URN {
+			return stats[i].URN < stats[j].URN
+		}
+		return stats[i].Direction < stats[j].Direction
+	})
+	return stats
+}
+
 // Register registers or updates a device and registers legacy aliases.
 func (r *DeviceResolver) Register(dev Device) {
 	r.mu.Lock()
@@ -1287,7 +1313,10 @@ type inputSubscriber struct {
 	buf       *ringBuf
 	closed    bool
 	dropCount atomic.Uint64
-	lastLog   atomic.Int64
+	// dropEvents counts individual ring-buffer overrun events (one per push
+	// that dropped bytes); dropCount is the exact byte total (ADR 0034).
+	dropEvents atomic.Uint64
+	lastLog    atomic.Int64
 }
 
 func newInputSubscriber(frameSize int) *inputSubscriber {
@@ -1304,17 +1333,18 @@ func (s *inputSubscriber) push(data []byte) {
 	if s.closed {
 		return
 	}
-	avail := s.buf.cap() - s.buf.n
-	if len(data) > avail {
-		droppedBytes := len(data) - avail
-		s.dropCount.Add(uint64(droppedBytes))
+	// Exact dropped bytes come from the ring itself (ADR 0034); the previous
+	// len(data)-avail approximation is replaced.
+	dropped := s.buf.write(data)
+	if dropped > 0 {
+		s.dropCount.Add(uint64(dropped))
+		s.dropEvents.Add(1)
 		now := time.Now().UnixNano()
 		last := s.lastLog.Load()
 		if now-last > int64(time.Second) && s.lastLog.CompareAndSwap(last, now) {
-			log.Printf("[AUDIO:DEV] Capture subscriber ring buffer overrun: dropped %d bytes", droppedBytes)
+			log.Printf("[AUDIO:DEV] Capture subscriber ring buffer overrun: dropped %d bytes", dropped)
 		}
 	}
-	s.buf.write(data)
 	s.cond.Broadcast()
 }
 
@@ -1323,6 +1353,12 @@ type outputSubscriber struct {
 	mu     sync.Mutex
 	buf    *ringBuf
 	closed bool
+	// dropBytes / dropEvents are the exact, lifetime playback-ring overrun
+	// counters for this handle (ADR 0034); previously these drops were
+	// silent.
+	dropBytes  atomic.Uint64
+	dropEvents atomic.Uint64
+	lastLog    atomic.Int64
 }
 
 func newOutputSubscriber(frameSize int) *outputSubscriber {
@@ -1360,6 +1396,14 @@ type deviceStreamController struct {
 	nextOutID uint64
 	writeMu   sync.Mutex // Serializes direct fast-path writes
 	mixerCond *sync.Cond
+
+	// Device-lifetime, exact hardware XRun counters (ADR 0034). Written only
+	// by the XRun hook closures installed on the physical stream (one
+	// atomic.Add per XRun, on the audio thread) and read lock-free by
+	// telemetry samplers. Monotonic across physical stream swaps; never
+	// reset while the controller is alive.
+	hwXrunsIn  atomic.Uint64
+	hwXrunsOut atomic.Uint64
 }
 
 func newDeviceStreamController(r *DeviceResolver, key StreamKey, phys AudioStream, sampleRate, channels int, gracePeriod time.Duration) *deviceStreamController {
@@ -1382,6 +1426,11 @@ func newDeviceStreamController(r *DeviceResolver, key StreamKey, phys AudioStrea
 		outSubs:     make(map[uint64]*outputSubscriber),
 	}
 	c.mixerCond = sync.NewCond(&c.mu)
+	// Install the device-lifetime XRun hook on the first physical stream
+	// (ADR 0034). This runs inside the constructor, i.e. before the
+	// controller is published into resolver.controllers and before any
+	// capture/playback I/O goroutine can touch the stream.
+	c.installXRunHook(phys)
 	return c
 }
 
@@ -1408,10 +1457,63 @@ func (c *deviceStreamController) swapPhysicalStream(newStream AudioStream) {
 	}
 	old := c.physical
 	c.physical = newStream
+	// Re-install the XRun hook on the new physical stream (ADR 0034), before
+	// releasing the lock so no reader can observe the new stream without its
+	// hook. The old instance's hook is intentionally never cleared: an XRun
+	// arriving in the teardown window still attributes to this controller's
+	// device-lifetime counters.
+	c.installXRunHook(newStream)
 	c.mu.Unlock()
 
 	if old != nil && old != newStream {
 		_ = old.Close()
+	}
+}
+
+// addHWInputXRun records one hardware input XRun (capture overflow) on this
+// controller's device-lifetime counter (ADR 0034). It is installed as the
+// XRun hook on the physical input stream and runs on the PortAudio callback
+// thread, so it must remain allocation- and lock-free.
+func (c *deviceStreamController) addHWInputXRun() { c.hwXrunsIn.Add(1) }
+
+// addHWOutputXRun records one hardware output XRun (playback underflow) on
+// this controller's device-lifetime counter (ADR 0034).
+func (c *deviceStreamController) addHWOutputXRun() { c.hwXrunsOut.Add(1) }
+
+// installXRunHook attaches the direction-appropriate device-lifetime XRun
+// counter closure to phys when phys implements XRunHookSetter (real
+// PortAudio streams and the ASRC resampler wrapper do; ghost, emulator, and
+// virtual streams do not and are safely skipped). The hook fires exactly
+// once per hardware XRun at the PortAudio error site.
+//
+// It performs only a type assertion and an atomic store on the stream, so it
+// is safe both under c.mu (swapPhysicalStream) and in the constructor before
+// the controller is published.
+func (c *deviceStreamController) installXRunHook(phys AudioStream) {
+	setter, ok := phys.(XRunHookSetter)
+	if !ok {
+		return
+	}
+	if c.key.Direction == DirectionInput {
+		setter.SetXRunHook(c.addHWInputXRun)
+	} else {
+		setter.SetXRunHook(c.addHWOutputXRun)
+	}
+}
+
+// stats returns a point-in-time snapshot of this controller's identity and
+// device-lifetime hardware XRun counters for the artifact telemetry layer
+// (ADR 0034).
+func (c *deviceStreamController) stats() DeviceStreamStats {
+	c.mu.Lock()
+	_, ghost := c.physical.(*GhostAudioStream)
+	c.mu.Unlock()
+	return DeviceStreamStats{
+		URN:        c.key.URN,
+		Direction:  c.key.Direction,
+		Ghost:      ghost,
+		HWXrunsIn:  c.hwXrunsIn.Load(),
+		HWXrunsOut: c.hwXrunsOut.Load(),
 	}
 }
 
@@ -1728,7 +1830,17 @@ func (c *deviceStreamController) writeOutput(h *RefStreamHandle, p []byte) (int,
 		h.outSub.mu.Unlock()
 		return 0, io.ErrClosedPipe
 	}
-	h.outSub.buf.write(p)
+	// Exact dropped bytes come from the ring itself (ADR 0034); these
+	// playback-ring overruns were previously dropped silently.
+	if dropped := h.outSub.buf.write(p); dropped > 0 {
+		h.outSub.dropBytes.Add(uint64(dropped))
+		h.outSub.dropEvents.Add(1)
+		now := time.Now().UnixNano()
+		last := h.outSub.lastLog.Load()
+		if now-last > int64(time.Second) && h.outSub.lastLog.CompareAndSwap(last, now) {
+			log.Printf("[AUDIO:DEV] Playback subscriber ring buffer overrun: dropped %d bytes", dropped)
+		}
+	}
 	h.outSub.mu.Unlock()
 
 	c.mu.Lock()
@@ -1897,6 +2009,7 @@ type RefStreamHandle struct {
 
 var _ AudioStream = (*RefStreamHandle)(nil)
 var _ BufferedStream = (*RefStreamHandle)(nil)
+var _ DropCounter = (*RefStreamHandle)(nil)
 
 // Read drains PCM frames from the handle's dedicated capture buffer.
 // If the handle or controller is closed, it returns io.EOF.
@@ -1976,6 +2089,33 @@ func (h *RefStreamHandle) Underlying() AudioStream {
 // Direction returns the StreamDirection of this handle.
 func (h *RefStreamHandle) Direction() StreamDirection {
 	return h.dir
+}
+
+// DroppedBytes returns the lifetime count of PCM bytes dropped from this
+// handle's dedicated ring buffer (ADR 0034): the capture ring for input
+// handles, the playback (multi-writer mixer) ring for output handles.
+// Accounting is exact per ringBuf.write.
+func (h *RefStreamHandle) DroppedBytes() uint64 {
+	switch {
+	case h.dir == DirectionInput && h.inSub != nil:
+		return h.inSub.dropCount.Load()
+	case h.dir == DirectionOutput && h.outSub != nil:
+		return h.outSub.dropBytes.Load()
+	}
+	return 0
+}
+
+// DropEvents returns the lifetime count of individual ring-buffer overrun
+// events (one per write that dropped bytes) for this handle's dedicated ring
+// buffer (ADR 0034).
+func (h *RefStreamHandle) DropEvents() uint64 {
+	switch {
+	case h.dir == DirectionInput && h.inSub != nil:
+		return h.inSub.dropEvents.Load()
+	case h.dir == DirectionOutput && h.outSub != nil:
+		return h.outSub.dropEvents.Load()
+	}
+	return 0
 }
 
 // Close releases the virtual handle, decrementing the controller ref-count

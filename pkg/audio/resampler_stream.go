@@ -290,6 +290,22 @@ func (s *resampledAudioStream) Write(src []byte) (int, error) {
 	return len(src), nil
 }
 
+// SetXRunHook forwards the hook to the underlying stream when it implements
+// XRunHookSetter (ADR 0034), so the device-lifetime XRun counters stay
+// attached to the physical PortAudio stream across the ASRC wrapper. The
+// underlying stream is read under the wrapper lock, mirroring how Read /
+// Write / Close access it. Non-implementing underlyings (ghost / emulator /
+// virtual) are safely skipped via the optional-interface type assertion.
+func (s *resampledAudioStream) SetXRunHook(hook func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.underlying != nil {
+		if setter, ok := s.underlying.(XRunHookSetter); ok {
+			setter.SetXRunHook(hook)
+		}
+	}
+}
+
 // Close closes the resampler and releases the underlying AudioStream.
 func (s *resampledAudioStream) Close() error {
 	s.mu.Lock()

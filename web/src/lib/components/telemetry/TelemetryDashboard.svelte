@@ -4,6 +4,7 @@
   import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import { peerStore } from '$lib/stores/peers.svelte';
   import type { ClusterNodeSummary, AudioDeviceSummary } from '$lib/api/types';
+  import RouteHealthPanel from './RouteHealthPanel.svelte';
 
   import Cpu from '@lucide/svelte/icons/cpu';
   import Activity from '@lucide/svelte/icons/activity';
@@ -863,6 +864,11 @@
                 {/each}
               </div>
             {/if}
+          </div>
+
+          <!-- 5. Audio Artifacts (ADR 0034): per-route + per-device health -->
+          <div class="border-t border-zinc-800 pt-4">
+            <RouteHealthPanel />
           </div>
         </div>
       {/if}

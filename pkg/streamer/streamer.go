@@ -1014,6 +1014,21 @@ type StreamerStats struct {
 	FEC               FECStats                     `json:"fec"`
 	PLC               PLCStats                     `json:"plc"`
 	ASRC              ASRCStats                    `json:"asrc"`
+
+	// ADR 0034 Pass B route-level fields (additive, omitempty). PacketsLost
+	// and PlayoutGaps are filled by Stats() from peer sums; the remaining
+	// fields are filled by the stream manager, which owns the route-to-device
+	// binding and the audio.DropCounter handles.
+	PacketsLost       uint64 `json:"packets_lost,omitempty"`
+	PlayoutGaps       uint64 `json:"playout_gaps,omitempty"`
+	CaptureDropBytes  uint64 `json:"capture_drop_bytes,omitempty"`
+	CaptureDropEvents uint64 `json:"capture_drop_events,omitempty"`
+	OutputDropBytes   uint64 `json:"output_drop_bytes,omitempty"`
+	OutputDropEvents  uint64 `json:"output_drop_events,omitempty"`
+	SourceDeviceURN   string `json:"source_device_urn,omitempty"`
+	DestDeviceURN     string `json:"dest_device_urn,omitempty"`
+	SourceGhost       bool   `json:"source_ghost,omitempty"`
+	DestGhost         bool   `json:"dest_ghost,omitempty"`
 }
 
 // Stats returns statistics for this streamer and all peer connections.
@@ -1056,6 +1071,8 @@ func (s *Streamer) Stats() StreamerStats {
 	}
 
 	for addr, peer := range s.peers {
+		stats.PacketsLost += peer.packetsLost.Load()
+		stats.PlayoutGaps += peer.totalUnderruns.Load()
 		if peer.FECDecoder != nil {
 			fDecStats := peer.FECDecoder.Stats()
 			stats.FEC.UnrecoverableGroupsTotal += fDecStats.UnrecoverableGroupsTotal
@@ -1087,6 +1104,52 @@ func (s *Streamer) Stats() StreamerStats {
 		}
 	}
 	return stats
+}
+
+// ArtifactSample returns a lock-free, route-scoped sample of this streamer's
+// lifetime artifact counters (ADR 0034, Pass B). All counters are read
+// atomically (no audio-thread stalls); the ArtifactAggregator windows them.
+//
+// Route identity and device-bound fields (RouteID, device URNs, ghost flags,
+// ring drops) are intentionally left zero: the streamer does not know them.
+// The stream manager augments the sample with those fields.
+func (s *Streamer) ArtifactSample() telemetry.RouteArtifactSample {
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
+
+	smp := telemetry.RouteArtifactSample{
+		PacketsReceived: s.packetsRecv.Load(),
+		FECRecovered:    s.fecRecovered.Load(),
+	}
+
+	for _, peer := range s.peers {
+		smp.PacketsLost += peer.packetsLost.Load()
+		smp.PlayoutGaps += peer.totalUnderruns.Load()
+		if peer.FECDecoder != nil {
+			smp.FECUnrecoverable += peer.FECDecoder.Stats().UnrecoverableGroupsTotal
+		}
+
+		var und, over, late, plc uint64
+		if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
+			_, _, und, over, plc, late = jb.AtomicLinkStats()
+		} else if peer.JitterBuf != nil {
+			st := peer.JitterBuf.Stats()
+			und, over, late, plc = st.Underruns, st.Overruns, st.LatePackets, st.PLC.ConcealedFramesTotal
+		}
+		smp.JitterUnderruns += und
+		smp.JitterOverruns += over
+		smp.LatePackets += late
+		smp.PLCConcealed += plc
+
+		smp.Peers = append(smp.Peers, telemetry.PeerArtifactSample{
+			Addr:        peer.Addr,
+			Underruns:   und,
+			Overruns:    over,
+			LatePackets: late,
+		})
+	}
+
+	return smp
 }
 
 // SetPeerID associates a peer address with an authoritative peer node ID.
@@ -1146,17 +1209,18 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 
 		var jbDepth int
 		var targetDelayMS float64
-		var underruns, overruns, plcConcealed uint64
+		var underruns, overruns, plcConcealed, latePackets uint64
 
 		if peer.JitterBuf != nil {
 			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
-				jbDepth, targetDelayMS, underruns, overruns, plcConcealed = jb.AtomicLinkStats()
+				jbDepth, targetDelayMS, underruns, overruns, plcConcealed, latePackets = jb.AtomicLinkStats()
 			} else {
 				st := peer.JitterBuf.Stats()
 				jbDepth = st.BufferedFrames
 				targetDelayMS = float64(st.TargetDelay.Milliseconds())
 				underruns = st.Underruns
 				overruns = st.Overruns
+				latePackets = st.LatePackets
 				plcConcealed = st.PLC.ConcealedFramesTotal
 			}
 		}
@@ -1178,6 +1242,7 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 			JitterTargetDelayMS: targetDelayMS,
 			Underruns:           underruns,
 			Overruns:            overruns,
+			LatePackets:         latePackets,
 			FECRecovered:        fecRec,
 			PLCConcealed:        plcConcealed,
 		})

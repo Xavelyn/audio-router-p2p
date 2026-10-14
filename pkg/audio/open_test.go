@@ -4,8 +4,13 @@ package audio
 
 import (
 	"encoding/binary"
+	"errors"
 	"io"
+	"sync"
+	"sync/atomic"
 	"testing"
+
+	"github.com/gordonklaus/portaudio"
 )
 
 type mockPAStream struct {
@@ -210,5 +215,237 @@ func TestExtractAlsaCardAndDevice(t *testing.T) {
 				t.Errorf("[%s] expected card=%d dev=%d, got card=%d dev=%d", tc.name, tc.wantC, tc.wantD, c, d)
 			}
 		}
+	}
+}
+
+// fakePAReader is a portAudioStreamReader that replays a fixed error sequence:
+// call i returns errs[i] when i < len(errs), and nil afterwards.
+type fakePAReader struct {
+	mu    sync.Mutex
+	buf   []int16
+	errs  []error
+	calls int
+}
+
+func (f *fakePAReader) Read() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var err error
+	if f.calls < len(f.errs) {
+		err = f.errs[f.calls]
+	}
+	// Keep the stale buffer populated so the swallow-stale-buffer path
+	// after an XRun is exercised.
+	for i := range f.buf {
+		f.buf[i] = int16(i)
+	}
+	f.calls++
+	return err
+}
+
+func (f *fakePAReader) Stop() error  { return nil }
+func (f *fakePAReader) Close() error { return nil }
+
+// fakePAWriter is a portAudioStreamWriter that replays a fixed error sequence:
+// call i returns errs[i] when i < len(errs), and nil afterwards.
+type fakePAWriter struct {
+	mu    sync.Mutex
+	errs  []error
+	calls int
+}
+
+func (f *fakePAWriter) Write() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var err error
+	if f.calls < len(f.errs) {
+		err = f.errs[f.calls]
+	}
+	f.calls++
+	return err
+}
+
+func (f *fakePAWriter) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *fakePAWriter) Abort() error { return nil }
+func (f *fakePAWriter) Close() error { return nil }
+
+func setTestXRunHook(t *testing.T, s AudioStream, fired *atomic.Int64) {
+	t.Helper()
+	setter, ok := s.(XRunHookSetter)
+	if !ok {
+		t.Fatalf("%T does not implement XRunHookSetter", s)
+	}
+	setter.SetXRunHook(func() { fired.Add(1) })
+}
+
+// TestPortAudioInput_XRunHookExactness verifies the hook fires EXACTLY once
+// per InputOverflowed: k interleaved XRuns → k invocations, zero for
+// non-XRun errors, and no panic when no hook is installed.
+func TestPortAudioInput_XRunHookExactness(t *testing.T) {
+	const (
+		channels = 2
+		blocks   = 256
+		xruns    = 3
+	)
+	buf := make([]int16, blocks*channels)
+	fake := &fakePAReader{buf: buf}
+	// Interleave: normal, XRun, normal, XRun, normal, XRun, normal
+	for i := 0; i < xruns+1; i++ {
+		fake.errs = append(fake.errs, nil)
+		if i < xruns {
+			fake.errs = append(fake.errs, portaudio.InputOverflowed)
+		}
+	}
+
+	in := NewPortaudioInputForTest(fake, buf)
+	defer in.Close()
+
+	var fired atomic.Int64
+	setTestXRunHook(t, in, &fired)
+
+	dst := make([]byte, blocks*channels*2)
+	for i, expected := range fake.errs {
+		n, err := in.Read(dst)
+		if errors.Is(expected, portaudio.InputOverflowed) {
+			// The XRun must be swallowed: stale buffer, nil error.
+			if err != nil || n == 0 {
+				t.Fatalf("read %d: XRun must be swallowed, got n=%d err=%v", i, n, err)
+			}
+			if got := fired.Load(); got != int64(i/2+1) {
+				t.Fatalf("read %d: hook fired %d times so far, want %d", i, got, i/2+1)
+			}
+		} else if err != nil || n == 0 {
+			t.Fatalf("read %d: unexpected failure n=%d err=%v", i, n, err)
+		}
+	}
+	if got := fired.Load(); got != xruns {
+		t.Fatalf("hook fired %d times, want exactly %d", got, xruns)
+	}
+}
+
+func TestPortAudioInput_NonXRunErrorDoesNotFireHook(t *testing.T) {
+	buf := make([]int16, 256*2)
+	boom := errors.New("device fault")
+	fake := &fakePAReader{buf: buf, errs: []error{nil, boom, nil}}
+
+	in := NewPortaudioInputForTest(fake, buf)
+	defer in.Close()
+
+	var fired atomic.Int64
+	setTestXRunHook(t, in, &fired)
+
+	dst := make([]byte, 1024)
+	if _, err := in.Read(dst); err != nil {
+		t.Fatalf("read 0: %v", err)
+	}
+	// Non-XRun errors still propagate to the caller (unchanged behavior).
+	if _, err := in.Read(dst); !errors.Is(err, boom) {
+		t.Fatalf("read 1: expected the original error to propagate, got %v", err)
+	}
+	if got := fired.Load(); got != 0 {
+		t.Fatalf("hook fired %d times on non-XRun errors, want 0", got)
+	}
+	if _, err := in.Read(dst); err != nil {
+		t.Fatalf("read 2: %v", err)
+	}
+	if got := fired.Load(); got != 0 {
+		t.Fatalf("hook fired %d times overall, want 0", got)
+	}
+}
+
+func TestPortAudioInput_XRunWithNoHookDoesNotPanic(t *testing.T) {
+	buf := make([]int16, 256*2)
+	fake := &fakePAReader{buf: buf, errs: []error{portaudio.InputOverflowed, nil}}
+
+	in := NewPortaudioInputForTest(fake, buf)
+	defer in.Close()
+	// No hook installed: XRuns must still be logged (rate-limited) and
+	// swallowed without panicking.
+	dst := make([]byte, 1024)
+	n, err := in.Read(dst)
+	if err != nil || n == 0 {
+		t.Fatalf("read with XRun and no hook: n=%d err=%v", n, err)
+	}
+	if _, err := in.Read(dst); err != nil {
+		t.Fatalf("read after XRun: %v", err)
+	}
+}
+
+// TestPortAudioOutput_XRunHookExactness verifies the hook fires EXACTLY once
+// per OutputUnderflowed: k interleaved XRuns → k invocations, zero for
+// non-underflow errors (which still propagate), and no panic when no hook is
+// installed.
+func TestPortAudioOutput_XRunHookExactness(t *testing.T) {
+	const xruns = 3
+	buf := make([]int16, 256) // mono test stream
+	fake := &fakePAWriter{}
+	// Each physical Write() plays one full block:
+	// ok, XRun, ok, XRun, ok, XRun, ok
+	for i := 0; i < xruns; i++ {
+		fake.errs = append(fake.errs, nil, portaudio.OutputUnderflowed)
+	}
+	fake.errs = append(fake.errs, nil)
+
+	out := NewPortaudioOutputForTest(fake, buf)
+	defer out.Close()
+
+	var fired atomic.Int64
+	setTestXRunHook(t, out, &fired)
+
+	blockBytes := len(buf) * 2
+	payload := make([]byte, blockBytes*len(fake.errs))
+	n, err := out.Write(payload)
+	if err != nil {
+		t.Fatalf("Write: XRuns must be swallowed, got %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("Write returned n=%d, want %d", n, len(payload))
+	}
+	if got := fired.Load(); got != xruns {
+		t.Fatalf("hook fired %d times, want exactly %d", got, xruns)
+	}
+	if got := fake.callCount(); got != len(fake.errs) {
+		t.Fatalf("underlying Write called %d times, want %d", got, len(fake.errs))
+	}
+}
+
+func TestPortAudioOutput_NonXRunErrorDoesNotFireHook(t *testing.T) {
+	buf := make([]int16, 256)
+	boom := errors.New("device fault")
+	fake := &fakePAWriter{errs: []error{boom}}
+
+	out := NewPortaudioOutputForTest(fake, buf)
+	defer out.Close()
+
+	var fired atomic.Int64
+	setTestXRunHook(t, out, &fired)
+
+	payload := make([]byte, len(buf)*2)
+	n, err := out.Write(payload)
+	if err == nil {
+		t.Fatalf("expected non-XRun error to propagate, got n=%d", n)
+	}
+	if got := fired.Load(); got != 0 {
+		t.Fatalf("hook fired %d times on non-XRun error, want 0", got)
+	}
+}
+
+func TestPortAudioOutput_XRunWithNoHookDoesNotPanic(t *testing.T) {
+	buf := make([]int16, 256)
+	fake := &fakePAWriter{errs: []error{portaudio.OutputUnderflowed, nil}}
+
+	out := NewPortaudioOutputForTest(fake, buf)
+	defer out.Close()
+	// No hook installed: the underflow must still be logged (rate-limited)
+	// and swallowed without panicking.
+	payload := make([]byte, len(buf)*4)
+	n, err := out.Write(payload)
+	if err != nil || n != len(payload) {
+		t.Fatalf("Write with XRun and no hook: n=%d err=%v", n, err)
 	}
 }

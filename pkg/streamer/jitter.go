@@ -77,6 +77,7 @@ type JitterBuffer struct {
 	atomicBuffered     atomic.Int32
 	atomicPLCConcealed atomic.Uint64
 	atomicTargetDelay  atomic.Int64 // nanoseconds
+	atomicLatePackets  atomic.Uint64
 
 	closed bool
 }
@@ -202,6 +203,7 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	// Signed RFC 1982 serial number distance from next expected sequence
 	if distFromNext < 0 {
 		jb.latePackets++
+		jb.atomicLatePackets.Add(1)
 		return 0, nil
 	}
 
@@ -213,6 +215,7 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	late := now.After(expectedPlayout.Add(jb.targetDelay))
 	if late {
 		jb.latePackets++
+		jb.atomicLatePackets.Add(1)
 	}
 
 	// Find slot: sequence numbers map directly into the ring buffer and wrap
@@ -412,7 +415,7 @@ func (jb *JitterBuffer) adaptDelay(arrival, expected time.Time) {
 }
 
 // AtomicLinkStats returns instantaneous jitter buffer metrics without locking the audio thread.
-func (jb *JitterBuffer) AtomicLinkStats() (buffered int, targetDelayMS float64, underruns, overruns, plcConcealed uint64) {
+func (jb *JitterBuffer) AtomicLinkStats() (buffered int, targetDelayMS float64, underruns, overruns, plcConcealed, latePackets uint64) {
 	b := jb.atomicBuffered.Load()
 	if b < 0 {
 		b = 0
@@ -421,7 +424,7 @@ func (jb *JitterBuffer) AtomicLinkStats() (buffered int, targetDelayMS float64, 
 	if targetNS == 0 {
 		targetNS = int64(jb.minDelay)
 	}
-	return int(b), float64(targetNS) / 1e6, jb.atomicUnderruns.Load(), jb.atomicOverruns.Load(), jb.atomicPLCConcealed.Load()
+	return int(b), float64(targetNS) / 1e6, jb.atomicUnderruns.Load(), jb.atomicOverruns.Load(), jb.atomicPLCConcealed.Load(), jb.atomicLatePackets.Load()
 }
 
 // Stats returns current buffer statistics.

@@ -77,8 +77,9 @@ type Server struct {
 	hub      *telemetry.TelemetryHub
 	v1Server *v1.V1Server
 
-	aggregator       *netTelemetry.Aggregator
-	networkCollector *metrics.NetworkMetricsCollector
+	aggregator         *netTelemetry.Aggregator
+	artifactAggregator *netTelemetry.ArtifactAggregator
+	networkCollector   *metrics.NetworkMetricsCollector
 
 	clusterMgr *cluster.Manager
 }
@@ -181,6 +182,22 @@ func (s *Server) SetAggregator(agg *netTelemetry.Aggregator) {
 	}
 }
 
+// ArtifactAggregator returns the audio artifact telemetry aggregator (ADR
+// 0034). It is constructed in the daemon, which owns its route/device
+// sources; the API server only holds and exposes it.
+func (s *Server) ArtifactAggregator() *netTelemetry.ArtifactAggregator {
+	return s.artifactAggregator
+}
+
+// SetArtifactAggregator configures the artifact telemetry aggregator and
+// forwards it to the V1 server (mirrors SetAggregator).
+func (s *Server) SetArtifactAggregator(agg *netTelemetry.ArtifactAggregator) {
+	s.artifactAggregator = agg
+	if s.v1Server != nil {
+		s.v1Server.SetArtifactAggregator(agg)
+	}
+}
+
 // GetHealthSnapshot supplies the latest atomic snapshot to the Prometheus collector.
 func (s *Server) GetHealthSnapshot() *netTelemetry.NetworkHealthSnapshot {
 	if s.aggregator != nil {
@@ -212,6 +229,9 @@ func (s *Server) Close() error {
 	}
 	if s.aggregator != nil {
 		_ = s.aggregator.Close()
+	}
+	if s.artifactAggregator != nil {
+		s.artifactAggregator.Stop()
 	}
 	if s.clusterMgr != nil {
 		_ = s.clusterMgr.Close()

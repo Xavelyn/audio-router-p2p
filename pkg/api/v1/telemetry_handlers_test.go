@@ -7,11 +7,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
+	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
 	"golang.org/x/net/websocket"
 )
 
@@ -245,5 +248,290 @@ func TestV1TelemetryWebSocket(t *testing.T) {
 	}
 	if mr2.Coefficients[1] != 0.75 {
 		t.Errorf("nested crosspoint gain = %f; want 0.75", mr2.Coefficients[1])
+	}
+}
+
+// v1FakeRouteSource is a controlled fake RouteArtifactSource for handler tests.
+type v1FakeRouteSource struct {
+	mu      sync.Mutex
+	samples map[string]netTelemetry.RouteArtifactSample
+}
+
+func (f *v1FakeRouteSource) RouteArtifactSamples() []netTelemetry.RouteArtifactSample {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]netTelemetry.RouteArtifactSample, 0, len(f.samples))
+	for _, s := range f.samples {
+		out = append(out, s)
+	}
+	return out
+}
+
+func (f *v1FakeRouteSource) set(routeID string, mutate func(*netTelemetry.RouteArtifactSample)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s := f.samples[routeID]
+	s.RouteID = routeID
+	mutate(&s)
+	f.samples[routeID] = s
+}
+
+// v1FakeDeviceSource is a controlled fake DeviceArtifactSource for handler tests.
+type v1FakeDeviceSource struct {
+	mu      sync.Mutex
+	samples []netTelemetry.DeviceArtifactSample
+}
+
+func (f *v1FakeDeviceSource) DeviceArtifactSamples() []netTelemetry.DeviceArtifactSample {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]netTelemetry.DeviceArtifactSample, len(f.samples))
+	copy(out, f.samples)
+	return out
+}
+
+func (f *v1FakeDeviceSource) set(s netTelemetry.DeviceArtifactSample) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, cur := range f.samples {
+		if cur.URN == s.URN && cur.Direction == s.Direction {
+			f.samples[i] = s
+			return
+		}
+	}
+	f.samples = append(f.samples, s)
+}
+
+// TestV1TelemetryStreamStats_WithArtifactAggregator verifies that when the
+// artifact aggregator is wired, stream-stats carries a `health` object
+// consistent with the injected samples and a `devices` overlay resolved from
+// the route's source/destination URNs (ADR 0034).
+func TestV1TelemetryStreamStats_WithArtifactAggregator(t *testing.T) {
+	s, mux := newTestV1Server(t)
+	s.streams = &mockStreamerStatsManager{
+		stats: map[string]streamer.StreamerStats{
+			"route-1": {
+				StreamID:        "stream-999",
+				PacketsSent:     500,
+				PacketsReceived: 495,
+				Underruns:       1,
+				SourceDeviceURN: "alsa://hw:0,0",
+				DestDeviceURN:   "alsa://hw:1,0",
+				Peers: map[string]streamer.JitterBufferStats{
+					"192.168.1.50:7001": {
+						BufferedFrames: 3,
+						CapacityFrames: 10,
+						Underruns:      1,
+						LatePackets:    2,
+						TargetDelay:    20 * time.Millisecond,
+					},
+				},
+			},
+		},
+	}
+
+	// Two synchronous ticks so the 10 s windows have a baseline and a delta.
+	routes := &v1FakeRouteSource{samples: map[string]netTelemetry.RouteArtifactSample{}}
+	routes.set("route-1", func(rs *netTelemetry.RouteArtifactSample) { rs.JitterUnderruns = 0 })
+	devices := &v1FakeDeviceSource{samples: []netTelemetry.DeviceArtifactSample{
+		{URN: "alsa://hw:0,0", Direction: audio.DirectionInput, HWXRuns: 0},
+		{URN: "alsa://hw:1,0", Direction: audio.DirectionOutput, HWXRuns: 12},
+	}}
+	agg := netTelemetry.NewArtifactAggregator(routes, devices, time.Second, 10*time.Second)
+	_ = agg.CollectSnapshot()
+	routes.set("route-1", func(rs *netTelemetry.RouteArtifactSample) {
+		rs.JitterUnderruns = 1 // 0 -> 1 in window
+		rs.FECRecovered = 2    // 0 -> 2 in window
+	})
+	_ = agg.CollectSnapshot()
+
+	s.SetArtifactAggregator(agg)
+
+	w := doV1Request(mux, http.MethodGet, "/api/v1/telemetry/stream-stats", nil, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var stats map[string]StreamStats
+	if err := json.Unmarshal(w.Body.Bytes(), &stats); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
+	}
+	st, ok := stats["route-1"]
+	if !ok {
+		t.Fatal("expected route-1 in stream stats")
+	}
+
+	if st.Health == nil {
+		t.Fatal("expected health to be present when aggregator is wired")
+	}
+	if st.Health.Underruns != 1 {
+		t.Errorf("health.underruns = %d; want 1 (windowed)", st.Health.Underruns)
+	}
+	if st.Health.FECRecovered != 2 {
+		t.Errorf("health.fec_recovered = %d; want 2 (windowed)", st.Health.FECRecovered)
+	}
+	// 1 in-window underrun: 100 * C_underrun(1) = 80 / MINOR.
+	if st.Health.Score != 80 {
+		t.Errorf("health.score = %v; want 80", st.Health.Score)
+	}
+	if st.Health.Severity != ArtifactSeverityMinor {
+		t.Errorf("health.severity = %s; want MINOR", st.Health.Severity)
+	}
+	if st.Health.WindowS != 10 {
+		t.Errorf("health.window_s = %d; want 10", st.Health.WindowS)
+	}
+
+	if st.Devices == nil {
+		t.Fatal("expected devices overlay when aggregator is wired")
+	}
+	if st.Devices.Input == nil || st.Devices.Input.URN != "alsa://hw:0,0" {
+		t.Errorf("devices.input = %+v; want urn alsa://hw:0,0", st.Devices.Input)
+	}
+	if st.Devices.Output == nil || st.Devices.Output.URN != "alsa://hw:1,0" {
+		t.Errorf("devices.output = %+v; want urn alsa://hw:1,0", st.Devices.Output)
+	}
+	if st.Devices.Output.Output == nil {
+		t.Fatal("devices.output.output direction object missing")
+	}
+	if st.Devices.Output.Output.XRunTotal != 12 {
+		t.Errorf("devices.output.output.xrun_total = %d; want 12", st.Devices.Output.Output.XRunTotal)
+	}
+	// No XRuns in-window on a constant counter; score stays clean.
+	if st.Devices.Output.Score != 100 || st.Devices.Output.Severity != ArtifactSeverityNone {
+		t.Errorf("devices.output score/severity = %v/%s; want 100/NONE", st.Devices.Output.Score, st.Devices.Output.Severity)
+	}
+
+	// JitterStats late_packets filled from the streamer's per-peer stats.
+	if peer, hasPeer := st.Peers["192.168.1.50:7001"]; !hasPeer || peer.LatePackets != 2 {
+		t.Errorf("peer late_packets = %+v; want 2", peer)
+	}
+}
+
+// TestV1TelemetryStreamStats_WithoutAggregator_BackwardCompatible is the
+// backward-compat regression guard: with the artifact aggregator unwired, the
+// response must be byte-compatible with today's for aggregator-derived fields
+// (no `health`, no `devices`). Peer-level late/early packets are plain
+// additive fields per ADR 0034 §4: always present, zero when absent.
+func TestV1TelemetryStreamStats_WithoutAggregator_BackwardCompatible(t *testing.T) {
+	s, mux := newTestV1Server(t)
+	s.streams = &mockStreamerStatsManager{
+		stats: map[string]streamer.StreamerStats{
+			"route-1": {
+				StreamID:        "stream-999",
+				PacketsSent:     500,
+				PacketsReceived: 495,
+				Underruns:       1,
+				SourceDeviceURN: "alsa://hw:0,0",
+				DestDeviceURN:   "alsa://hw:1,0",
+				Peers: map[string]streamer.JitterBufferStats{
+					"192.168.1.50:7001": {
+						BufferedFrames: 3,
+						CapacityFrames: 10,
+						Underruns:      1,
+						TargetDelay:    20 * time.Millisecond,
+					},
+				},
+			},
+		},
+	}
+	// s.artifactAggregator intentionally left nil.
+
+	w := doV1Request(mux, http.MethodGet, "/api/v1/telemetry/stream-stats", nil, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var raw map[string]map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal stats: %v", err)
+	}
+	for id, entry := range raw {
+		if _, ok := entry["health"]; ok {
+			t.Errorf("route %s carries health although the aggregator is unwired", id)
+		}
+		if _, ok := entry["devices"]; ok {
+			t.Errorf("route %s carries devices although the aggregator is unwired", id)
+		}
+		if peers, ok := entry["peers"].(map[string]any); ok {
+			for pAddr, p := range peers {
+				pm, _ := p.(map[string]any)
+				// ADR 0034 §4: plain additive fields — present even when zero
+				// (only health/devices are omitted when the aggregator is unwired).
+				if v, ok := pm["late_packets"].(float64); !ok || v != 0 {
+					t.Errorf("peer %s late_packets = %v; want 0 (present, plain field)", pAddr, pm["late_packets"])
+				}
+				if v, ok := pm["early_packets"].(float64); !ok || v != 0 {
+					t.Errorf("peer %s early_packets = %v; want 0 (present, plain field)", pAddr, pm["early_packets"])
+				}
+			}
+		}
+	}
+
+	// Pre-existing payload is intact.
+	var stats map[string]StreamStats
+	_ = json.Unmarshal(w.Body.Bytes(), &stats)
+	if st := stats["route-1"]; st.StreamID != "stream-999" || st.PacketsSent != 500 || st.Underruns != 1 {
+		t.Errorf("pre-existing payload mismatch: %+v", st)
+	}
+}
+
+// TestV1TelemetryDeviceArtifacts covers the new URN-keyed endpoint: auth is
+// enforced, unwired returns an empty object, and wired returns the snapshot's
+// device map with the ADR 0034 shape.
+func TestV1TelemetryDeviceArtifacts(t *testing.T) {
+	s, mux := newTestV1Server(t)
+	const path = "/api/v1/telemetry/device-artifacts"
+
+	// (c) Auth enforced.
+	if w := doV1Request(mux, http.MethodGet, path, nil, ""); w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without credentials, got %d", w.Code)
+	}
+	if w := doV1Request(mux, http.MethodGet, path, nil, "Bearer wrong-token"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 with invalid credentials, got %d", w.Code)
+	}
+	if w := doV1Request(mux, http.MethodPost, path, nil, "Bearer test-v1-token"); w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405 for POST, got %d", w.Code)
+	}
+
+	// Unwired aggregator: empty object.
+	w := doV1Request(mux, http.MethodGet, path, nil, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 unwired, got %d", w.Code)
+	}
+	if body := strings.TrimSpace(w.Body.String()); body != "{}" {
+		t.Fatalf("unwired device-artifacts = %q; want {}", body)
+	}
+
+	// Wired aggregator: correct shape.
+	routes := &v1FakeRouteSource{samples: map[string]netTelemetry.RouteArtifactSample{}}
+	devices := &v1FakeDeviceSource{samples: []netTelemetry.DeviceArtifactSample{
+		{URN: "alsa://hw:0,0", Direction: audio.DirectionInput, HWXRuns: 0},
+		{URN: "alsa://hw:1,0", Direction: audio.DirectionOutput, HWXRuns: 12},
+	}}
+	agg := netTelemetry.NewArtifactAggregator(routes, devices, time.Second, 10*time.Second)
+	_ = agg.CollectSnapshot()
+	s.SetArtifactAggregator(agg)
+
+	w = doV1Request(mux, http.MethodGet, path, nil, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 wired, got %d", w.Code)
+	}
+	var devMap map[string]DeviceHealth
+	if err := json.Unmarshal(w.Body.Bytes(), &devMap); err != nil {
+		t.Fatalf("unmarshal device-artifacts: %v", err)
+	}
+	if len(devMap) != 2 {
+		t.Fatalf("expected 2 devices, got %d: %s", len(devMap), w.Body.String())
+	}
+	if in := devMap["alsa://hw:0,0"]; in.URN != "alsa://hw:0,0" || in.Input == nil || in.Output != nil {
+		t.Errorf("input device shape wrong: %+v", in)
+	}
+	if out := devMap["alsa://hw:1,0"]; out.URN != "alsa://hw:1,0" || out.Output == nil || out.Output.XRunTotal != 12 {
+		t.Errorf("output device shape wrong: %+v", out)
+	}
+	body := w.Body.String()
+	for _, key := range []string{`"urn"`, `"ghost"`, `"score"`, `"severity"`, `"input"`, `"output"`, `"xrun_window"`, `"xrun_total"`} {
+		if !strings.Contains(body, key) {
+			t.Errorf("device-artifacts response missing key %s: %s", key, body)
+		}
 	}
 }

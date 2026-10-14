@@ -63,6 +63,13 @@ type portAudioStreamReader interface {
 	Close() error
 }
 
+// portAudioStreamWriter abstracts the blocking write and lifecycle from a PortAudio stream.
+type portAudioStreamWriter interface {
+	Write() error
+	Abort() error
+	Close() error
+}
+
 // portaudioInput wraps a blocking PortAudio input stream and exposes it as a
 // byte-oriented AudioStream (little-endian int16 PCM).
 type portaudioInput struct {
@@ -73,7 +80,23 @@ type portaudioInput struct {
 	spill        []byte
 	closed       bool
 	lastOverflow atomic.Int64
-	isRealPA     bool
+	// xrunHook is invoked exactly once per input XRun (hardware overflow) at
+	// the existing InputOverflowed error site (ADR 0034). It is loaded only
+	// in the rare XRun branch, so the happy path pays nothing.
+	xrunHook atomic.Pointer[func()]
+	isRealPA bool
+}
+
+// SetXRunHook installs a hook invoked exactly once per input XRun, from
+// within Read() after the unchanged 1/s rate-limited log line (ADR 0034). A
+// nil hook clears the installed hook. The hook runs on the audio thread and
+// must be lock-free, allocation-free, and non-blocking.
+func (p *portaudioInput) SetXRunHook(hook func()) {
+	if hook == nil {
+		p.xrunHook.Store(nil)
+		return
+	}
+	p.xrunHook.Store(&hook)
 }
 
 func buildRateCandidates(requested, defaultRate int, activeRates ...int) []int {
@@ -359,6 +382,12 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 			if now-last > int64(time.Second) && p.lastOverflow.CompareAndSwap(last, now) {
 				log.Printf("[AUDIO:IO] Input buffer overflowed (XRun)")
 			}
+			// Fire the device-lifetime XRun hook exactly once per XRun
+			// (ADR 0034): one atomic pointer load + one call, no extra
+			// locking or allocation on the audio thread.
+			if h := p.xrunHook.Load(); h != nil {
+				(*h)()
+			}
 		} else {
 			log.Printf("[AUDIO:IO] Input stream read error: %v", err)
 			return 0, err
@@ -409,13 +438,41 @@ func (p *portaudioInput) Close() error {
 // real time; smaller writes are parked until a full buffer accumulates.
 type portaudioOutput struct {
 	mu            sync.Mutex
-	stream        *portaudio.Stream
+	stream        portAudioStreamWriter
 	buf           []int16
 	frameSize     int
 	blockBytes    int
 	spill         []byte
 	closed        bool
 	lastUnderflow atomic.Int64
+	// xrunHook is invoked exactly once per output XRun (hardware underflow)
+	// at the existing OutputUnderflowed error site (ADR 0034). It is loaded
+	// only in the rare XRun branch, so the happy path pays nothing.
+	xrunHook atomic.Pointer[func()]
+}
+
+// SetXRunHook installs a hook invoked exactly once per output XRun, from
+// within Write() after the unchanged 1/s rate-limited log line (ADR 0034). A
+// nil hook clears the installed hook. The hook runs on the audio thread and
+// must be lock-free, allocation-free, and non-blocking.
+func (o *portaudioOutput) SetXRunHook(hook func()) {
+	if hook == nil {
+		o.xrunHook.Store(nil)
+		return
+	}
+	o.xrunHook.Store(&hook)
+}
+
+// NewPortaudioOutputForTest instantiates a portaudioOutput with a custom
+// stream writer for unit testing. The test stream plays mono (1 channel)
+// int16 frames; the physical block size is len(buf) samples.
+func NewPortaudioOutputForTest(stream portAudioStreamWriter, buf []int16) AudioStream {
+	return &portaudioOutput{
+		stream:     stream,
+		buf:        buf,
+		frameSize:  2,
+		blockBytes: len(buf) * 2,
+	}
 }
 
 func resolveOutputDevice(deviceID int, fallbackNames ...string) (*portaudio.DeviceInfo, error) {
@@ -586,6 +643,12 @@ func (o *portaudioOutput) Write(p []byte) (int, error) {
 				last := o.lastUnderflow.Load()
 				if now-last > int64(time.Second) && o.lastUnderflow.CompareAndSwap(last, now) {
 					log.Printf("[AUDIO:IO] Output buffer underflowed (XRun)")
+				}
+				// Fire the device-lifetime XRun hook exactly once per XRun
+				// (ADR 0034): one atomic pointer load + one call, no extra
+				// locking or allocation on the audio thread.
+				if h := o.xrunHook.Load(); h != nil {
+					(*h)()
 				}
 			} else {
 				log.Printf("[AUDIO:IO] Output stream write error: %v", err)

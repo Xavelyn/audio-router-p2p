@@ -1,8 +1,17 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
-  import type { AudioDevice } from '$lib/api/types';
+  import type { AudioDevice, DeviceHealth, RouteHealth } from '$lib/api/types';
   import { meterStore } from '$lib/stores/meters.svelte';
+  import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import { urnChecksum } from '$lib/utils/checksum';
+  import {
+    breakdownLines,
+    devicePillSeverity,
+    isTelemetryFresh,
+    routeTouchesDevice,
+    type DeviceIdentity,
+  } from '$lib/utils/artifacts';
+  import HealthPill from './HealthPill.svelte';
   import Mic from '@lucide/svelte/icons/mic';
   import Radio from '@lucide/svelte/icons/radio';
   import Plus from '@lucide/svelte/icons/plus';
@@ -108,6 +117,58 @@
 
   const leftPeakPercent = $derived(dbToPercent(leftMeter.peakDb));
   const rightPeakPercent = $derived(dbToPercent(rightMeter.peakDb));
+
+  // ==========================================================================
+  // ADR 0034: per-connection audio artifact HealthPill
+  // Pill = WORST of the device's own severity (URN-keyed device-artifacts)
+  // and the severities of all routes touching this device. Rendered only
+  // when FRESH artifact data exists — "no data" (aggregator unwired) or
+  // stale telemetry (> 1500 ms, the meter staleness convention) renders
+  // nothing: a missing pill must never look like a fake-clean one.
+  // ==========================================================================
+  const deviceIdentity = $derived<DeviceIdentity>({
+    urn: data.device.urn,
+    id: data.device.id,
+    legacyId: data.device.legacy_id,
+    checksum: deviceHash,
+    tail: deviceTail,
+  });
+
+  const deviceArtifact = $derived.by<DeviceHealth | null>(() => {
+    const keys = [data.device.urn, data.device.id].filter((k): k is string => !!k);
+    for (const k of keys) {
+      const hit = telemetryStore.deviceArtifacts[k];
+      if (hit) return hit;
+    }
+    return null;
+  });
+
+  const touchingRouteHealth = $derived.by<Array<{ routeId: string; health: RouteHealth }>>(() => {
+    const out: Array<{ routeId: string; health: RouteHealth }> = [];
+    for (const [routeId, st] of Object.entries(telemetryStore.streamStats)) {
+      if (st.health && routeTouchesDevice(routeId, st.devices, deviceIdentity)) {
+        out.push({ routeId, health: st.health });
+      }
+    }
+    return out;
+  });
+
+  const pillSeverity = $derived.by<string | null>(() => {
+    if (!isTelemetryFresh(telemetryStore.lastUpdated, Date.now())) return null;
+    return devicePillSeverity(
+      deviceArtifact?.severity ?? null,
+      touchingRouteHealth.map((r) => r.health.severity)
+    );
+  });
+
+  const pillLines = $derived(
+    pillSeverity === null
+      ? []
+      : breakdownLines(
+          { urn: data.device.urn || data.device.id, health: deviceArtifact },
+          touchingRouteHealth
+        )
+  );
 </script>
 
 <div
@@ -148,6 +209,9 @@
 
     <!-- Direction Badges & Dismiss -->
     <div class="flex items-center gap-1 shrink-0">
+      {#if pillSeverity !== null}
+        <HealthPill severity={pillSeverity} lines={pillLines} />
+      {/if}
       {#if data.device.status === 'quarantined'}
         <span class="rounded bg-amber-500/20 px-1.5 py-0.5 text-[9px] font-mono font-bold uppercase tracking-wider text-amber-300 border border-amber-500/40 animate-pulse shrink-0" title="Device disconnected: Pacing zero silence">
           GHOST

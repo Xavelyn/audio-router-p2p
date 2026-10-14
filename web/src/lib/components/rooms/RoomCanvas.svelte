@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import {
     SvelteFlow,
     Controls,
@@ -16,6 +16,7 @@
   import { deviceStore } from '$lib/stores/devices.svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
   import { meterStore } from '$lib/stores/meters.svelte';
+  import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import { flowLayoutStore } from '$lib/stores/flowLayout.svelte';
   import type { AudioDevice, AudioDeviceSummary } from '$lib/api/types';
   import DevicePalette from './flow/DevicePalette.svelte';
@@ -68,12 +69,22 @@
     ]);
     meterStore.init();
 
+    // ADR 0034: the flow-canvas device HealthPills need the 2 s artifact
+    // telemetry (stream-stats + device-artifacts). Start the per-page
+    // polling here, mirroring TelemetryDashboard's convention.
+    telemetryStore.startPolling(2000);
+
     // Initial default staging ONLY if canvas has never been configured
     if (!flowLayoutStore.hasSavedLayout) {
       ensureRoomDevicesStaged();
       ensureDefaultStaging();
     }
     syncFlowGraph();
+  });
+
+  onDestroy(() => {
+    // Stop artifact telemetry when the flow canvas unmounts (tab switch).
+    telemetryStore.stopPolling();
   });
 
   // Consolidate devices from local deviceStore and clusterStore

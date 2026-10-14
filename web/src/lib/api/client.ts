@@ -14,6 +14,7 @@ import type {
   CreateRoomRequest,
   UpdateRoomBindingsRequest,
   StreamStats,
+  DeviceHealth,
   ErrorResponse,
   NetworkHealthResponse,
   ClusterNodesResponse,
@@ -299,6 +300,14 @@ export class ApiClient {
 
   async getStreamStats(): Promise<Record<string, StreamStats>> {
     return this.request<Record<string, StreamStats>>('/api/v1/telemetry/stream-stats');
+  }
+
+  /**
+   * ADR 0034: URN-keyed per-device artifact health. Returns an empty object
+   * when the daemon's ArtifactAggregator is unwired (tests, partial startup).
+   */
+  async getDeviceArtifacts(): Promise<Record<string, DeviceHealth>> {
+    return this.request<Record<string, DeviceHealth>>('/api/v1/telemetry/device-artifacts');
   }
 
   // ==========================================================================

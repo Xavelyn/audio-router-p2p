@@ -7,6 +7,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1164,5 +1165,367 @@ func TestDeviceResolver_AsyncPromotion(t *testing.T) {
 		if err != nil || n <= 0 {
 			t.Fatalf("read %d after promotion failed: n=%d, err=%v", i, n, err)
 		}
+	}
+}
+
+// --- ADR 0034 Pass A: event-site artifact counters ---
+
+// xrunCapableFake is an AudioStream that also implements XRunHookSetter and
+// captures the installed hook, so tests can fire it as if the PortAudio
+// driver reported a hardware XRun. It counts its own hook invocations so a
+// test can prove the controller's lifetime counter matches the exact number
+// of invocations.
+type xrunCapableFake struct {
+	hook  atomic.Pointer[func()]
+	fires atomic.Uint64
+}
+
+func (f *xrunCapableFake) SetXRunHook(hook func()) {
+	if hook == nil {
+		f.hook.Store(nil)
+		return
+	}
+	f.hook.Store(&hook)
+}
+
+func (f *xrunCapableFake) fire() {
+	if h := f.hook.Load(); h != nil {
+		f.fires.Add(1)
+		(*h)()
+	}
+}
+
+func (f *xrunCapableFake) Read([]byte) (int, error)  { return 0, nil }
+func (f *xrunCapableFake) Write([]byte) (int, error) { return 0, nil }
+func (f *xrunCapableFake) Close() error              { return nil }
+
+// TestOutputSubscriber_RingDropCounting verifies the NEW exact playback-ring
+// drop counters: a write that overflows the multi-writer ring counts the
+// exact bytes/events once, and a later fitting write counts nothing.
+func TestOutputSubscriber_RingDropCounting(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:out-drops", Direction: DirectionOutput}, NewVirtualAudioDevice(), 48000, 2, defaultGracePeriod)
+	defer c.close()
+
+	// Two output handles force the multi-writer ring path in writeOutput.
+	c.mu.Lock()
+	h1 := c.newOutputHandleLocked()
+	h2 := c.newOutputHandleLocked()
+	c.mu.Unlock()
+	_ = h2
+
+	const over = 3840 // frame-aligned for 2ch (frameSize 4)
+	ringCap := h1.outSub.buf.cap()
+	if ringCap%h1.outSub.buf.frameSize != 0 {
+		t.Fatalf("ring cap %d is not frame-aligned", ringCap)
+	}
+
+	payload := make([]byte, ringCap+over)
+	n, err := c.writeOutput(h1, payload)
+	if err != nil {
+		t.Fatalf("writeOutput: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("writeOutput returned n=%d, want %d", n, len(payload))
+	}
+
+	sub := h1.outSub
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d, want exactly 1", got)
+	}
+	if got := sub.dropBytes.Load(); got != over {
+		t.Fatalf("dropBytes=%d, want exactly %d", got, over)
+	}
+
+	// DropCounter delegation on the output handle must match.
+	var dc DropCounter = h1
+	if got := dc.DroppedBytes(); got != over {
+		t.Fatalf("handle DroppedBytes()=%d, want %d", got, over)
+	}
+	if got := dc.DropEvents(); got != 1 {
+		t.Fatalf("handle DropEvents()=%d, want 1", got)
+	}
+
+	// Simulate the mixer draining space; a fitting write must add no event.
+	sub.mu.Lock()
+	sub.buf.read(make([]byte, over))
+	sub.mu.Unlock()
+	if _, err := c.writeOutput(h1, make([]byte, over)); err != nil {
+		t.Fatalf("second writeOutput: %v", err)
+	}
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d after fitting write, want still 1", got)
+	}
+	if got := sub.dropBytes.Load(); got != over {
+		t.Fatalf("dropBytes=%d after fitting write, want still %d", got, over)
+	}
+}
+
+// TestInputSubscriber_DropEventsAlongsideDropCount verifies the capture-ring
+// dropEvents counter increments in lockstep with the existing dropCount using
+// the exact ringBuf.write byte accounting.
+func TestInputSubscriber_DropEventsAlongsideDropCount(t *testing.T) {
+	sub := newInputSubscriber(4) // 2ch (frameSize 4)
+	const over = 8
+
+	sub.push(make([]byte, sub.buf.cap()+over))
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d, want exactly 1", got)
+	}
+	if got := sub.dropCount.Load(); got != over {
+		t.Fatalf("dropCount=%d, want exactly %d (exact ring accounting)", got, over)
+	}
+
+	// A reader consumed `over` bytes; a fitting push must add no event.
+	sub.mu.Lock()
+	sub.buf.read(make([]byte, over))
+	sub.mu.Unlock()
+	sub.push(make([]byte, over))
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d after fitting push, want still 1", got)
+	}
+	if got := sub.dropCount.Load(); got != over {
+		t.Fatalf("dropCount=%d after fitting push, want still %d", got, over)
+	}
+}
+
+// TestDeviceStreamController_XRunHookExactness verifies the device-lifetime
+// XRun counters with a fake physical that captures its installed hook:
+// invoking the captured hook N times yields hwXrunsIn (input direction) or
+// hwXrunsOut (output direction) == N exactly, and non-implementing physicals
+// (ghost) are skipped without panic.
+func TestDeviceStreamController_XRunHookExactness(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	const invocations = 5
+
+	t.Run("input direction", func(t *testing.T) {
+		fake := &xrunCapableFake{}
+		c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-in", Direction: DirectionInput}, fake, 48000, 2, defaultGracePeriod)
+		defer c.close()
+
+		if fake.hook.Load() == nil {
+			t.Fatal("constructor did not install the XRun hook on the physical stream")
+		}
+		for i := 0; i < invocations; i++ {
+			fake.fire()
+		}
+		if got := c.hwXrunsIn.Load(); got != invocations {
+			t.Fatalf("hwXrunsIn=%d, want exactly %d", got, invocations)
+		}
+		if got := c.hwXrunsOut.Load(); got != 0 {
+			t.Fatalf("hwXrunsOut=%d, want 0 on an input-direction controller", got)
+		}
+		if got := fake.fires.Load(); got != invocations {
+			t.Fatalf("fake observed %d hook invocations, want %d", got, invocations)
+		}
+	})
+
+	t.Run("output direction", func(t *testing.T) {
+		fake := &xrunCapableFake{}
+		c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-out", Direction: DirectionOutput}, fake, 48000, 2, defaultGracePeriod)
+		defer c.close()
+
+		if fake.hook.Load() == nil {
+			t.Fatal("constructor did not install the XRun hook on the physical stream")
+		}
+		for i := 0; i < invocations; i++ {
+			fake.fire()
+		}
+		if got := c.hwXrunsOut.Load(); got != invocations {
+			t.Fatalf("hwXrunsOut=%d, want exactly %d", got, invocations)
+		}
+		if got := c.hwXrunsIn.Load(); got != 0 {
+			t.Fatalf("hwXrunsIn=%d, want 0 on an output-direction controller", got)
+		}
+	})
+
+	t.Run("non-implementing physical is skipped", func(t *testing.T) {
+		ghost := NewGhostAudioStream(48000, 2)
+		c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-ghost", Direction: DirectionInput}, ghost, 48000, 2, defaultGracePeriod)
+		defer c.close()
+		// Must not panic, and there is no hook to fire: counters stay 0.
+		if got := c.hwXrunsIn.Load(); got != 0 {
+			t.Fatalf("hwXrunsIn=%d for ghost physical, want 0", got)
+		}
+		if got := c.hwXrunsOut.Load(); got != 0 {
+			t.Fatalf("hwXrunsOut=%d for ghost physical, want 0", got)
+		}
+	})
+}
+
+// TestDeviceStreamController_XRunHookMonotonicAcrossSwaps verifies that
+// device-lifetime XRun totals are monotonic across swapPhysicalStream: the
+// new stream's hook is installed at swap time, and the old stream's hook is
+// intentionally never cleared, so a teardown-window XRun still counts.
+func TestDeviceStreamController_XRunHookMonotonicAcrossSwaps(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	a := &xrunCapableFake{}
+	b := &xrunCapableFake{}
+	c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-swap", Direction: DirectionInput}, a, 48000, 2, defaultGracePeriod)
+	defer c.close()
+
+	for i := 0; i < 3; i++ {
+		a.fire()
+	}
+
+	c.swapPhysicalStream(b)
+	if b.hook.Load() == nil {
+		t.Fatal("swapPhysicalStream did not install the XRun hook on the new stream")
+	}
+	for i := 0; i < 2; i++ {
+		b.fire()
+	}
+
+	// XRun in the teardown window of the old instance (hook never cleared).
+	a.fire()
+
+	if got := c.hwXrunsIn.Load(); got != 6 {
+		t.Fatalf("hwXrunsIn=%d, want exactly 6 (3+2+1: no reset, no double count)", got)
+	}
+}
+
+// TestDeviceResolver_ActiveControllerStats verifies the new resolver accessor
+// exposes, per active controller, URN, direction, ghost flag, and the
+// device-lifetime XRun values.
+func TestDeviceResolver_ActiveControllerStats(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	const urnName = "urn:test:stats-dev"
+	inKey := StreamKey{URN: urnName, Direction: DirectionInput}
+	outKey := StreamKey{URN: urnName, Direction: DirectionOutput}
+	ghostKey := StreamKey{URN: "urn:test:stats-ghost", Direction: DirectionOutput}
+
+	inFake := &xrunCapableFake{}
+	inCtrl := newDeviceStreamController(resolver, inKey, inFake, 48000, 2, defaultGracePeriod)
+	outCtrl := newDeviceStreamController(resolver, outKey, &xrunCapableFake{}, 48000, 2, defaultGracePeriod)
+	ghostCtrl := newDeviceStreamController(resolver, ghostKey, NewGhostAudioStream(48000, 2), 48000, 2, defaultGracePeriod)
+	defer func() {
+		_ = inCtrl.close()
+		_ = outCtrl.close()
+		_ = ghostCtrl.close()
+	}()
+
+	resolver.mu.Lock()
+	resolver.controllers[inKey] = inCtrl
+	resolver.controllers[outKey] = outCtrl
+	resolver.controllers[ghostKey] = ghostCtrl
+	resolver.mu.Unlock()
+
+	inFake.fire()
+	inFake.fire()
+
+	stats := resolver.ActiveControllerStats()
+	if len(stats) != 3 {
+		t.Fatalf("got %d controller stats, want 3", len(stats))
+	}
+
+	byKey := make(map[StreamKey]DeviceStreamStats, len(stats))
+	for _, s := range stats {
+		byKey[StreamKey{URN: s.URN, Direction: s.Direction}] = s
+	}
+
+	in, ok := byKey[inKey]
+	if !ok {
+		t.Fatalf("missing stats for %v", inKey)
+	}
+	if in.Ghost || in.HWXrunsIn != 2 || in.HWXrunsOut != 0 {
+		t.Fatalf("input stats = %+v, want Ghost=false HWXrunsIn=2 HWXrunsOut=0", in)
+	}
+
+	out, ok := byKey[outKey]
+	if !ok {
+		t.Fatalf("missing stats for %v", outKey)
+	}
+	if out.Ghost || out.HWXrunsIn != 0 || out.HWXrunsOut != 0 {
+		t.Fatalf("output stats = %+v, want Ghost=false and zero XRuns", out)
+	}
+
+	gh, ok := byKey[ghostKey]
+	if !ok {
+		t.Fatalf("missing stats for %v", ghostKey)
+	}
+	if !gh.Ghost {
+		t.Fatalf("ghost stats = %+v, want Ghost=true", gh)
+	}
+}
+
+// TestDeviceStreamController_XRunHookRaceUnderSwap must pass under
+// `go test -race`: one goroutine fires the installed hook in a loop while
+// another repeatedly swaps the physical stream. The final device-lifetime
+// count must equal the total number of hook invocations exactly (no lost or
+// double-counted XRuns, no reset).
+func TestDeviceStreamController_XRunHookRaceUnderSwap(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	const nFakes = 8
+	fakes := make([]*xrunCapableFake, nFakes)
+	for i := range fakes {
+		fakes[i] = &xrunCapableFake{}
+	}
+
+	c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-race", Direction: DirectionOutput}, fakes[0], 48000, 2, defaultGracePeriod)
+	defer c.close()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Swapper: cycles the physical stream among the fakes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c.swapPhysicalStream(fakes[i%nFakes])
+		}
+	}()
+
+	// Fire workers: read the current physical stream and fire its captured
+	// hook as fast as possible.
+	const workers = 4
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if f, ok := c.getPhysicalStream().(*xrunCapableFake); ok {
+					f.fire()
+				}
+			}
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	var totalInvocations uint64
+	for _, f := range fakes {
+		totalInvocations += f.fires.Load()
+	}
+	if totalInvocations == 0 {
+		t.Fatal("no hook invocations observed; test did not exercise the race")
+	}
+	if got := c.hwXrunsOut.Load(); got != totalInvocations {
+		t.Fatalf("hwXrunsOut=%d, total hook invocations=%d: lost or double-counted XRuns", got, totalInvocations)
+	}
+	if got := c.hwXrunsIn.Load(); got != 0 {
+		t.Fatalf("hwXrunsIn=%d, want 0 on an output-direction controller", got)
 	}
 }

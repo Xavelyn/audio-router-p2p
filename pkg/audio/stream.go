@@ -40,17 +40,24 @@ func newRingBuf(capacity, frameSize int) *ringBuf {
 }
 
 // write appends p, dropping the oldest data (in whole frames) when full.
-func (r *ringBuf) write(p []byte) {
+// It returns the exact number of bytes dropped from the oldest side by this
+// call (0 when the write fits): the truncation of an oversized write (only
+// the newest cap bytes are kept, so len(p)-cap bytes are dropped up front)
+// plus every frame removed by dropFrame to make room (frameSize bytes each,
+// or the remaining partial n when it is the only data in the ring).
+func (r *ringBuf) write(p []byte) int {
 	if len(p) == 0 {
-		return
+		return 0
 	}
+	dropped := 0
 	// A single write larger than the ring can never fit in full: keep the
 	// newest cap bytes.
 	if len(p) >= r.cap() {
+		dropped += len(p) - r.cap()
 		p = p[len(p)-r.cap():]
 	}
 	for len(p) > r.cap()-r.n {
-		r.dropFrame()
+		dropped += r.dropFrame()
 	}
 	pos := (r.start + r.n) % r.cap()
 	first := r.cap() - pos
@@ -61,6 +68,7 @@ func (r *ringBuf) write(p []byte) {
 		copy(r.data[:len(p)-first], p[first:])
 	}
 	r.n += len(p)
+	return dropped
 }
 
 // read copies up to len(dst) bytes into dst, aligned to frame boundaries, and
@@ -95,8 +103,9 @@ func (r *ringBuf) read(dst []byte) int {
 }
 
 // dropFrame removes a single frame (rounded to the next full frame) from the
-// oldest side of the buffer.
-func (r *ringBuf) dropFrame() {
+// oldest side of the buffer. It returns the number of bytes removed:
+// frameSize, or the remaining partial n when it is the only data in the ring.
+func (r *ringBuf) dropFrame() int {
 	n := r.frameSize
 	if n < 1 {
 		n = 1
@@ -109,6 +118,7 @@ func (r *ringBuf) dropFrame() {
 	if r.n == 0 {
 		r.start = 0
 	}
+	return n
 }
 
 func (r *ringBuf) cap() int { return len(r.data) }
@@ -171,6 +181,8 @@ func (e *emulatorInput) produce() {
 			}
 		}
 		chunk = append(chunk[:0], block...)
+		// Emulator drops are not artifacts of a real device; the exact
+		// dropped-byte return value is intentionally ignored here.
 		e.buf.write(chunk)
 		e.cond.Broadcast()
 		e.mu.Unlock()

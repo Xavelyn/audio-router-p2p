@@ -53,13 +53,21 @@ type V1Server struct {
 	devReg    *DeviceRegistry
 	startTime time.Time
 
-	aggregator *netTelemetry.Aggregator
-	clusterMgr *cluster.Manager
+	aggregator         *netTelemetry.Aggregator
+	artifactAggregator *netTelemetry.ArtifactAggregator
+	clusterMgr         *cluster.Manager
 }
 
 // SetAggregator configures the central network telemetry aggregator.
 func (s *V1Server) SetAggregator(agg *netTelemetry.Aggregator) {
 	s.aggregator = agg
+}
+
+// SetArtifactAggregator configures the audio artifact telemetry aggregator
+// (ADR 0034). When unset, stream-stats omits health/devices (byte-compatible)
+// and device-artifacts returns an empty object.
+func (s *V1Server) SetArtifactAggregator(agg *netTelemetry.ArtifactAggregator) {
+	s.artifactAggregator = agg
 }
 
 // SetClusterManager configures the cluster manager.
@@ -220,6 +228,7 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	// Telemetry & Diagnostics
 	mux.HandleFunc("/api/v1/network/health", s.AuthMiddleware(s.handleNetworkHealth))
 	mux.HandleFunc("/api/v1/telemetry/stream-stats", s.AuthMiddleware(s.handleTelemetryStreamStats))
+	mux.HandleFunc("/api/v1/telemetry/device-artifacts", s.AuthMiddleware(s.handleTelemetryDeviceArtifacts))
 	mux.HandleFunc("/api/v1/telemetry/meters", s.AuthMiddleware(s.handleTelemetryMetersSSE))
 	mux.HandleFunc("/api/v1/telemetry/ws", s.handleTelemetryWebSocket)
 }
