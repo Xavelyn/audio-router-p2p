@@ -3,6 +3,13 @@ import { SSEManager } from '$lib/api/sse';
 import { TelemetryWebSocket } from '$lib/api/ws';
 import { authStore } from './auth.svelte';
 
+// Displayed-level ballistics (studio VU behavior): fast attack, slow release.
+// Smoothing is applied once when a meter frame is written into the store;
+// all consumers (bars, needles, readouts) read the already-smoothed values.
+const SILENCE_FLOOR_DB = -96;
+const METER_ATTACK_MS = 40;
+const METER_RELEASE_MS = 400;
+
 export interface ChannelState {
   channel: number;
   rmsDb: number;
@@ -90,6 +97,19 @@ class MeterStore {
     this.sse.connect();
   }
 
+  // Exponential ballistics filter for displayed dB values: rises fast when the
+  // level increases (attack), falls slowly when it decreases (release). dtMs is
+  // the time since the previous write for this channel, so the smoothing is
+  // independent of the actual frame rate.
+  private smoothLevel(prev: number | undefined, next: number, dtMs: number): number {
+    if (prev === undefined || !Number.isFinite(prev) || !Number.isFinite(next)) return next;
+    if (next === prev) return next;
+    const tau = next > prev ? METER_ATTACK_MS : METER_RELEASE_MS;
+    const alpha = dtMs <= 0 ? 1 : Math.min(1, 1 - Math.exp(-dtMs / tau));
+    const out = prev + (next - prev) * alpha;
+    return out < SILENCE_FLOOR_DB ? SILENCE_FLOOR_DB : out;
+  }
+
   public handleMeterFrame(frame: MeterFrame) {
     if (frame.closed) {
       if (this.streams[frame.stream_id]) {
@@ -109,10 +129,14 @@ class MeterStore {
       const prev = prevChannels.find((p) => p.channel === ch.channel);
       const prevPeakHold = prev?.peakHoldDb ?? -96;
       const prevClipHold = prev?.clipHoldUntil ?? 0;
+      const dtMs = prev ? Math.max(0, now - prev.lastUpdated) : 0;
+
+      // Smooth the displayed level with attack/release ballistics.
+      const rmsDb = this.smoothLevel(prev?.rmsDb, ch.rms_dbfs, dtMs);
+      const peakDb = this.smoothLevel(prev?.peakDb, ch.peak_dbfs, dtMs);
 
       // Peak hold logic: hold peak if new peak is higher, or slowly drop
-      const newPeak = ch.peak_dbfs;
-      let peakHold = Math.max(newPeak, prevPeakHold);
+      const peakHold = Math.max(peakDb, prevPeakHold);
 
       // Clip indicator hold (light stays lit for 1.2s on clip)
       let clipHold = prevClipHold;
@@ -122,8 +146,8 @@ class MeterStore {
 
       return {
         channel: ch.channel,
-        rmsDb: ch.rms_dbfs,
-        peakDb: ch.peak_dbfs,
+        rmsDb,
+        peakDb,
         peakHoldDb: peakHold,
         clipped: now < clipHold,
         clipHoldUntil: clipHold,

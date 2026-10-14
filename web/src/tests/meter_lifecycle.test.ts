@@ -132,5 +132,40 @@ describe('ADR-0026: Meter Telemetry Lifecycle and Deterministic Binding', () => 
       expect(meterStore.streams['room-conf-nodeA-mic1-nodeB-spk1'].channels[0].peakDb).toBe(-12.0);
       expect(meterStore.streams['room-conf-nodeA-mic1-nodeB-spk1:out'].channels[0].peakDb).toBe(-14.0);
     });
+
+    it('smooths displayed dB with fast attack / slow release ballistics', () => {
+      const frame = (rms: number, peak: number): MeterFrame => ({
+        stream_id: 'smooth-stream',
+        timestamp_ns: Date.now() * 1000000,
+        dtx_state: 'Active',
+        channels: [
+          { channel: 0, rms_dbfs: rms, peak_dbfs: peak, clipped: false },
+        ],
+      });
+
+      // First write is raw (no previous state to smooth from)
+      vi.setSystemTime(1000);
+      meterStore.handleMeterFrame(frame(-60, -55));
+      expect(meterStore.streams['smooth-stream'].channels[0].peakDb).toBe(-55);
+      expect(meterStore.streams['smooth-stream'].channels[0].rmsDb).toBe(-60);
+
+      // Level jumps up: fast attack must move well past the midpoint but not
+      // overshoot the raw value
+      vi.setSystemTime(1033);
+      meterStore.handleMeterFrame(frame(-10, -5));
+      let ch = meterStore.streams['smooth-stream'].channels[0];
+      expect(ch.peakDb).toBeGreaterThan(-30);
+      expect(ch.peakDb).toBeLessThan(-5);
+      expect(ch.rmsDb).toBeGreaterThan(-35);
+      expect(ch.rmsDb).toBeLessThan(-10);
+
+      // Level drops: slow release must only step down a small amount, far
+      // from the raw -60 value
+      vi.setSystemTime(1066);
+      meterStore.handleMeterFrame(frame(-70, -60));
+      ch = meterStore.streams['smooth-stream'].channels[0];
+      expect(ch.peakDb).toBeGreaterThan(-33);
+      expect(ch.peakDb).toBeLessThan(-26);
+    });
   });
 });
