@@ -116,10 +116,22 @@ func (s *V1Server) handleTelemetryMetersSSE(w http.ResponseWriter, r *http.Reque
 	defer s.hub.Unsubscribe(sub)
 
 	ctx := r.Context()
+
+	// Periodic SSE keepalive comment. The hub stays silent when no taps are
+	// registered, so without this idle connections can be reaped by intermediaries
+	// and peers cannot detect dead links promptly.
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-keepalive.C:
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case msg, ok := <-sub.Ch:
 			if !ok {
 				return

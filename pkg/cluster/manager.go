@@ -65,6 +65,12 @@ type Manager struct {
 	disc       DiscoveryProvider
 	httpClient *http.Client
 
+	// relayHTTPClient is dedicated to long-lived peer telemetry SSE streams.
+	// It intentionally has NO overall request timeout (unlike httpClient which
+	// is bounded by ScrapeTimeout); a global timeout would kill the streaming
+	// connection every ScrapeTimeout and cause periodic meter gaps in the UI.
+	relayHTTPClient *http.Client
+
 	// Lock-free read plane for O(1) instant UI/API queries
 	snapshot atomic.Pointer[ClusterSnapshot]
 
@@ -107,17 +113,21 @@ func NewManager(cfg Config, local LocalNodeProvider, disc DiscoveryProvider, cus
 	}
 
 	var client *http.Client
+	// Shared transport for all cluster HTTP traffic. Note: http.Client.Timeout
+	// is per-client, so a bounded scrape client and an unbounded relay client
+	// can safely share the same transport.
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Allow self-signed certificates inside mesh
+		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	relayClient := &http.Client{Transport: tr} // No Timeout: long-lived SSE streams
 	if len(customClient) > 0 && customClient[0] != nil {
 		client = customClient[0]
 	} else {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow self-signed certificates inside mesh
-			},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		}
 		client = &http.Client{
 			Transport: tr,
 			Timeout:   cfg.ScrapeTimeout + 500*time.Millisecond,
@@ -125,10 +135,11 @@ func NewManager(cfg Config, local LocalNodeProvider, disc DiscoveryProvider, cus
 	}
 
 	m := &Manager{
-		cfg:          cfg,
-		local:        local,
-		disc:         disc,
-		httpClient:   client,
+		cfg:             cfg,
+		local:           local,
+		disc:            disc,
+		httpClient:      client,
+		relayHTTPClient: relayClient,
 		peerFailures: make(map[string]int),
 		circuitOpen:  make(map[string]time.Time),
 		peerStreams:  make(map[string]context.CancelFunc),
@@ -997,7 +1008,7 @@ func (m *Manager) runPeerTelemetryStream(ctx context.Context, peerID, apiAddr st
 		req.Header.Set("Accept", "text/event-stream")
 		req.Header.Set("X-Cluster-Relay", "true")
 
-		resp, err := m.httpClient.Do(req)
+		resp, err := m.relayHTTPClient.Do(req)
 		if err != nil {
 			select {
 			case <-ctx.Done():

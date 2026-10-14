@@ -712,3 +712,88 @@ func TestClusterManager_PeerTelemetryRelay(t *testing.T) {
 		}
 	}
 }
+
+func TestClusterManager_RelayClientHasNoTimeout(t *testing.T) {
+	local := &mockLocalNode{nodeID: "local-node"}
+	disc := newMockDiscovery("local-node")
+	mgr := NewManager(Config{ScrapeTimeout: 300 * time.Millisecond}, local, disc)
+	defer mgr.Close()
+
+	if mgr.relayHTTPClient == nil {
+		t.Fatal("relayHTTPClient must be initialized")
+	}
+	if mgr.relayHTTPClient.Timeout != 0 {
+		t.Fatalf("relayHTTPClient must have no overall timeout for long-lived SSE streams, got %v", mgr.relayHTTPClient.Timeout)
+	}
+	if mgr.httpClient.Timeout <= 0 {
+		t.Fatal("scrape httpClient must keep its bounded timeout")
+	}
+}
+
+// TestClusterManager_RelaySSE_SurvivesScrapeTimeout guards against the regression where
+// the relay SSE connection was issued through the scrape client (bounded by
+// ScrapeTimeout), causing the stream to be killed and re-established at fixed
+// intervals. The peer sends exactly one frame then holds the connection; a healthy
+// relay must keep the single connection alive instead of reconnecting (which would
+// produce a second frame).
+func TestClusterManager_RelaySSE_SurvivesScrapeTimeout(t *testing.T) {
+	peerMux := http.NewServeMux()
+	peerMux.HandleFunc("/api/v1/telemetry/meters", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "no flusher", 500)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+
+		fmt.Fprintf(w, "event: meter\ndata: {\"stream_id\":\"hold-stream\"}\n\n")
+		flusher.Flush()
+
+		// Hold the connection open until the client disconnects
+		<-r.Context().Done()
+	})
+	peerMux.HandleFunc("/api/v1/network/health", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(telemetry.NetworkHealthSnapshot{HealthScore: 100})
+	})
+	peerMux.HandleFunc("/api/v1/devices", func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]AudioDeviceSummary{})
+	})
+
+	peerServer := httptest.NewServer(peerMux)
+	defer peerServer.Close()
+
+	local := &mockLocalNode{nodeID: "local-node"}
+	disc := newMockDiscovery("local-node")
+	disc.addPeer(discovery.Peer{
+		ID:       "remote-peer-1",
+		APIAddr:  peerServer.URL,
+		LastSeen: time.Now(),
+	}, "alive")
+
+	broadcaster := newMockBroadcaster()
+	mgr := NewManager(Config{
+		ScrapeInterval: 100 * time.Millisecond,
+		ScrapeTimeout:  300 * time.Millisecond,
+	}, local, disc)
+	mgr.SetTelemetryBroadcaster(broadcaster)
+	defer mgr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	mgr.Start(ctx)
+
+	// Wait long enough for several old-behavior kill/reconnect cycles (800ms
+	// timeout + 1s backoff) to have produced duplicate frames if the regression
+	// were present.
+	time.Sleep(3 * time.Second)
+
+	broadcaster.mu.Lock()
+	count := len(broadcaster.payloads)
+	broadcaster.mu.Unlock()
+
+	if count != 1 {
+		t.Fatalf("expected exactly 1 relayed frame from a stable SSE connection, got %d (connection is being killed and re-established periodically)", count)
+	}
+}
