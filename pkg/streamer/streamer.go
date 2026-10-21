@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -142,6 +143,8 @@ type Streamer struct {
 	mu       sync.Mutex
 	started  bool
 	output   audio.AudioStream
+	mixPCM   []byte
+	mixAccum []int32
 	stopCh   chan struct{}
 	stopOnce sync.Once
 	errCh    chan error
@@ -528,8 +531,10 @@ func (s *Streamer) playout() {
 	s.peersMu.RLock()
 	defer s.peersMu.RUnlock()
 
+	var first []byte
+	contributors := 0
 	for _, peer := range s.peers {
-		if peer.JitterBuf == nil {
+		if peer.JitterBuf == nil || peer.Output == nil {
 			continue
 		}
 		data, _, err := peer.JitterBuf.PopNonBlock()
@@ -537,31 +542,63 @@ func (s *Streamer) playout() {
 			continue // underrun, silence
 		}
 
-		if peer.Output != nil {
-			playData := data
-			if peer.ASRC != nil {
-				ratio := 1.0
-				if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
-					ratio = jb.driftCtrl.Ratio()
-				}
-				// Deadband: engage ASRC resampling when ratio diverges by > 1.0 ppm (1.0e-6).
-				// Preserves exact byte nominal passthrough under negligible jitter/noise.
-				if math.Abs(ratio-1.0) > 1.0e-6 {
-					needed := len(data)*2 + 64
-					if len(peer.asrcOutBuf) < needed {
-						peer.asrcOutBuf = make([]byte, needed)
-					}
-					n := peer.ASRC.Process(data, peer.asrcOutBuf, ratio)
-					if n > 0 {
-						playData = peer.asrcOutBuf[:n]
-					}
-				}
+		playData := data
+		if peer.ASRC != nil {
+			ratio := 1.0
+			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
+				ratio = jb.driftCtrl.Ratio()
 			}
-
-			if _, err := peer.Output.Write(playData); err != nil {
-				log.Printf("streamer: output write error: %v", err)
+			if math.Abs(ratio-1.0) > 1.0e-6 {
+				needed := len(data)*2 + 64
+				if len(peer.asrcOutBuf) < needed {
+					peer.asrcOutBuf = make([]byte, needed)
+				}
+				n := peer.ASRC.Process(data, peer.asrcOutBuf, ratio)
+				if n > 0 {
+					playData = peer.asrcOutBuf[:n]
+				}
 			}
 		}
+		if contributors == 0 {
+			first = playData
+			contributors = 1
+			continue
+		}
+		// Accumulate in wider samples; clamp only after all contributors.
+		if contributors == 1 {
+			if len(s.mixAccum) < len(first)/2 {
+				s.mixAccum = make([]int32, len(first)/2)
+			}
+			for i := 0; i < len(first)/2; i++ {
+				s.mixAccum[i] = int32(int16(binary.LittleEndian.Uint16(first[2*i:])))
+			}
+		}
+		// ASRC may produce slightly different lengths. Mix the common part.
+		for i := 0; i < len(playData)/2 && i < len(first)/2; i++ {
+			s.mixAccum[i] += int32(int16(binary.LittleEndian.Uint16(playData[2*i:])))
+		}
+		contributors++
+	}
+	if contributors == 0 || s.output == nil {
+		return
+	}
+	if contributors > 1 {
+		if len(s.mixPCM) < len(first) {
+			s.mixPCM = make([]byte, len(first))
+		}
+		for i := 0; i < len(first)/2; i++ {
+			v := s.mixAccum[i]
+			if v > 32767 {
+				v = 32767
+			} else if v < -32768 {
+				v = -32768
+			}
+			binary.LittleEndian.PutUint16(s.mixPCM[2*i:], uint16(int16(v)))
+		}
+		first = s.mixPCM[:len(first)]
+	}
+	if _, err := s.output.Write(first); err != nil {
+		log.Printf("streamer: output write error: %v", err)
 	}
 }
 
