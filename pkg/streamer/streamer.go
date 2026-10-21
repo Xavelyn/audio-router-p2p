@@ -82,6 +82,7 @@ type RemotePeer struct {
 	FECDecoder     *transport.FECDecoder
 	ASRC           *dsp.ASRCResampler
 	asrcOutBuf     []byte
+	lastPacket     time.Time // guarded by Streamer.peersMu for dynamically learned peers
 
 	// Telemetry atomic accumulators for lock-free interrogation
 	packetsSent  atomic.Uint64
@@ -106,25 +107,27 @@ type FECConfig struct {
 
 // StreamConfig holds configuration for a stream session.
 type StreamConfig struct {
-	SampleRate    int
-	Channels      int
-	PacketTime    int // ms per packet
-	JitterBufSize int // frames
-	MinDelay      time.Duration
-	MaxDelay      time.Duration
-	DTX           dsp.DTXConfig
-	FEC           FECConfig
+	SampleRate      int
+	Channels        int
+	PacketTime      int // ms per packet
+	JitterBufSize   int // frames
+	MinDelay        time.Duration
+	MaxDelay        time.Duration
+	PeerIdleTimeout time.Duration // expiry for dynamically learned receive-only peers
+	DTX             dsp.DTXConfig
+	FEC             FECConfig
 }
 
 func DefaultStreamConfig(sampleRate, channels int) StreamConfig {
 	return StreamConfig{
-		SampleRate:    sampleRate,
-		Channels:      channels,
-		PacketTime:    20,
-		JitterBufSize: 200,
-		MinDelay:      20 * time.Millisecond,
-		MaxDelay:      200 * time.Millisecond,
-		DTX:           dsp.DefaultDTXConfig(),
+		SampleRate:      sampleRate,
+		Channels:        channels,
+		PacketTime:      20,
+		JitterBufSize:   200,
+		MinDelay:        20 * time.Millisecond,
+		MaxDelay:        200 * time.Millisecond,
+		PeerIdleTimeout: 5 * time.Second,
+		DTX:             dsp.DefaultDTXConfig(),
 		FEC: FECConfig{
 			Enabled:   false,
 			GroupSize: 4,
@@ -220,6 +223,9 @@ func NewStreamer(trans Transport, localIPs []string, config StreamConfig, localN
 	}
 	if config.Channels < 1 {
 		return nil, errors.New("streamer: channel count must be positive")
+	}
+	if config.PeerIdleTimeout <= 0 {
+		config.PeerIdleTimeout = 5 * time.Second
 	}
 	if config.DTX == (dsp.DTXConfig{}) {
 		config.DTX = dsp.DefaultDTXConfig()
@@ -516,6 +522,15 @@ func (s *Streamer) recvLoop(stopCh chan struct{}) {
 	// Combine all jitter buffers - we play out at the rate of the first peer
 	ticker := time.NewTicker(time.Duration(s.config.PacketTime) * time.Millisecond)
 	defer ticker.Stop()
+	cleanupEvery := s.config.PeerIdleTimeout / 2
+	if cleanupEvery > time.Second {
+		cleanupEvery = time.Second
+	}
+	if cleanupEvery < 10*time.Millisecond {
+		cleanupEvery = 10 * time.Millisecond
+	}
+	cleanup := time.NewTicker(cleanupEvery)
+	defer cleanup.Stop()
 
 	for {
 		select {
@@ -523,6 +538,30 @@ func (s *Streamer) recvLoop(stopCh chan struct{}) {
 			return
 		case <-ticker.C:
 			s.playout()
+		case <-cleanup.C:
+			s.expireIdlePeers(time.Now())
+		}
+	}
+}
+
+// expireIdlePeers releases receive-only peers learned from the wire. Configured
+// destinations have a different direction and must survive periods of silence.
+func (s *Streamer) expireIdlePeers(now time.Time) {
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	s.expireIdlePeersLocked(now)
+}
+
+// Caller holds peersMu; also used before admitting a new sender so expired
+// entries cannot keep the bounded peer table full until the next timer tick.
+func (s *Streamer) expireIdlePeersLocked(now time.Time) {
+	for addr, peer := range s.peers {
+		if peer.Direction != DirRecvOnly || peer.lastPacket.IsZero() || now.Sub(peer.lastPacket) <= s.config.PeerIdleTimeout {
+			continue
+		}
+		delete(s.peers, addr)
+		if peer.JitterBuf != nil {
+			_ = peer.JitterBuf.Close()
 		}
 	}
 }
@@ -616,15 +655,24 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	s.mu.Unlock()
 
 	peerAddr := addr.String()
-	s.peersMu.RLock()
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
 	peer, ok := s.peers[peerAddr]
-	s.peersMu.RUnlock()
 
 	// An address may carry several routes over a shared socket. A known peer
 	// address never overrides the session ID check. The zero ID is retained as
 	// an explicit accept-all mode for callers that intentionally request it.
 	if sid != emptyID && hdr.StreamID != sid {
 		return // not for us
+	}
+	// A sender can restart with sequence zero on the same UDP address. Start
+	// with fresh jitter, FEC and sequence state after a genuine idle period.
+	if ok && peer.Direction == DirRecvOnly && !peer.lastPacket.IsZero() && time.Since(peer.lastPacket) > s.config.PeerIdleTimeout {
+		delete(s.peers, peerAddr)
+		if peer.JitterBuf != nil {
+			_ = peer.JitterBuf.Close()
+		}
+		ok = false
 	}
 
 	if !ok {
@@ -666,27 +714,14 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 			asrcOutBuf:     make([]byte, packetBytes*2+64),
 		}
 
-		s.peersMu.Lock()
-		if existing, exists := s.peers[peerAddr]; exists {
-			peer = existing
-			if peer.FECDecoder == nil {
-				peer.FECDecoder, _ = transport.NewFECDecoder(fecGroupSize, packetBytes)
-			}
-			if peer.ASRC == nil {
-				peer.ASRC = dsp.NewASRCResampler(s.config.Channels)
-			}
-			if len(peer.asrcOutBuf) == 0 {
-				peer.asrcOutBuf = make([]byte, packetBytes*2+64)
-			}
-		} else {
-			const maxDynamicPeers = 64
+		const maxDynamicPeers = 64
+		if len(s.peers) >= maxDynamicPeers {
+			s.expireIdlePeersLocked(time.Now())
 			if len(s.peers) >= maxDynamicPeers {
-				s.peersMu.Unlock()
 				return
 			}
-			s.peers[peerAddr] = peer
 		}
-		s.peersMu.Unlock()
+		s.peers[peerAddr] = peer
 	}
 
 	s.packetsRecv.Add(1)
@@ -712,6 +747,9 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	if (hdr.Flags & transport.FlagFEC) != 0 {
 		s.fecParityRecv.Add(1)
 		reconstructed, err := peer.FECDecoder.ProcessParity(payload)
+		if err == nil && peer.Direction == DirRecvOnly {
+			peer.lastPacket = time.Now()
+		}
 		if err == nil && len(reconstructed) > 0 {
 			for _, rec := range reconstructed {
 				s.fecRecovered.Add(1)
@@ -768,6 +806,11 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 			log.Printf("streamer: jitter buffer push error: %v", err)
 		} else if dropped > 0 {
 			log.Printf("streamer: jitter buffer overrun for %s", peerAddr)
+			if peer.Direction == DirRecvOnly {
+				peer.lastPacket = time.Now()
+			}
+		} else if peer.Direction == DirRecvOnly {
+			peer.lastPacket = time.Now()
 		}
 	}
 }

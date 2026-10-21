@@ -89,3 +89,9 @@ They pause while that peer has no advertised stream endpoint and resume at its
 new endpoint without reopening capture. Routes using only explicit destination
 addresses remain static. This does not reconnect the single-peer DTLS
 transport; DTLS still requires a new connection when its peer moves or restarts.
+
+Receivers remove dynamically learned senders after five seconds without valid
+audio packets (configurable with `StreamConfig.PeerIdleTimeout` for embedded
+streamers). A returning sender gets fresh jitter/FEC and sequence state, so a
+restart at the same UDP address does not stay stuck behind the old sequence.
+Configured destinations are not expired by this receiver-side cleanup.
