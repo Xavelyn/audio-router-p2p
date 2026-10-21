@@ -87,8 +87,18 @@ between independent network sources.
 UDP send-only routes bound to a `peerId` now follow discovery's stream address.
 They pause while that peer has no advertised stream endpoint and resume at its
 new endpoint without reopening capture. Routes using only explicit destination
-addresses remain static. This does not reconnect the single-peer DTLS
-transport; DTLS still requires a new connection when its peer moves or restarts.
+addresses remain static.
+
+DTLS (encrypt mode) reconnects automatically when its peer restarts: a
+closing peer sends a close notification, and a crashed or silent peer is
+detected after several missed keepalives (both roles exchange a small
+keepalive datagram every 3 s). The client role redials with exponential
+backoff (250 ms to 2 s) and the server role re-accepts on its existing
+socket; audio pauses for the gap and then resumes. The client dials the
+peer address from the route table, so a peer that moves to a *different*
+address still requires a route update. The DTLS role is set with
+`--dtls-role=server|client` (default `server`); a pair must use opposite
+roles, and the client role requires exactly one resolvable peer address.
 
 Receivers remove dynamically learned senders after five seconds without valid
 audio packets (configurable with `StreamConfig.PeerIdleTimeout` for embedded

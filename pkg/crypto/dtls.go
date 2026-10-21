@@ -245,6 +245,9 @@ func (l *DTLSListener) Close() error {
 	return l.listener.Close()
 }
 
+// Addr is the bound address, available before a peer connects.
+func (l *DTLSListener) Addr() net.Addr { return l.listener.Addr() }
+
 func buildDTLSConfig(cfg *DTLSConfig) (*dtls.Config, error) {
 	var cert *tls.Certificate
 	if cfg.CertFile != "" && cfg.KeyFile != "" {

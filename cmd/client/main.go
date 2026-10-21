@@ -86,7 +86,7 @@ func main() {
 			CertFile:   cfg.CertFile,
 			KeyFile:    cfg.KeyFile,
 			PSK:        psk,
-			IsServer:   true, // server role: accept the peer's DTLS connection
+			IsServer:   cfg.DTLSRole != "client", // the other node must use the opposite role
 		}
 		trans, err = transport.NewDTLSTransport(dtlsCfg)
 		if err != nil {

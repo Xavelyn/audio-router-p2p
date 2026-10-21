@@ -15,10 +15,11 @@ type Config struct {
 	ListenAddr  string
 	CertFile    string
 	KeyFile     string
-	NoTLS       bool   // disable TLS and serve plain HTTP
+	NoTLS       bool // disable TLS and serve plain HTTP
 	AuthToken   string
 	UseEmulator bool   // true when running with the -use-emulator flag or the noaudio build
 	Encrypt     bool   // enable DTLS/SRTP encryption for audio streams
+	DTLSRole    string // server or client; a pair must use opposite roles
 	PSK         string // Pre-shared key for DTLS (base64 encoded)
 	RoutesFile  string // Path to the JSON routes file
 
@@ -67,6 +68,7 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.StringVar(&cfg.AuthToken, "auth-token", "", "Authentication token for the API and peer handshakes")
 	fs.BoolVar(&cfg.UseEmulator, "use-emulator", false, "Use the audio emulator instead of real devices")
 	fs.BoolVar(&cfg.Encrypt, "encrypt", false, "Enable DTLS/SRTP encryption for audio streams")
+	fs.StringVar(&cfg.DTLSRole, "dtls-role", "server", "DTLS role: server or client (peers must use opposite roles)")
 	fs.StringVar(&cfg.PSK, "psk", "", "Pre-shared key for DTLS encryption (base64 encoded)")
 	fs.StringVar(&cfg.RoutesFile, "routes", "routes.json", "Path to the JSON routes file")
 
@@ -120,6 +122,9 @@ func LoadFromArgs(args []string) (*Config, error) {
 
 	if cfg.AuthToken == "" {
 		return nil, fmt.Errorf("auth-token is required")
+	}
+	if cfg.DTLSRole != "server" && cfg.DTLSRole != "client" {
+		return nil, fmt.Errorf("dtls-role must be server or client")
 	}
 	if cfg.AnnounceInterval <= 0 || cfg.PeerTTL <= 0 || cfg.SyncInterval <= 0 {
 		return nil, fmt.Errorf("announce-interval, peer-ttl and sync-interval must be positive")
