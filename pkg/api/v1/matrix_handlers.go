@@ -3,12 +3,34 @@ package v1
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/audio-router-p2p/pkg/router"
 )
+
+// Live matrix updates are optional for stream-manager implementations used by
+// API consumers and tests. The daemon implements this without restarting I/O.
+type liveMatrixUpdater interface {
+	UpdateMatrix(router.MatrixRoute) error
+}
+
+func (s *V1Server) updateLiveMatrix(mr router.MatrixRoute) error {
+	if updater, ok := s.streams.(liveMatrixUpdater); ok {
+		return updater.UpdateMatrix(mr)
+	}
+	return nil
+}
+
+func (s *V1Server) restoreMatrix(mr router.MatrixRoute) {
+	if err := s.router.AddMatrix(mr); err != nil {
+		// Keep the original failure visible to the caller, but record rollback
+		// failures so a persisted/live mismatch does not go unnoticed.
+		log.Printf("route %s: matrix rollback failed: %v", mr.ID, err)
+	}
+}
 
 // handleRoutes handles GET /api/v1/routes and POST /api/v1/routes.
 func (s *V1Server) handleRoutes(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +176,7 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 		if slewMS <= 0 {
 			slewMS = 20.0
 		}
+		old, _ := s.router.GetMatrix(routeID)
 		mr, err := s.router.UpdateCrosspoint(routeID, req.OutChannel, req.InChannel, req.Gain, slewMS)
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
@@ -161,6 +184,11 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 			} else {
 				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_CROSSPOINT", err.Error())
 			}
+			return
+		}
+		if err := s.updateLiveMatrix(mr); err != nil {
+			s.restoreMatrix(old)
+			s.WriteError(w, http.StatusConflict, "ERR_LIVE_ROUTE", err.Error())
 			return
 		}
 		s.WriteJSON(w, http.StatusOK, mr)
@@ -186,7 +214,8 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if _, found := s.router.GetMatrix(routeID); !found {
+		old, found := s.router.GetMatrix(routeID)
+		if !found {
 			s.WriteError(w, http.StatusNotFound, "ERR_NOT_FOUND", "route not found")
 			return
 		}
@@ -230,6 +259,13 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 			s.WriteError(w, http.StatusInternalServerError, "ERR_SAVE_ROUTE", err.Error())
 			return
 		}
+		if s.streams != nil {
+			if err := s.streams.StartRoute(router.MatrixRouteToStreamRoute(mr)); err != nil {
+				_ = s.router.AddMatrix(old)
+				s.WriteError(w, http.StatusConflict, "ERR_STREAM_START", err.Error())
+				return
+			}
+		}
 		s.WriteJSON(w, http.StatusOK, mr)
 
 	case http.MethodPatch:
@@ -239,6 +275,7 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
 			return
 		}
+		old, _ := s.router.GetMatrix(routeID)
 		mr, err := s.router.PatchMatrix(routeID, req.Name, req.Coefficients, req.SlewMS, req.Muted)
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
@@ -246,6 +283,11 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 			} else {
 				s.WriteError(w, http.StatusBadRequest, "ERR_PATCH_ROUTE", err.Error())
 			}
+			return
+		}
+		if err := s.updateLiveMatrix(mr); err != nil {
+			s.restoreMatrix(old)
+			s.WriteError(w, http.StatusConflict, "ERR_LIVE_ROUTE", err.Error())
 			return
 		}
 		s.WriteJSON(w, http.StatusOK, mr)

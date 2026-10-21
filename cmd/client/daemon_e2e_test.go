@@ -349,6 +349,39 @@ func TestDaemonAPI_DynamicRouteMatrixE2E(t *testing.T) {
 	if updatedRoute.Coefficients[0] != 0.5 {
 		t.Errorf("expected coefficient[0] = 0.5, got %f", updatedRoute.Coefficients[0])
 	}
+	active := node1.streams.routes[updatedRoute.ID]
+	if active == nil || active.matrix == nil {
+		t.Fatal("API route has no live matrix processor")
+	}
+	originalStream := active.st
+	deadline := time.Now().Add(2 * time.Second)
+	for active.matrix.mixer.CurrentCoefficients()[0] != 0.5 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := active.matrix.mixer.CurrentCoefficients()[0]; got != 0.5 {
+		t.Fatalf("live crosspoint gain = %f, want 0.5", got)
+	}
+	muted := true
+	patch := v1.PatchRouteRequest{Muted: &muted}
+	w, _ := json.Marshal(patch)
+	req, _ = http.NewRequest(http.MethodPatch, node1.apiURL+"/api/v1/routes/route-api-matrix-1", bytes.NewReader(w))
+	req.Header.Set("Authorization", "Bearer "+node1.cfg.AuthToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("PATCH mute: response=%v error=%v", resp, err)
+	}
+	_ = resp.Body.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for active.matrix.mixer.CurrentCoefficients()[0] != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := active.matrix.mixer.CurrentCoefficients()[0]; got != 0 {
+		t.Fatalf("live mute coefficient = %f, want 0", got)
+	}
+	if node1.streams.routes[updatedRoute.ID].st != originalStream {
+		t.Fatal("gain/mute update restarted the stream")
+	}
 
 	// 6. Check Stream Stats endpoint via GET /api/v1/telemetry/stream-stats
 	req, _ = http.NewRequest(http.MethodGet, node1.apiURL+"/api/v1/telemetry/stream-stats", nil)
@@ -391,7 +424,7 @@ func TestDaemonAPI_DynamicRouteMatrixE2E(t *testing.T) {
 
 	reader := bufio.NewReader(sseResp.Body)
 	receivedMeterEvent := false
-	deadline := time.Now().Add(2 * time.Second)
+	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		line, rerr := reader.ReadString('\n')
 		if rerr != nil {

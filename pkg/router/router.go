@@ -14,15 +14,20 @@ import (
 
 // StreamRoute describes how audio from one source device is delivered.
 type StreamRoute struct {
-	ID              string   `json:"id"`
-	Direction       string   `json:"direction,omitempty"` // "receive" for a receiver-only route; otherwise send
-	SourceDevice    int      `json:"sourceDevice"`
-	SourceDeviceURN string   `json:"sourceDeviceUrn,omitempty"`
-	DestDevice      int      `json:"destDevice,omitempty"`
-	DestDeviceURN   string   `json:"destDeviceUrn,omitempty"`
-	Destinations    []string `json:"destinations"`
-	SampleRate      int      `json:"sampleRate,omitempty"`
-	Channels        int      `json:"channels,omitempty"`
+	ID              string    `json:"id"`
+	Direction       string    `json:"direction,omitempty"` // "receive" for a receiver-only route; otherwise send
+	SourceDevice    int       `json:"sourceDevice"`
+	SourceDeviceURN string    `json:"sourceDeviceUrn,omitempty"`
+	DestDevice      int       `json:"destDevice,omitempty"`
+	DestDeviceURN   string    `json:"destDeviceUrn,omitempty"`
+	Destinations    []string  `json:"destinations"`
+	SampleRate      int       `json:"sampleRate,omitempty"`
+	Channels        int       `json:"channels,omitempty"`
+	InChannels      int       `json:"inChannels,omitempty"`
+	OutChannels     int       `json:"outChannels,omitempty"`
+	Coefficients    []float64 `json:"coefficients,omitempty"`
+	SlewMS          float64   `json:"slewMs,omitempty"`
+	Muted           bool      `json:"muted,omitempty"`
 
 	// Peer binding and negotiated format
 	PeerID        string `json:"peerId,omitempty"`        // Bound peer ID (empty = any/unicast)
@@ -164,6 +169,7 @@ func (r *Router) GetMatrix(id string) (MatrixRoute, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	mr, ok := r.matrixRoutes[id]
+	mr.Coefficients = append([]float64(nil), mr.Coefficients...)
 	return mr, ok
 }
 
@@ -217,6 +223,7 @@ func (r *Router) UpdateCrosspoint(id string, outCh, inCh int, gain float64, slew
 		return MatrixRoute{}, fmt.Errorf("gain out of bounds [0.0, 2.0]: %f", gain)
 	}
 	idx := outCh*mr.InChannels + inCh
+	mr.Coefficients = append([]float64(nil), mr.Coefficients...)
 	mr.Coefficients[idx] = gain
 	if slewMS > 0 {
 		mr.SlewMS = slewMS
@@ -283,36 +290,67 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 	}
 	srcNode := "local"
 	dstNode := "local"
-	if sr.PeerID != "" {
-		dstNode = sr.PeerID
+	inCh, outCh := ch, ch
+	if sr.InChannels > 0 {
+		inCh = sr.InChannels
 	}
-	inChans := make([]int, ch)
-	outChans := make([]int, ch)
-	for i := 0; i < ch; i++ {
+	if sr.OutChannels > 0 {
+		outCh = sr.OutChannels
+	}
+	coeffs := NewDefaultDownmixMatrix(inCh, outCh).Coefficients
+	if len(sr.Coefficients) == inCh*outCh {
+		coeffs = append([]float64(nil), sr.Coefficients...)
+	}
+	if sr.Direction == "receive" {
+		srcNode = sr.PeerID
+	}
+	if sr.PeerID != "" {
+		if sr.Direction != "receive" {
+			dstNode = sr.PeerID
+		}
+	}
+	if sr.Direction == "receive" && sr.PeerID == "" {
+		srcNode = "remote"
+	}
+	inChans := make([]int, inCh)
+	outChans := make([]int, outCh)
+	for i := 0; i < inCh; i++ {
 		inChans[i] = i
+	}
+	for i := 0; i < outCh; i++ {
 		outChans[i] = i
 	}
-	idMatrix := NewIdentityGainMatrix(ch)
+	srcDevice, dstDevice := fmt.Sprintf("%d", sr.SourceDevice), fmt.Sprintf("%d", sr.DestDevice)
+	if sr.SourceDeviceURN != "" {
+		srcDevice = sr.SourceDeviceURN
+	}
+	if sr.DestDeviceURN != "" {
+		dstDevice = sr.DestDeviceURN
+	}
+	slew := sr.SlewMS
+	if slew <= 0 {
+		slew = 20
+	}
 	return MatrixRoute{
 		ID:   sr.ID,
 		Name: sr.ID,
 		Source: MatrixEndpoint{
 			NodeID:   srcNode,
-			DeviceID: fmt.Sprintf("%d", sr.SourceDevice),
+			DeviceID: srcDevice,
 			Layout:   LayoutStereo,
 			Channels: inChans,
 		},
 		Destination: MatrixEndpoint{
 			NodeID:   dstNode,
-			DeviceID: "0",
+			DeviceID: dstDevice,
 			Layout:   LayoutStereo,
 			Channels: outChans,
 		},
-		InChannels:   ch,
-		OutChannels:  ch,
-		Coefficients: idMatrix.Coefficients,
-		SlewMS:       20.0,
-		Muted:        false,
+		InChannels:   inCh,
+		OutChannels:  outCh,
+		Coefficients: coeffs,
+		SlewMS:       slew,
+		Muted:        sr.Muted,
 		State:        "active",
 	}
 }
@@ -356,7 +394,12 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		DestDeviceURN:   mr.Destination.DeviceID,
 		Destinations:    dests,
 		SampleRate:      48000,
-		Channels:        mr.InChannels,
+		Channels:        mr.OutChannels,
+		InChannels:      mr.InChannels,
+		OutChannels:     mr.OutChannels,
+		Coefficients:    append([]float64(nil), mr.Coefficients...),
+		SlewMS:          mr.SlewMS,
+		Muted:           mr.Muted,
 		PeerID:          mr.Destination.NodeID,
 	}
 }

@@ -69,3 +69,9 @@ including the wire header and room for FEC. For example, 48 kHz stereo uses
 headers and CPU; this is not a bandwidth-saving codec. Both route endpoints
 must use matching sample rate and channel count. Unsupported high-bandwidth
 formats fail rather than silently sending oversized datagrams.
+
+Matrix-route coefficients and mute are applied to live PCM with sample-slewed
+changes. Sending routes process audio before network transmission; receive-only
+routes process audio before local playback. Live matrix routes currently require
+equal input/output channel counts; a route requiring channel-count conversion
+returns an error rather than silently ignoring its matrix.

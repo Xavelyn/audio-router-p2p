@@ -275,10 +275,11 @@ type streamManager struct {
 }
 
 type activeStream struct {
-	route router.StreamRoute
-	st    *streamer.Streamer
-	in    audio.AudioStream
-	out   audio.AudioStream
+	route  router.StreamRoute
+	st     *streamer.Streamer
+	in     audio.AudioStream
+	out    audio.AudioStream
+	matrix *routeMatrix
 }
 
 func newStreamManager(cfg *config.Config, trans streamer.Transport, localIPs []string, disc *discovery.Discovery) *streamManager {
@@ -316,6 +317,15 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	if sr.Channels < 1 {
 		sr.Channels = 1
 	}
+	if sr.InChannels != 0 && sr.InChannels != sr.Channels || sr.OutChannels != 0 && sr.OutChannels != sr.Channels {
+		return fmt.Errorf("route %s: channel-count conversion is not supported by live PCM routes", sr.ID)
+	}
+	if len(sr.Coefficients) != 0 {
+		mr := router.StreamRouteToMatrixRoute(sr)
+		if err := mr.Validate(); err != nil {
+			return err
+		}
+	}
 	if old, ok := m.routes[sr.ID]; ok {
 		m.stopLocked(old)
 		delete(m.routes, sr.ID)
@@ -336,10 +346,23 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	var out audio.AudioStream
-	destAddrs := sr.Destinations
+	destAddrs := append([]string(nil), sr.Destinations...)
+	// The matrix API uses a legacy loopback placeholder for local endpoints.
+	// Resolve it to this daemon's actual stream socket (which may use -stream-port
+	// or port 0), without treating a different loopback daemon as local.
+	if sr.PeerID == "local" && sr.Direction != "receive" && m.trans != nil {
+		for i, dest := range destAddrs {
+			if dest == "127.0.0.1:45678" {
+				local := m.trans.LocalAddr()
+				if local != nil {
+					destAddrs[i] = net.JoinHostPort("127.0.0.1", strconv.Itoa(local.Port))
+				}
+			}
+		}
+	}
 
 	// If route has a peer ID, try to bind to that peer
-	if sr.Direction != "receive" && sr.PeerID != "" {
+	if sr.Direction != "receive" && sr.PeerID != "" && sr.PeerID != "local" {
 		if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
 			// Use peer's stream address if available
 			if !contains(destAddrs, peer.StreamAddr) {
@@ -395,6 +418,27 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		return err
 	}
+	var matrix *routeMatrix
+	if sr.Direction == "receive" {
+		matrix, err = newRouteMatrix(out, sr)
+		if err == nil {
+			out = matrix
+		}
+	} else {
+		matrix, err = newRouteMatrix(in, sr)
+		if err == nil {
+			in = matrix
+		}
+	}
+	if err != nil {
+		if in != nil {
+			_ = in.Close()
+		}
+		if out != nil {
+			_ = out.Close()
+		}
+		return err
+	}
 	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, m.disc.NodeID())
 	if err != nil {
 		if in != nil {
@@ -430,9 +474,20 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	// Save the potentially updated route (with peer binding)
-	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out}
+	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out, matrix: matrix}
 	log.Printf("route %s: streaming device %s -> %d destinations (peer: %s)", sr.ID, srcRef, len(destAddrs), sr.PeerID)
 	return nil
+}
+
+// UpdateMatrix adjusts an active route without restarting capture or transport.
+func (m *streamManager) UpdateMatrix(route router.MatrixRoute) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	as, ok := m.routes[route.ID]
+	if !ok || as.matrix == nil {
+		return fmt.Errorf("route %s is not active", route.ID)
+	}
+	return as.matrix.Update(route)
 }
 
 // StopRoute stops and releases a route's streams.
