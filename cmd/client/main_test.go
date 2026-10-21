@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -281,5 +282,85 @@ func TestReceiveRoutesShareOutputDevice(t *testing.T) {
 	}
 	if len(m.outputs) != 0 {
 		t.Fatal("output bus was not released after final route")
+	}
+}
+
+func TestPeerBoundRouteFollowsDiscoveryAddress(t *testing.T) {
+	trans, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trans.Close()
+	first, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	packetsFirst, packetsSecond := make(chan struct{}, 100), make(chan struct{}, 100)
+	first.Receive(func([]byte, *net.UDPAddr) {
+		select {
+		case packetsFirst <- struct{}{}:
+		default:
+		}
+	})
+	second.Receive(func([]byte, *net.UDPAddr) {
+		select {
+		case packetsSecond <- struct{}{}:
+		default:
+		}
+	})
+	cfg := &config.Config{AuthToken: "rebind-test", UseEmulator: true,
+		AnnounceInterval: time.Second, PeerTTL: 3 * time.Second, SyncInterval: time.Second}
+	disc, err := discovery.New(cfg, "sender-rebind")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disc.Close()
+	m := newStreamManager(cfg, trans, []string{"127.0.0.1"}, disc)
+	defer m.StopAll()
+	if err := m.StartRoute(router.StreamRoute{ID: "follow-peer", PeerID: "remote", SourceDevice: 0,
+		Destinations: []string{first.Addr()}, SampleRate: 48000, Channels: 2}); err != nil {
+		t.Fatal(err)
+	}
+	st := m.routes["follow-peer"].st
+	peerAddress := func() string { return st.PeerAddress("remote") }
+	// No discovered peer means no traffic to the stale configured destination.
+	if addr := peerAddress(); addr != "" {
+		t.Fatalf("stale endpoint active before discovery: %s", addr)
+	}
+	waitAddr := func(want string) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if peerAddress() == want {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("active destination = %s, want %s", peerAddress(), want)
+	}
+	waitPacket := func(ch <-chan struct{}) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+			t.Fatal("no packet after rebind")
+		}
+	}
+	disc.AddPeer(&discovery.Peer{ID: "remote", StreamAddr: first.Addr()})
+	waitAddr(first.Addr())
+	waitPacket(packetsFirst)
+	disc.AddPeer(&discovery.Peer{ID: "remote", StreamAddr: second.Addr()})
+	waitAddr(second.Addr())
+	waitPacket(packetsSecond)
+	disc.AddPeer(&discovery.Peer{ID: "remote"})
+	waitAddr("")
+	if m.routes["follow-peer"].st != st {
+		t.Fatal("peer move restarted the stream")
 	}
 }

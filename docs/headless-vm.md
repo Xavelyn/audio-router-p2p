@@ -83,3 +83,9 @@ grow without bound. Routes sharing an output must use the same sample rate and
 channel count; an incompatible route is rejected without closing the active
 output. This is a bounded real-time mixer, not sample-accurate synchronization
 between independent network sources.
+
+UDP send-only routes bound to a `peerId` now follow discovery's stream address.
+They pause while that peer has no advertised stream endpoint and resume at its
+new endpoint without reopening capture. Routes using only explicit destination
+addresses remain static. This does not reconnect the single-peer DTLS
+transport; DTLS still requires a new connection when its peer moves or restarts.

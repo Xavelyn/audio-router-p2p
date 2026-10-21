@@ -942,6 +942,85 @@ func (s *Streamer) SetPeerID(addr string, peerID string) {
 	}
 }
 
+// RebindPeer changes the destination of a send-only UDP stream without
+// restarting capture or resetting its sequence number. An empty address
+// removes the destination while discovery considers the peer unavailable.
+// The shared transport does not own a DTLS reconnect, so reject changes to
+// its fixed connection rather than pretending packets will reach a new peer.
+func (s *Streamer) RebindPeer(peerID, addr string) error {
+	if peerID == "" {
+		return errors.New("streamer: peer ID required for rebind")
+	}
+	if addr != "" {
+		if _, err := net.ResolveUDPAddr("udp", addr); err != nil {
+			return fmt.Errorf("streamer: invalid peer address %q: %w", addr, err)
+		}
+		if s.isLocalDest(addr) {
+			return errors.New("streamer: cannot rebind remote peer to local bypass")
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.started || s.output != nil {
+		return errors.New("streamer: rebinding requires a started send-only stream")
+	}
+	s.peersMu.Lock()
+	defer s.peersMu.Unlock()
+	var previous *RemotePeer
+	for oldAddr, peer := range s.peers {
+		if peer.PeerID != peerID {
+			continue
+		}
+		if oldAddr == addr {
+			return nil
+		}
+		previous = peer
+	}
+	if previous != nil && s.transport != nil {
+		if _, ok := s.transport.(*transport.DTLSTransport); ok {
+			return errors.New("streamer: DTLS peer address is fixed; reconnect required")
+		}
+	}
+	if addr != "" {
+		if _, exists := s.peers[addr]; exists {
+			return fmt.Errorf("streamer: destination %q already assigned", addr)
+		}
+		if len(s.peers) >= 64 && previous == nil {
+			return errors.New("streamer: too many destinations")
+		}
+	}
+	for oldAddr, peer := range s.peers {
+		if peer.PeerID == peerID {
+			delete(s.peers, oldAddr)
+			if peer.JitterBuf != nil {
+				_ = peer.JitterBuf.Close()
+			}
+		}
+	}
+	if addr != "" {
+		p := &RemotePeer{Addr: addr, PeerID: peerID, Direction: DirSendOnly}
+		if previous != nil {
+			p.packetsSent.Store(previous.packetsSent.Load())
+			p.bytesSent.Store(previous.bytesSent.Load())
+		}
+		s.peers[addr] = p
+	}
+	return nil
+}
+
+// PeerAddress reports the current destination for a bound peer (or empty
+// while it is unavailable). It is safe to use during a live rebind.
+func (s *Streamer) PeerAddress(peerID string) string {
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
+	for addr, peer := range s.peers {
+		if peer.PeerID == peerID {
+			return addr
+		}
+	}
+	return ""
+}
+
 // StreamLinkStats returns atomic link metrics per peer without stalling audio threads.
 func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 	s.mu.Lock()

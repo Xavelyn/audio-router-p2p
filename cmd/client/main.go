@@ -282,6 +282,8 @@ type activeStream struct {
 	out       audio.AudioStream
 	matrix    *routeMatrix
 	outputKey string
+	watchStop chan struct{}
+	watchDone chan struct{}
 }
 
 func newStreamManager(cfg *config.Config, trans streamer.Transport, localIPs []string, disc *discovery.Discovery) *streamManager {
@@ -365,13 +367,20 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	// If route has a peer ID, try to bind to that peer
-	if sr.Direction != "receive" && sr.PeerID != "" && sr.PeerID != "local" {
-		if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
-			// Use peer's stream address if available
+	if sr.Direction != "receive" && sr.PeerID != "" && sr.PeerID != "local" && m.disc != nil {
+		// A peer-bound UDP route follows discovery, not a potentially stale
+		// persisted address. Do not send to the old endpoint while it is gone.
+		if _, ok := m.trans.(*transport.UDPTransport); ok {
+			destAddrs = nil
+			sr.PeerAddr = ""
+			if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
+				destAddrs = []string{peer.StreamAddr}
+				sr.PeerAddr = peer.StreamAddr
+			}
+		} else if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
 			if !contains(destAddrs, peer.StreamAddr) {
 				destAddrs = append(destAddrs, peer.StreamAddr)
 			}
-			// Update route with peer info for persistence
 			sr.PeerAddr = peer.StreamAddr
 		}
 	} else if sr.Direction != "receive" && len(destAddrs) > 0 {
@@ -498,7 +507,15 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	// Save the potentially updated route (with peer binding)
-	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out, matrix: matrix, outputKey: outputKey}
+	as := &activeStream{route: sr, st: st, in: in, out: out, matrix: matrix, outputKey: outputKey}
+	m.routes[sr.ID] = as
+	if sr.Direction != "receive" && sr.PeerID != "" && sr.PeerID != "local" && out == nil && m.disc != nil {
+		if _, ok := m.trans.(*transport.UDPTransport); ok {
+			as.watchStop = make(chan struct{})
+			as.watchDone = make(chan struct{})
+			go m.followPeer(as, as.watchStop, as.watchDone)
+		}
+	}
 	log.Printf("route %s: streaming device %s -> %d destinations (peer: %s)", sr.ID, srcRef, len(destAddrs), sr.PeerID)
 	return nil
 }
@@ -564,6 +581,10 @@ func (m *streamManager) StreamLinkStats() []telemetry.StreamLinkStats {
 }
 
 func (m *streamManager) stopLocked(as *activeStream) {
+	if as.watchStop != nil {
+		close(as.watchStop)
+		<-as.watchDone
+	}
 	if m.hub != nil {
 		m.hub.UnregisterTap(as.route.ID)
 	}
@@ -584,6 +605,36 @@ func (m *streamManager) stopLocked(as *activeStream) {
 	if as.out != nil {
 		_ = as.out.Close()
 		m.removeEmptyOutputLocked(as.outputKey)
+	}
+}
+
+// Discovery polling is deliberately outside the manager lock: a slow
+// resolution must not stall API updates or route shutdown. The streamer
+// serializes destination swaps with the send loop.
+func (m *streamManager) followPeer(as *activeStream, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+	current := as.route.PeerAddr
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+		}
+		addr := ""
+		if peer := m.disc.PeerByID(as.route.PeerID); peer != nil {
+			addr = peer.StreamAddr
+		}
+		if addr == current {
+			continue
+		}
+		if err := as.st.RebindPeer(as.route.PeerID, addr); err != nil {
+			log.Printf("route %s: peer rebind: %v", as.route.ID, err)
+			continue
+		}
+		log.Printf("route %s: peer %s stream endpoint %q -> %q", as.route.ID, as.route.PeerID, current, addr)
+		current = addr
 	}
 }
 
