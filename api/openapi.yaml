@@ -1,0 +1,1463 @@
+openapi: 3.1.0
+info:
+  title: Audio Router P2P Control Plane API
+  version: 1.0.0
+  description: |
+    Formal REST, Server-Sent Events (SSE), and WebSocket control plane specification
+    for audio-router-p2p. Provides deterministic matrix routing, audio device and node
+    registry, high-frequency telemetry (VU/RMS/clipping/ASRC/FEC/PLC), multi-node room
+    orchestration, and backward-compatible adapters.
+  contact:
+    name: Audio Systems Architecture Team
+    url: https://github.com/audio-router-p2p
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: /
+    description: Current node control plane
+
+security:
+  - BearerAuth: []
+  - CookieAuth: []
+  - QueryAuth: []
+
+paths:
+  # ============================================================================
+  # SYSTEM & NODE MANAGEMENT (/api/v1/system)
+  # ============================================================================
+  /api/v1/system/status:
+    get:
+      tags:
+        - System
+      summary: Get system operational health and node summary
+      description: Returns node identity, daemon uptime, active stream and route counts, and subsystem health.
+      operationId: getSystemStatus
+      responses:
+        '200':
+          description: Operational status snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemStatus'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/system/peers:
+    get:
+      tags:
+        - System
+      summary: List discovered mesh peers
+      description: Enumerates peer nodes discovered via mDNS, DHT, or static peer configuration.
+      operationId: listPeers
+      responses:
+        '200':
+          description: List of discovered peer nodes.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PeerNode'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+    post:
+      tags:
+        - System
+      summary: Connect to a remote peer node
+      description: Manually initiates connection and session negotiation with an external peer address.
+      operationId: connectPeer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ConnectPeerRequest'
+      responses:
+        '201':
+          description: Successfully initiated peer handshake.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PeerNode'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/system/clock-sync:
+    get:
+      tags:
+        - System
+      summary: Retrieve clock synchronization telemetry
+      description: Queries PTP/NTP distributed clock synchronization offsets and estimation variance across nodes.
+      operationId: getClockSync
+      responses:
+        '200':
+          description: Clock synchronization telemetry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClockSyncStatus'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  # ============================================================================
+  # AUDIO DEVICE & NODE REGISTRY (/api/v1/devices)
+  # ============================================================================
+  /api/v1/devices:
+    get:
+      tags:
+        - Devices
+      summary: Enumerate audio devices
+      description: Lists hardware sound cards, virtual audio interfaces, and loopback sinks/sources available on this host.
+      operationId: listDevices
+      parameters:
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, input, output, virtual]
+            default: all
+          description: Filter devices by type.
+      responses:
+        '200':
+          description: Collection of available audio devices.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioDevice'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/devices/{deviceId}:
+    get:
+      tags:
+        - Devices
+      summary: Get device details
+      description: Returns configuration, supported sample rates, channel configurations, and runtime gain levels for a device.
+      operationId: getDevice
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdParam'
+      responses:
+        '200':
+          description: Detailed device state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioDevice'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    patch:
+      tags:
+        - Devices
+      summary: Update device runtime parameters
+      description: Adjusts master volume, mute state, or channel map without tearing down ongoing streams.
+      operationId: updateDevice
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDeviceRequest'
+      responses:
+        '200':
+          description: Device updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioDevice'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/devices/virtual:
+    post:
+      tags:
+        - Devices
+      summary: Create a virtual loopback device
+      description: Allocates a software loopback sink/source device in memory for bridging, DAW routing, or testing.
+      operationId: createVirtualDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVirtualDeviceRequest'
+      responses:
+        '201':
+          description: Virtual device created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AudioDevice'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /api/v1/devices/virtual/{deviceId}:
+    delete:
+      tags:
+        - Devices
+      summary: Tear down a virtual loopback device
+      description: Removes an active virtual loopback device and closes associated memory buffers.
+      operationId: deleteVirtualDevice
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdParam'
+      responses:
+        '204':
+          description: Virtual device successfully deleted.
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  # ============================================================================
+  # MATRIX ROUTING CONTRACT (/api/v1/routes)
+  # ============================================================================
+  /api/v1/routes:
+    get:
+      tags:
+        - Routing
+      summary: List all active matrix routes
+      description: Retrieves all active matrix routing configurations, crosspoint coefficient matrices, and endpoint bindings.
+      operationId: listRoutes
+      responses:
+        '200':
+          description: Active route collection.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/MatrixRoute'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+    post:
+      tags:
+        - Routing
+      summary: Create and activate a matrix route
+      description: Configures an N:M channel routing session from source endpoints to destination endpoints with linear gain matrices.
+      operationId: createRoute
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRouteRequest'
+      responses:
+        '201':
+          description: Route created and streaming pipeline established.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRoute'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '409':
+          description: Route ID collision or resource conflict.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/routes/{routeId}:
+    get:
+      tags:
+        - Routing
+      summary: Get matrix route details
+      description: Returns configuration, runtime statistics, and current coefficient matrices for a specific route.
+      operationId: getRoute
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      responses:
+        '200':
+          description: Route details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRoute'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    put:
+      tags:
+        - Routing
+      summary: Replace matrix route configuration
+      description: Completely updates route configuration, re-negotiating audio codecs or formats if channel counts change.
+      operationId: replaceRoute
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRouteRequest'
+      responses:
+        '200':
+          description: Route replaced.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRoute'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    patch:
+      tags:
+        - Routing
+      summary: Live-update matrix coefficients with slew rate smoothing
+      description: Modifies crosspoint gains, mutes, or labels without interrupting or restarting the real-time audio stream.
+      operationId: patchRoute
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PatchRouteRequest'
+      responses:
+        '200':
+          description: Route updated. Slew interpolator activated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRoute'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    delete:
+      tags:
+        - Routing
+      summary: Stop and delete a matrix route
+      description: Smoothly fades down route gain, tears down streamer pipeline, and removes entry from persistent routing table.
+      operationId: deleteRoute
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      responses:
+        '204':
+          description: Route deleted successfully.
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/routes/{routeId}/crosspoint:
+    post:
+      tags:
+        - Routing
+      summary: Update single crosspoint gain
+      description: Atomically updates the linear gain multiplier for a single (outChannel, inChannel) pair with 20ms slew interpolation.
+      operationId: setCrosspointGain
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CrosspointGainRequest'
+      responses:
+        '200':
+          description: Crosspoint updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MatrixRoute'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  # ============================================================================
+  # ROOM ORCHESTRATION (/api/v1/rooms)
+  # ============================================================================
+  /api/v1/rooms:
+    get:
+      tags:
+        - Rooms
+      summary: List conference audio rooms
+      description: Enumerate active mesh rooms, topologies, and member participants.
+      operationId: listRooms
+      responses:
+        '200':
+          description: Active rooms.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RoomInfo'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+    post:
+      tags:
+        - Rooms
+      summary: Create a conference audio room
+      description: Creates a distributed audio room with leader election and automatic format harmonization.
+      operationId: createRoom
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+      responses:
+        '201':
+          description: Room created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+
+  /api/v1/rooms/{roomId}:
+    get:
+      tags:
+        - Rooms
+      summary: Get room details
+      description: Returns room state, leader node, members, and active audio layout.
+      operationId: getRoom
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      responses:
+        '200':
+          description: Room details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+    delete:
+      tags:
+        - Rooms
+      summary: Close audio room
+      description: Disbands room session and disconnects all participating peers.
+      operationId: deleteRoom
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      responses:
+        '204':
+          description: Room disbanded.
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/rooms/{roomId}/join:
+    post:
+      tags:
+        - Rooms
+      summary: Join local node to audio room
+      description: Joins the room, establishes mesh audio peer connections, and engages format downmix/upmix adapters.
+      operationId: joinRoom
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      responses:
+        '200':
+          description: Successfully joined room.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/rooms/{roomId}/leave:
+    post:
+      tags:
+        - Rooms
+      summary: Leave audio room
+      description: Disconnects local peer from room session.
+      operationId: leaveRoom
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      responses:
+        '200':
+          description: Successfully left room.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  # ============================================================================
+  # HIGH-FREQUENCY TELEMETRY (/api/v1/telemetry)
+  # ============================================================================
+  /api/v1/telemetry/stream-stats:
+    get:
+      tags:
+        - Telemetry
+      summary: Query snapshot of stream diagnostics
+      description: Returns real-time metrics including FEC recovery counts, PLC concealment events, ASRC drift ppm, and jitter buffer histograms.
+      operationId: getStreamStats
+      responses:
+        '200':
+          description: Stream statistics by stream ID.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/StreamStats'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/telemetry/meters:
+    get:
+      tags:
+        - Telemetry
+      summary: Server-Sent Events (SSE) meter stream
+      description: |
+        Streams real-time audio levels (VU, RMS dBFS, Peak dBFS, clipping indicator, DTX state)
+        at 20-50 Hz intervals. Uses non-blocking ring-buffer dispatch. Drops frames on slow consumers
+        to protect real-time DSP execution.
+      operationId: streamMetersSSE
+      parameters:
+        - name: rate
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 10
+            maximum: 60
+            default: 30
+          description: Desired meter push frequency in Hertz (frames/sec).
+      responses:
+        '200':
+          description: Continuous Server-Sent Event stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                example: |
+                  event: meter
+                  data: {"stream_id":"b3f8...","channels":[{"rms_dbfs":-18.4,"peak_dbfs":-6.2,"clipped":false}],"timestamp_ns":1727280000000000000}
+
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/telemetry/ws:
+    get:
+      tags:
+        - Telemetry
+      summary: Bidirectional WebSocket telemetry and control session
+      description: |
+        Establishes a low-latency bidirectional WebSocket connection. Server streams binary or JSON
+        metering frames at 20-50 Hz and broadcast state changes. Clients can send live matrix gain slew
+        commands, crosspoint updates, or mute toggles. Drops frames on lag without exerting backpressure.
+      operationId: connectTelemetryWebSocket
+      parameters:
+        - name: token
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Query parameter authentication token fallback for WebSocket browsers.
+      responses:
+        '101':
+          description: Switching Protocols to WebSocket.
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  # ============================================================================
+  # BACKWARD-COMPATIBILITY ROOT ADAPTERS
+  # ============================================================================
+  /status:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy system status adapter
+      description: Backward-compatible alias for `/api/v1/system/status`.
+      responses:
+        '200':
+          description: Legacy node status.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SystemStatus'
+
+  /devices:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy device list adapter
+      description: Backward-compatible alias for `/api/v1/devices`.
+      responses:
+        '200':
+          description: Device list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/AudioDevice'
+
+  /routes:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy route list adapter
+      description: Backward-compatible alias for `/api/v1/routes`.
+      responses:
+        '200':
+          description: Route table snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/StreamRoute'
+    post:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy create route adapter
+      description: Backward-compatible alias for `/api/v1/routes`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StreamRoute'
+      responses:
+        '201':
+          description: Created route.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StreamRoute'
+
+  /peers:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy peers list adapter
+      description: Backward-compatible alias for `/api/v1/system/peers`.
+      responses:
+        '200':
+          description: Peers list.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PeerNode'
+
+  /sync:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy clock sync adapter
+      description: Backward-compatible alias for `/api/v1/system/clock-sync`.
+      responses:
+        '200':
+          description: Clock sync info.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClockSyncStatus'
+
+  /rooms:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy room list adapter
+      description: Backward-compatible alias for `/api/v1/rooms`.
+      responses:
+        '200':
+          description: List of rooms.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RoomInfo'
+    post:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy create room adapter
+      description: Backward-compatible alias for `/api/v1/rooms`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRoomRequest'
+      responses:
+        '201':
+          description: Room created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+
+  /rooms/{roomId}/join:
+    post:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy room join adapter
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      responses:
+        '200':
+          description: Joined room.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+
+  /rooms/{roomId}/leave:
+    post:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy room leave adapter
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      responses:
+        '200':
+          description: Left room.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+
+  /streams/stats:
+    get:
+      tags:
+        - Legacy
+      deprecated: true
+      summary: Legacy stream stats adapter
+      description: Backward-compatible alias for `/api/v1/telemetry/stream-stats`.
+      responses:
+        '200':
+          description: Stream statistics.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/StreamStats'
+
+# ==============================================================================
+# COMPONENTS
+# ==============================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Token
+      description: "Header Authorization: Bearer <token> or X-Auth-Token: <token>."
+    CookieAuth:
+      type: apiKey
+      in: cookie
+      name: audio_session
+      description: HTTP-only session cookie for embedded WebUI SPA.
+    QueryAuth:
+      type: apiKey
+      in: query
+      name: token
+      description: Query parameter token fallback for browser WebSocket and EventSource connections.
+
+  parameters:
+    DeviceIdParam:
+      name: deviceId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Device identifier (integer index string or virtual device GUID).
+    RouteIdParam:
+      name: routeId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Unique matrix route identifier.
+    RoomIdParam:
+      name: roomId
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Conference room identifier.
+
+  responses:
+    BadRequestError:
+      description: Malformed payload, invalid channel index, or out-of-range gain.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    UnauthorizedError:
+      description: Missing or invalid authentication credentials.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFoundError:
+      description: Target resource (device, route, or room) was not found.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+
+  schemas:
+    # --------------------------------------------------------------------------
+    # Common Error
+    # --------------------------------------------------------------------------
+    ErrorResponse:
+      type: object
+      required:
+        - error
+        - code
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+          example: invalid crosspoint coordinates
+        code:
+          type: string
+          description: Machine-readable error code.
+          example: ERR_INVALID_COEFFICIENT
+        details:
+          type: object
+          description: Optional diagnostic metadata.
+
+    # --------------------------------------------------------------------------
+    # System Status & Peers
+    # --------------------------------------------------------------------------
+    SystemStatus:
+      type: object
+      required:
+        - status
+        - version
+        - uptime_seconds
+        - active_routes
+        - discovered_peers
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded, error]
+          example: ok
+        version:
+          type: string
+          example: 1.4.0
+        uptime_seconds:
+          type: number
+          example: 3600.5
+        active_routes:
+          type: integer
+          example: 4
+        discovered_peers:
+          type: integer
+          example: 3
+        clock_sync_locked:
+          type: boolean
+          example: true
+
+    PeerNode:
+      type: object
+      required:
+        - id
+        - addr
+        - status
+      properties:
+        id:
+          type: string
+          example: node-nyc-edge-01
+        addr:
+          type: string
+          example: 192.168.1.120:7001
+        status:
+          type: string
+          enum: [connected, negotiating, disconnected]
+          example: connected
+        rtt_ms:
+          type: number
+          example: 4.2
+        last_seen:
+          type: string
+          format: date-time
+
+    ConnectPeerRequest:
+      type: object
+      required:
+        - addr
+      properties:
+        addr:
+          type: string
+          example: 10.0.0.50:7001
+        tls_fingerprint:
+          type: string
+          description: Expected DTLS certificate SHA-256 fingerprint for verification.
+
+    ClockSyncStatus:
+      type: object
+      required:
+        - locked
+        - offset_ns
+        - drift_ppm
+      properties:
+        locked:
+          type: boolean
+          example: true
+        offset_ns:
+          type: integer
+          description: Estimated wall-clock offset relative to mesh clock master in nanoseconds.
+          example: -12500
+        drift_ppm:
+          type: number
+          description: Frequency offset in parts per million.
+          example: -2.35
+        source:
+          type: string
+          enum: [ptp, ntp, internal]
+          example: ptp
+
+    # --------------------------------------------------------------------------
+    # Audio Devices
+    # --------------------------------------------------------------------------
+    AudioDevice:
+      type: object
+      required:
+        - id
+        - name
+        - max_input
+        - max_output
+        - default_sample_rate
+        - is_virtual
+      properties:
+        id:
+          type: string
+          example: "0"
+        name:
+          type: string
+          example: "Built-in Microphone"
+        max_input:
+          type: integer
+          example: 2
+        max_output:
+          type: integer
+          example: 0
+        default_sample_rate:
+          type: number
+          example: 48000
+        is_virtual:
+          type: boolean
+          example: false
+        volume:
+          type: number
+          minimum: 0.0
+          maximum: 2.0
+          default: 1.0
+          example: 1.0
+        muted:
+          type: boolean
+          default: false
+        supported_layouts:
+          type: array
+          items:
+            type: string
+            enum: [mono, stereo, quad, "5.1", "7.1"]
+          example: [mono, stereo]
+
+    UpdateDeviceRequest:
+      type: object
+      properties:
+        volume:
+          type: number
+          minimum: 0.0
+          maximum: 2.0
+          example: 0.8
+        muted:
+          type: boolean
+          example: false
+
+    CreateVirtualDeviceRequest:
+      type: object
+      required:
+        - name
+        - direction
+        - channels
+        - sample_rate
+      properties:
+        name:
+          type: string
+          example: "Loopback-Bus-A"
+        direction:
+          type: string
+          enum: [input, output, duplex]
+          example: duplex
+        channels:
+          type: integer
+          enum: [1, 2, 4, 6, 8]
+          example: 2
+        sample_rate:
+          type: integer
+          enum: [44100, 48000, 96000]
+          default: 48000
+        buffer_size_frames:
+          type: integer
+          default: 480
+          example: 480
+
+    # --------------------------------------------------------------------------
+    # Matrix Routing
+    # --------------------------------------------------------------------------
+    MatrixEndpoint:
+      type: object
+      required:
+        - node_id
+        - device_id
+        - channels
+      properties:
+        node_id:
+          type: string
+          description: Host node identifier (or "local").
+          example: local
+        device_id:
+          type: string
+          example: "0"
+        layout:
+          type: string
+          enum: [mono, stereo, quad, "5.1", "7.1", custom]
+          example: stereo
+        channels:
+          type: array
+          items:
+            type: integer
+          description: Zero-based channel index mapping.
+          example: [0, 1]
+
+    MatrixRoute:
+      type: object
+      required:
+        - id
+        - source
+        - destination
+        - coefficients
+        - in_channels
+        - out_channels
+        - slew_ms
+        - state
+      properties:
+        id:
+          type: string
+          example: route-mix-master
+        name:
+          type: string
+          example: "Studio Monitor Feed"
+        source:
+          $ref: '#/components/schemas/MatrixEndpoint'
+        destination:
+          $ref: '#/components/schemas/MatrixEndpoint'
+        in_channels:
+          type: integer
+          description: Number of source input channels (M).
+          example: 2
+        out_channels:
+          type: integer
+          description: Number of destination output channels (N).
+          example: 2
+        coefficients:
+          type: array
+          items:
+            type: number
+          description: |
+            Row-major flat gain matrix of size out_channels * in_channels.
+            Each coefficient represents linear gain multiplier [0.0 .. 2.0] (-inf to +6 dB).
+            Index calculation: coefficients[out_ch * in_channels + in_ch].
+          example: [1.0, 0.0, 0.0, 1.0]
+        slew_ms:
+          type: number
+          default: 20.0
+          description: Linear gain ramp slewing duration in milliseconds to prevent audio pops.
+          example: 20.0
+        muted:
+          type: boolean
+          default: false
+        state:
+          type: string
+          enum: [active, slewing, paused, error]
+          example: active
+
+    CreateRouteRequest:
+      type: object
+      required:
+        - source
+        - destination
+      properties:
+        id:
+          type: string
+          description: Unique route identifier. Generated if omitted.
+          example: route-stereo-pair
+        name:
+          type: string
+          example: "Master to Broadcast Out"
+        source:
+          $ref: '#/components/schemas/MatrixEndpoint'
+        destination:
+          $ref: '#/components/schemas/MatrixEndpoint'
+        coefficients:
+          type: array
+          items:
+            type: number
+          description: Row-major gain coefficients. Defaults to identity / standard downmix matrix if omitted.
+          example: [1.0, 0.0, 0.0, 1.0]
+        slew_ms:
+          type: number
+          default: 20.0
+          example: 20.0
+
+    PatchRouteRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        coefficients:
+          type: array
+          items:
+            type: number
+          description: Updated row-major gain matrix. Slewed over slew_ms without audio glitch.
+        slew_ms:
+          type: number
+          description: Override slew rate transition time in ms.
+          example: 20.0
+        muted:
+          type: boolean
+
+    CrosspointGainRequest:
+      type: object
+      required:
+        - out_channel
+        - in_channel
+        - gain
+      properties:
+        out_channel:
+          type: integer
+          minimum: 0
+          example: 0
+        in_channel:
+          type: integer
+          minimum: 0
+          example: 1
+        gain:
+          type: number
+          minimum: 0.0
+          maximum: 2.0
+          example: 0.7071
+        slew_ms:
+          type: number
+          default: 20.0
+          example: 20.0
+
+    # --------------------------------------------------------------------------
+    # Room Management
+    # --------------------------------------------------------------------------
+    RoomInfo:
+      type: object
+      required:
+        - id
+        - name
+        - state
+      properties:
+        id:
+          type: string
+          example: room-control-room-a
+        name:
+          type: string
+          example: "Live Control Room"
+        leader:
+          type: string
+          example: node-nyc-master
+        state:
+          type: string
+          enum: [idle, active, degraded]
+          example: active
+        members:
+          type: array
+          items:
+            type: string
+          example: ["node-nyc-master", "node-lon-monitor", "node-fra-backup"]
+
+    CreateRoomRequest:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          example: room-broadcast-stage
+        name:
+          type: string
+          example: "Broadcast Stage"
+
+    # --------------------------------------------------------------------------
+    # Telemetry & Diagnostics
+    # --------------------------------------------------------------------------
+    ChannelMeter:
+      type: object
+      required:
+        - channel
+        - rms_dbfs
+        - peak_dbfs
+        - clipped
+      properties:
+        channel:
+          type: integer
+          example: 0
+        rms_dbfs:
+          type: number
+          format: float
+          description: Root-Mean-Square loudness in decibels relative to Full Scale.
+          example: -16.42
+        peak_dbfs:
+          type: number
+          format: float
+          description: True peak amplitude in decibels relative to Full Scale.
+          example: -3.15
+        clipped:
+          type: boolean
+          description: True if sample reached digital ceiling (-0.0 dBFS).
+          example: false
+
+    MeterFrame:
+      type: object
+      required:
+        - stream_id
+        - timestamp_ns
+        - channels
+        - dtx_state
+      properties:
+        stream_id:
+          type: string
+          example: 9b1deb4d3b7d4bad9bdd2b0d7b3dcb6d
+        timestamp_ns:
+          type: integer
+          example: 1727280000000000000
+        dtx_state:
+          type: string
+          enum: [Active, Hangover, Suppressed]
+          example: Active
+        channels:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChannelMeter'
+
+    JitterStats:
+      type: object
+      required:
+        - current_depth_frames
+        - target_depth_frames
+        - underruns
+        - overruns
+      properties:
+        current_depth_frames:
+          type: integer
+          example: 3
+        target_depth_frames:
+          type: integer
+          example: 3
+        underruns:
+          type: integer
+          example: 0
+        overruns:
+          type: integer
+          example: 0
+        jitter_ms:
+          type: number
+          example: 1.25
+
+    FECStats:
+      type: object
+      required:
+        - group_size_k
+        - parity_packets_sent_total
+        - parity_packets_received_total
+        - packets_recovered_total
+        - unrecoverable_groups_total
+      properties:
+        group_size_k:
+          type: integer
+          example: 4
+        parity_packets_sent_total:
+          type: integer
+          example: 2450
+        parity_packets_received_total:
+          type: integer
+          example: 2448
+        packets_recovered_total:
+          type: integer
+          example: 42
+        unrecoverable_groups_total:
+          type: integer
+          example: 2
+
+    PLCStats:
+      type: object
+      required:
+        - concealed_frames_total
+        - pitch_detected_frames_total
+        - noise_extrapolated_frames_total
+        - silence_decay_events_total
+      properties:
+        concealed_frames_total:
+          type: integer
+          example: 12
+        pitch_detected_frames_total:
+          type: integer
+          example: 11
+        noise_extrapolated_frames_total:
+          type: integer
+          example: 1
+        silence_decay_events_total:
+          type: integer
+          example: 0
+
+    ASRCStats:
+      type: object
+      required:
+        - nominal_rate_hz
+        - resample_ratio
+        - drift_ppm
+        - samples_adjusted_total
+      properties:
+        nominal_rate_hz:
+          type: integer
+          example: 48000
+        smoothed_watermark_frames:
+          type: number
+          example: 3.01
+        target_watermark_frames:
+          type: number
+          example: 3.00
+        drift_ppm:
+          type: number
+          example: -14.2
+        resample_ratio:
+          type: number
+          example: 0.9999858
+        samples_adjusted_total:
+          type: integer
+          example: 128
+
+    StreamStats:
+      type: object
+      required:
+        - stream_id
+        - packets_sent
+        - packets_received
+        - underruns
+        - overruns
+        - fec
+        - plc
+        - asrc
+      properties:
+        stream_id:
+          type: string
+          example: 9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d
+        packets_sent:
+          type: integer
+          example: 15400
+        packets_received:
+          type: integer
+          example: 15392
+        underruns:
+          type: integer
+          example: 0
+        overruns:
+          type: integer
+          example: 0
+        late_packets:
+          type: integer
+          example: 2
+        early_packets:
+          type: integer
+          example: 0
+        dtx_state:
+          type: string
+          example: Active
+        dtx_packets_suppressed_total:
+          type: integer
+          example: 410
+        rms_dbfs:
+          type: number
+          example: -18.2
+        peak_dbfs:
+          type: number
+          example: -5.4
+        fec:
+          $ref: '#/components/schemas/FECStats'
+        plc:
+          $ref: '#/components/schemas/PLCStats'
+        asrc:
+          $ref: '#/components/schemas/ASRCStats'
+        peers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/JitterStats'
+          description: Per-remote-peer jitter and reception statistics.
+
+    # --------------------------------------------------------------------------
+    # Legacy Format Types
+    # --------------------------------------------------------------------------
+    StreamRoute:
+      type: object
+      required:
+        - id
+        - sourceDevice
+        - destinations
+      properties:
+        id:
+          type: string
+          example: route-legacy-1
+        sourceDevice:
+          type: integer
+          example: 0
+        destinations:
+          type: array
+          items:
+            type: string
+          example: ["192.168.1.150:7000"]
+        sampleRate:
+          type: integer
+          example: 48000
+        channels:
+          type: integer
+          example: 2
+        peerId:
+          type: string
+          example: peer-xyz
+        peerAddr:
+          type: string
+          example: 192.168.1.150:7000
+        negotiated:
+          type: boolean
+          example: true
+        negSampleRate:
+          type: integer
+          example: 48000
+        negChannels:
+          type: integer
+          example: 2
+        negCodec:
+          type: string
+          example: pcm16
