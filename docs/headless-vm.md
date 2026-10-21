@@ -61,3 +61,11 @@ and lists the receiver's stream UDP address under `destinations`. On the
 receiver, use `direction: "receive"` with the same ID and a local
 `destDevice` or `destDeviceUrn`. Each daemon needs its own routes file and
 distinct listen, discovery, sync, and stream ports when running on one VM.
+
+Daemon PCM16 routes automatically choose the largest whole-millisecond packet
+duration (up to 20 ms) that keeps the audio datagram below 1,150 bytes,
+including the wire header and room for FEC. For example, 48 kHz stereo uses
+5 ms packets rather than fragmented 20 ms packets. Shorter packets cost more
+headers and CPU; this is not a bandwidth-saving codec. Both route endpoints
+must use matching sample rate and channel count. Unsupported high-bandwidth
+formats fail rather than silently sending oversized datagrams.

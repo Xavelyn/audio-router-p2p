@@ -44,6 +44,8 @@ type portaudioInput struct {
 	mu     sync.Mutex
 	stream *portaudio.Stream
 	buf    []int16
+	// next is the first unread sample from the last PortAudio read.
+	next   int
 	closed bool
 }
 
@@ -116,7 +118,7 @@ func OpenInput(deviceID int, sampleRate, channels int, useEmulator bool) (AudioS
 		termPortAudio()
 		return nil, err
 	}
-	return &portaudioInput{stream: st, buf: buf}, nil
+	return &portaudioInput{stream: st, buf: buf, next: len(buf)}, nil
 }
 
 func (p *portaudioInput) Read(dst []byte) (int, error) {
@@ -125,24 +127,24 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 	if p.closed {
 		return 0, io.EOF
 	}
-	if err := p.stream.Read(); err != nil && !errors.Is(err, portaudio.InputOverflowed) {
-		return 0, err
+	if len(dst) < 2 {
+		return 0, io.ErrShortBuffer
 	}
-	// dst must be able to hold one buffer; otherwise the excess frames are
-	// dropped (they have already been consumed from the audio device).
-	need := len(p.buf) * 2
-	if len(dst) >= need {
-		for i, s := range p.buf {
-			binary.LittleEndian.PutUint16(dst[i*2:], uint16(s))
+	if p.next >= len(p.buf) {
+		if err := p.stream.Read(); err != nil && !errors.Is(err, portaudio.InputOverflowed) {
+			return 0, err
 		}
-		return need, nil
+		p.next = 0
 	}
-	n := 0
-	for i := 0; i < len(p.buf) && n+2 <= len(dst); i++ {
-		binary.LittleEndian.PutUint16(dst[n:], uint16(p.buf[i]))
-		n += 2
+	samples := len(dst) / 2
+	if remaining := len(p.buf) - p.next; samples > remaining {
+		samples = remaining
 	}
-	return n, nil
+	for i := 0; i < samples; i++ {
+		binary.LittleEndian.PutUint16(dst[i*2:], uint16(p.buf[p.next+i]))
+	}
+	p.next += samples
+	return samples * 2, nil
 }
 
 func (p *portaudioInput) Write(b []byte) (int, error) { return 0, nil }

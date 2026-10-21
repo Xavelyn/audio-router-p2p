@@ -385,7 +385,16 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			return fmt.Errorf("open local output device %s: %w", dstRef, err)
 		}
 	}
-	streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
+	streamCfg, err := streamer.NetworkPCMConfig(sr.SampleRate, sr.Channels)
+	if err != nil {
+		if in != nil {
+			_ = in.Close()
+		}
+		if out != nil {
+			_ = out.Close()
+		}
+		return err
+	}
 	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, m.disc.NodeID())
 	if err != nil {
 		if in != nil {

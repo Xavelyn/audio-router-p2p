@@ -42,7 +42,9 @@ func TestRouteProcessHelper(t *testing.T) {
 	m := newStreamManager(cfg, trans, []string{"127.0.0.1"}, disc)
 	defer m.StopAll()
 
-	route := router.StreamRoute{ID: "two-process-route", SampleRate: 44100, Channels: 1}
+	// 48 kHz stereo exercises the packet-size policy (5ms, not the old
+	// fragmenting 20ms packet) across a real process boundary.
+	route := router.StreamRoute{ID: "two-process-route", SampleRate: 48000, Channels: 2}
 	if role == "receiver" {
 		route.Direction = "receive"
 		route.DestDevice = 1
