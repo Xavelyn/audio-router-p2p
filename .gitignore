@@ -1,0 +1,13 @@
+# Local Go toolchain and module cache created by tools/bootstrap.sh
+/.tools/
+/.gopath/
+/tools/env.sh
+
+# Web dependencies and generated build output
+/web/node_modules/
+/web/dist/
+
+# Local runtime files
+/routes.json
+/cert.pem
+/key.pem

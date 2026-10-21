@@ -199,12 +199,32 @@ func TestNodeToNode_BidirectionalMatrixRouting(t *testing.T) {
 	stB.SetStreamID(sidBA)
 	defer stB.Stop()
 
-	// Start Node A: transmits to Node B, outputs incoming to outA
-	if err := stA.Start(inA, []string{addrB}, outA); err != nil {
+	// Each directional route has its own session ID and matching receiver on
+	// the shared socket; knowing a sender's address cannot bypass demux.
+	recvA, err := NewStreamer(transA, nil, cfgA, "nodeA")
+	if err != nil {
+		t.Fatalf("NewStreamer receiver A: %v", err)
+	}
+	recvA.SetStreamID(sidBA)
+	defer recvA.Stop()
+	recvB, err := NewStreamer(transB, nil, cfgB, "nodeB")
+	if err != nil {
+		t.Fatalf("NewStreamer receiver B: %v", err)
+	}
+	recvB.SetStreamID(sidAB)
+	defer recvB.Stop()
+	if err := recvA.Start(nil, nil, outA); err != nil {
+		t.Fatalf("Start recvA: %v", err)
+	}
+	if err := recvB.Start(nil, nil, outB); err != nil {
+		t.Fatalf("Start recvB: %v", err)
+	}
+
+	// Start independent send-only directional routes.
+	if err := stA.Start(inA, []string{addrB}, nil); err != nil {
 		t.Fatalf("Start stA: %v", err)
 	}
-	// Start Node B: transmits to Node A, outputs incoming to outB
-	if err := stB.Start(inB, []string{addrA}, outB); err != nil {
+	if err := stB.Start(inB, []string{addrA}, nil); err != nil {
 		t.Fatalf("Start stB: %v", err)
 	}
 

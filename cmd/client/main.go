@@ -244,6 +244,14 @@ func destIsLocal(hostport string, localIPs []string) bool {
 	return false
 }
 
+func sameTransportPort(hostport string, trans streamer.Transport) bool {
+	if trans == nil || trans.LocalAddr() == nil {
+		return false
+	}
+	_, port, err := net.SplitHostPort(hostport)
+	return err == nil && port == strconv.Itoa(trans.LocalAddr().Port)
+}
+
 func contains(slice []string, item string) bool {
 	for _, s := range slice {
 		if s == item {
@@ -296,6 +304,12 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	defer m.mu.Unlock()
 
 	sr := route
+	if sr.Direction != "" && sr.Direction != "send" && sr.Direction != "receive" {
+		return fmt.Errorf("route %s: unsupported direction %q", sr.ID, sr.Direction)
+	}
+	if sr.ID == "" {
+		return errors.New("route ID is required")
+	}
 	if sr.SampleRate <= 0 {
 		sr.SampleRate = 44100
 	}
@@ -312,16 +326,20 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		srcRef = strconv.Itoa(sr.SourceDevice)
 	}
 
-	in, err := m.resolver.OpenInput(srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
-	if err != nil {
-		return fmt.Errorf("open input device %s: %w", srcRef, err)
+	var in audio.AudioStream
+	var err error
+	if sr.Direction != "receive" {
+		in, err = m.resolver.OpenInput(srcRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+		if err != nil {
+			return fmt.Errorf("open input device %s: %w", srcRef, err)
+		}
 	}
 
 	var out audio.AudioStream
 	destAddrs := sr.Destinations
 
 	// If route has a peer ID, try to bind to that peer
-	if sr.PeerID != "" {
+	if sr.Direction != "receive" && sr.PeerID != "" {
 		if peer := m.disc.PeerByID(sr.PeerID); peer != nil && peer.StreamAddr != "" {
 			// Use peer's stream address if available
 			if !contains(destAddrs, peer.StreamAddr) {
@@ -330,7 +348,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			// Update route with peer info for persistence
 			sr.PeerAddr = peer.StreamAddr
 		}
-	} else if len(destAddrs) > 0 {
+	} else if sr.Direction != "receive" && len(destAddrs) > 0 {
 		// Try to match destinations to discovered peers
 		for i, dest := range destAddrs {
 			if peer := m.disc.PeerByAddr(dest); peer != nil && peer.StreamAddr != "" {
@@ -342,31 +360,50 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 	}
 
-	for _, d := range destAddrs {
-		if destIsLocal(d, m.localIPs) {
-			dstRef := sr.DestDeviceURN
-			if dstRef == "" {
-				dstRef = strconv.Itoa(sr.DestDevice)
+	if sr.Direction == "receive" {
+		destAddrs = nil
+	}
+	openOutput := sr.Direction == "receive"
+	if !openOutput {
+		for _, d := range destAddrs {
+			if destIsLocal(d, m.localIPs) && sameTransportPort(d, m.trans) {
+				openOutput = true
+				break
 			}
-			out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
-			if err != nil {
+		}
+	}
+	if openOutput {
+		dstRef := sr.DestDeviceURN
+		if dstRef == "" {
+			dstRef = strconv.Itoa(sr.DestDevice)
+		}
+		out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+		if err != nil {
+			if in != nil {
 				_ = in.Close()
-				return fmt.Errorf("open local output device %s: %w", dstRef, err)
 			}
-			break
+			return fmt.Errorf("open local output device %s: %w", dstRef, err)
 		}
 	}
 	streamCfg := streamer.DefaultStreamConfig(sr.SampleRate, sr.Channels)
 	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, m.disc.NodeID())
 	if err != nil {
-		_ = in.Close()
+		if in != nil {
+			_ = in.Close()
+		}
 		if out != nil {
 			_ = out.Close()
 		}
 		return err
 	}
+	// Both endpoints of a route must use the same ID to demultiplex packets
+	// on the shared transport. Keep the ID stable across route restarts while
+	// separating routes (and deployments with different auth tokens).
+	st.SetStreamID(streamer.DeriveStreamID(m.cfg.AuthToken, "route:"+sr.ID))
 	if err := st.Start(in, destAddrs, out); err != nil {
-		_ = in.Close()
+		if in != nil {
+			_ = in.Close()
+		}
 		if out != nil {
 			_ = out.Close()
 		}

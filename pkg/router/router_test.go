@@ -40,3 +40,23 @@ func TestRouterAddGetDelete(t *testing.T) {
 		t.Fatalf("route still present after delete")
 	}
 }
+
+func TestReceiveRoutePersists(t *testing.T) {
+	path := t.TempDir() + "/routes.json"
+	r, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	route := StreamRoute{ID: "remote-to-local", Direction: "receive", DestDevice: 1}
+	if err := r.Add(route); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reloaded.Get(route.ID)
+	if !ok || got.Direction != "receive" || got.DestDevice != 1 {
+		t.Fatalf("reloaded receive route = %+v, found = %v", got, ok)
+	}
+}

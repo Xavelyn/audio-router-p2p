@@ -15,6 +15,7 @@ import (
 // StreamRoute describes how audio from one source device is delivered.
 type StreamRoute struct {
 	ID              string   `json:"id"`
+	Direction       string   `json:"direction,omitempty"` // "receive" for a receiver-only route; otherwise send
 	SourceDevice    int      `json:"sourceDevice"`
 	SourceDeviceURN string   `json:"sourceDeviceUrn,omitempty"`
 	DestDevice      int      `json:"destDevice,omitempty"`
@@ -318,6 +319,10 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 
 // MatrixRouteToStreamRoute converts a canonical MatrixRoute to legacy StreamRoute.
 func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
+	direction := ""
+	if mr.Source.NodeID != "" && mr.Source.NodeID != "local" {
+		direction = "receive"
+	}
 	var srcDev int
 	trimmedSrc := strings.TrimPrefix(mr.Source.DeviceID, "hw:")
 	trimmedSrc = strings.TrimPrefix(trimmedSrc, "dev:")
@@ -344,6 +349,7 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 	}
 	return StreamRoute{
 		ID:              mr.ID,
+		Direction:       direction,
 		SourceDevice:    srcDev,
 		SourceDeviceURN: mr.Source.DeviceID,
 		DestDevice:      dstDev,

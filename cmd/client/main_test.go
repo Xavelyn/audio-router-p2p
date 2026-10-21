@@ -7,8 +7,10 @@ import (
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
+	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
+	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/transport"
 )
 
@@ -83,15 +85,15 @@ func TestStreamManager(t *testing.T) {
 	defer trans.Close()
 
 	cfg := &config.Config{
-		UseEmulator:     true,
-		ShutdownTimeout: 1 * time.Second,
-		DiscoveryPort:   0,
-		MulticastPort:   0,
-		SyncPort:        0,
+		UseEmulator:      true,
+		ShutdownTimeout:  1 * time.Second,
+		DiscoveryPort:    0,
+		MulticastPort:    0,
+		SyncPort:         0,
 		AnnounceInterval: 1 * time.Second,
-		PeerTTL:         3 * time.Second,
-		SyncInterval:    1 * time.Second,
-		AuthToken:       "test-tok",
+		PeerTTL:          3 * time.Second,
+		SyncInterval:     1 * time.Second,
+		AuthToken:        "test-tok",
 	}
 
 	disc, err := discovery.New(cfg, "test-node-sm")
@@ -118,6 +120,10 @@ func TestStreamManager(t *testing.T) {
 	if _, ok := stats["test-route-1"]; !ok {
 		t.Errorf("expected stats for test-route-1")
 	}
+	wantID := streamer.DeriveStreamID(cfg.AuthToken, "route:"+route.ID)
+	if got := sm.routes[route.ID].st.StreamID(); got != wantID {
+		t.Fatalf("route stream ID = %x, want %x", got, wantID)
+	}
 
 	// Stop single route
 	if err := sm.StopRoute("test-route-1"); err != nil {
@@ -128,5 +134,75 @@ func TestStreamManager(t *testing.T) {
 	if err := sm.StartRoute(route); err != nil {
 		t.Fatalf("StartRoute 2 failed: %v", err)
 	}
+	if got := sm.routes[route.ID].st.StreamID(); got != wantID {
+		t.Fatalf("restarted route stream ID = %x, want %x", got, wantID)
+	}
 	sm.StopAll()
+}
+
+func TestStreamManagersSendAndReceiveRoute(t *testing.T) {
+	senderTransport, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderTransport.Close()
+	receiverTransport, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverTransport.Close()
+
+	cfg := &config.Config{
+		AuthToken: "shared-test-token", UseEmulator: true,
+		AnnounceInterval: time.Second, PeerTTL: 3 * time.Second, SyncInterval: time.Second,
+	}
+	senderDisc, err := discovery.New(cfg, "sender")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer senderDisc.Close()
+	receiverDisc, err := discovery.New(cfg, "receiver")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiverDisc.Close()
+	localIPs := []string{"127.0.0.1"}
+	sender := newStreamManager(cfg, senderTransport, localIPs, senderDisc)
+	receiver := newStreamManager(cfg, receiverTransport, localIPs, receiverDisc)
+	// Only the receiver has an output; it listens before capture starts.
+	if err := receiver.StartRoute(router.StreamRoute{
+		ID: "shared-route", Direction: "receive", DestDevice: 1,
+		SampleRate: 44100, Channels: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.StopAll()
+	if receiver.routes["shared-route"].in != nil || receiver.routes["shared-route"].out == nil {
+		t.Fatal("receive route must open output only")
+	}
+	if err := sender.StartRoute(router.StreamRoute{
+		ID: "shared-route", SourceDevice: 0,
+		Destinations: []string{receiverTransport.Addr()},
+		SampleRate:   44100, Channels: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer sender.StopAll()
+	if sender.routes["shared-route"].out != nil {
+		t.Fatal("remote send route unexpectedly opened local output")
+	}
+	if sender.routes["shared-route"].st.StreamID() != receiver.routes["shared-route"].st.StreamID() {
+		t.Fatal("send and receive routes do not share a stream ID")
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for audio.OutputBufferSize(receiver.routes["shared-route"].out) == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := audio.OutputBufferSize(receiver.routes["shared-route"].out); got == 0 {
+		t.Fatal("receiver did not play network audio")
+	}
+	if got := receiver.Stats()["shared-route"].PacketsReceived; got == 0 {
+		t.Fatal("receiver did not count any packets")
+	}
 }

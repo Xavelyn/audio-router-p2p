@@ -550,6 +550,69 @@ func TestStreamerSetStreamIDAndStats(t *testing.T) {
 	}
 }
 
+func TestStreamerRejectsDifferentStreamFromKnownPeer(t *testing.T) {
+	s, err := NewStreamer(nil, nil, DefaultStreamConfig(48000, 1), "receiver")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.SetStreamID(DeriveStreamID("secret", "route-a"))
+	addr := &net.UDPAddr{IP: net.ParseIP("127.0.0.2"), Port: 45678}
+	peer := &RemotePeer{
+		Addr:      addr.String(),
+		JitterBuf: NewJitterBuffer(s.packetBytes(), 48000, 1, 16),
+	}
+	defer peer.JitterBuf.Close()
+	s.peers[addr.String()] = peer
+
+	other := transport.Marshal(transport.PacketHeader{
+		Seq: 1, Timestamp: uint64(time.Now().UnixNano()),
+		StreamID:   DeriveStreamID("secret", "route-b"),
+		SampleRate: 48000, Channels: 1,
+	}, make([]byte, s.packetBytes()))
+	s.handlePacket(other, addr)
+	if got := s.Stats().PacketsReceived; got != 0 {
+		t.Fatalf("wrong-route packet counted as received: %d", got)
+	}
+	if got := peer.JitterBuf.Stats().BufferedFrames; got != 0 {
+		t.Fatalf("wrong-route packet entered jitter buffer: %d frames", got)
+	}
+
+	good := transport.Marshal(transport.PacketHeader{
+		Seq: 1, Timestamp: uint64(time.Now().UnixNano()),
+		StreamID: s.StreamID(), SampleRate: 48000, Channels: 1,
+	}, make([]byte, s.packetBytes()))
+	s.handlePacket(good, addr)
+	if got := s.Stats().PacketsReceived; got != 1 {
+		t.Fatalf("matching packet count = %d, want 1", got)
+	}
+	if got := peer.JitterBuf.Stats().BufferedFrames; got != 1 {
+		t.Fatalf("matching packet buffered = %d frames, want 1", got)
+	}
+}
+
+func TestStreamerLocalBypassRequiresSamePort(t *testing.T) {
+	udp, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	s, err := NewStreamer(udp, []string{"127.0.0.1"}, DefaultStreamConfig(44100, 1), "node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.isLocalDest(udp.Addr()) {
+		t.Fatal("own socket should be local")
+	}
+	other, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if s.isLocalDest(other.Addr()) {
+		t.Fatal("another daemon on the same host must not bypass UDP")
+	}
+}
+
 func TestStreamLinkStats_AtomicCollection(t *testing.T) {
 	s, err := NewStreamer(nil, []string{"127.0.0.1"}, DefaultStreamConfig(44100, 1), "test-node")
 	if err != nil {

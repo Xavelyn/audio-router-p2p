@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"math"
@@ -82,14 +83,14 @@ type RemotePeer struct {
 	asrcOutBuf     []byte
 
 	// Telemetry atomic accumulators for lock-free interrogation
-	packetsSent   atomic.Uint64
-	packetsRecv   atomic.Uint64
-	bytesSent     atomic.Uint64
-	bytesRecv     atomic.Uint64
-	packetsLost   atomic.Uint64
-	fecRecovered  atomic.Uint64
-	lastSeq       atomic.Uint32
-	hasSeq        atomic.Bool
+	packetsSent  atomic.Uint64
+	packetsRecv  atomic.Uint64
+	bytesSent    atomic.Uint64
+	bytesRecv    atomic.Uint64
+	packetsLost  atomic.Uint64
+	fecRecovered atomic.Uint64
+	lastSeq      atomic.Uint32
+	hasSeq       atomic.Bool
 
 	lastRateCalc  atomic.Int64 // unix nano
 	lastRateBytes atomic.Uint64
@@ -153,18 +154,18 @@ type Streamer struct {
 	audioTapMu        sync.RWMutex
 
 	// Send path
-	sendSeq        atomic.Uint32
-	fecEncoder     *transport.FECEncoder
-	fecEncoderMu   sync.Mutex
-	fecParitySent  atomic.Uint64
+	sendSeq       atomic.Uint32
+	fecEncoder    *transport.FECEncoder
+	fecEncoderMu  sync.Mutex
+	fecParitySent atomic.Uint64
 
 	// Receive path
-	recvWG         sync.WaitGroup
-	peers          map[string]*RemotePeer // keyed by peer address
-	peersMu        sync.RWMutex
-	packetsRecv    atomic.Uint64
-	fecParityRecv  atomic.Uint64
-	fecRecovered   atomic.Uint64
+	recvWG        sync.WaitGroup
+	peers         map[string]*RemotePeer // keyed by peer address
+	peersMu       sync.RWMutex
+	packetsRecv   atomic.Uint64
+	fecParityRecv atomic.Uint64
+	fecRecovered  atomic.Uint64
 
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.
@@ -582,9 +583,10 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	peer, ok := s.peers[peerAddr]
 	s.peersMu.RUnlock()
 
-	// Accept packets whose hdr.StreamID == s.streamID OR if s.streamID == [16]byte{}
-	// (promiscuous/accept-all) OR if peer exists in s.peers.
-	if hdr.StreamID != sid && sid != emptyID && !ok {
+	// An address may carry several routes over a shared socket. A known peer
+	// address never overrides the session ID check. The zero ID is retained as
+	// an explicit accept-all mode for callers that intentionally request it.
+	if sid != emptyID && hdr.StreamID != sid {
 		return // not for us
 	}
 
@@ -993,6 +995,19 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 
 // isLocalDest reports whether hostport resolves to a local IP.
 func (s *Streamer) isLocalDest(hostport string) bool {
+	// A peer on the same host but a different UDP port is a distinct node,
+	// not a local audio bypass. This matters for multi-daemon setups and
+	// loopback integration tests.
+	if s.transport != nil {
+		_, port, err := net.SplitHostPort(hostport)
+		if err != nil {
+			return false
+		}
+		local := s.transport.LocalAddr()
+		if local == nil || port != fmt.Sprint(local.Port) {
+			return false
+		}
+	}
 	ip, err := parseIP(hostport)
 	if err != nil {
 		return false
