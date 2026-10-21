@@ -354,6 +354,41 @@ func TestJitterBufferRespectsPlayoutDeadline(t *testing.T) {
 	}
 }
 
+func TestJitterBufferAdaptationRetimesPlayout(t *testing.T) {
+	jb := NewJitterBuffer(960, 48000, 1, 20)
+	defer jb.Close()
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	jb.minDelay = 20 * time.Millisecond
+	jb.maxDelay = 200 * time.Millisecond
+	jb.targetDelay = jb.minDelay
+	jb.playoutDelay = jb.minDelay
+	anchor := jb.playoutTime
+	first := time.Now()
+	jb.adaptDelay(first, first, 1)
+	jb.adaptDelay(first.Add(30*time.Millisecond), first.Add(20*time.Millisecond), 2)
+	if jb.targetDelay <= jb.minDelay {
+		t.Fatalf("target did not increase after 10ms transit variation: %s", jb.targetDelay)
+	}
+	if got := jb.playoutTime.Sub(anchor); got != time.Millisecond {
+		t.Fatalf("playout moved %s, want gradual 1ms", got)
+	}
+}
+
+func TestJitterBufferAdaptationIgnoresSenderClockOffset(t *testing.T) {
+	jb := NewJitterBuffer(960, 48000, 1, 20)
+	defer jb.Close()
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	first := time.Now()
+	sender := first.Add(-10 * time.Hour)
+	jb.adaptDelay(first, sender, 1)
+	jb.adaptDelay(first.Add(20*time.Millisecond), sender.Add(20*time.Millisecond), 2)
+	if jb.targetDelay != jb.minDelay {
+		t.Fatalf("clock offset affected jitter target: %s", jb.targetDelay)
+	}
+}
+
 // TestJitterBufferOutOfOrder verifies that packets arriving out of order are
 // played back in sequence order.
 func TestJitterBufferOutOfOrder(t *testing.T) {

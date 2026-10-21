@@ -2,7 +2,6 @@ package streamer
 
 import (
 	"errors"
-	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,11 +54,15 @@ type JitterBuffer struct {
 
 	// Adaptive delay
 	targetDelay   time.Duration
+	playoutDelay  time.Duration // delay actually applied to playoutTime
 	minDelay      time.Duration
 	maxDelay      time.Duration
-	ewmaDelay     time.Duration
 	ewmaDeviation time.Duration
 	alpha         float64 // EWMA smoothing factor
+	lastArrival   time.Time
+	lastSenderTS  time.Time
+	lastJitterSeq uint32
+	hasJitterSeq  bool
 
 	// Stats
 	underruns    uint64
@@ -100,20 +103,20 @@ func NewJitterBuffer(frameSize, sampleRate, channels int, capacityFrames int) *J
 		frames[i].data = make([]byte, frameSize)
 	}
 	return &JitterBuffer{
-		frames:      frames,
-		capacity:    capacityFrames,
-		frameSize:   frameSize,
-		sampleRate:  sampleRate,
-		channels:    channels,
-		minDelay:    minDelay,
-		maxDelay:    maxDelay,
-		targetDelay: minDelay,
-		ewmaDelay:   minDelay,
-		alpha:       0.125,
-		plc:         dsp.NewPSOLAConcealer(sampleRate, channels),
-		driftCtrl:   NewClockDriftController(DefaultClockDriftConfig(targetWatermark)),
-		concealBuf:  make([]byte, frameSize),
-		recoverBuf:  make([]byte, frameSize),
+		frames:       frames,
+		capacity:     capacityFrames,
+		frameSize:    frameSize,
+		sampleRate:   sampleRate,
+		channels:     channels,
+		minDelay:     minDelay,
+		maxDelay:     maxDelay,
+		targetDelay:  minDelay,
+		playoutDelay: minDelay,
+		alpha:        0.125,
+		plc:          dsp.NewPSOLAConcealer(sampleRate, channels),
+		driftCtrl:    NewClockDriftController(DefaultClockDriftConfig(targetWatermark)),
+		concealBuf:   make([]byte, frameSize),
+		recoverBuf:   make([]byte, frameSize),
 	}
 }
 
@@ -149,6 +152,8 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 		jb.nextSeq = seq
 		jb.originTime = ts
 		jb.playoutTime = now.Add(jb.targetDelay)
+		jb.playoutDelay = jb.targetDelay
+		jb.hasJitterSeq = false
 		jb.seqInitialized = true
 	} else if (flags & transport.FlagActive) != 0 {
 		if jb.dtxMode {
@@ -158,6 +163,8 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 			jb.nextSeq = seq
 			jb.originTime = ts
 			jb.playoutTime = now.Add(jb.targetDelay)
+			jb.playoutDelay = jb.targetDelay
+			jb.hasJitterSeq = false
 			jb.seqInitialized = true
 		}
 	}
@@ -168,6 +175,7 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 		jb.nextSeq = seq
 		jb.originTime = ts
 		jb.playoutTime = now.Add(jb.targetDelay)
+		jb.playoutDelay = jb.targetDelay
 		jb.seqInitialized = true
 	}
 
@@ -183,7 +191,7 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
 
 	// Check if packet is too late (already past playout time)
-	late := now.After(expectedPlayout.Add(jb.targetDelay))
+	late := now.After(expectedPlayout)
 	if late {
 		jb.latePackets++
 	}
@@ -209,9 +217,10 @@ func (jb *JitterBuffer) PushWithFlags(seq uint32, timestamp int64, data []byte, 
 	f.received = now
 	f.valid = true
 
-	// Adaptive delay adjustment based on arrival time vs expected (omit SID packets from jitter stats)
-	if jb.seqInitialized && !late && !isSID {
-		jb.adaptDelay(now, expectedPlayout)
+	// Sender/receiver clocks need not agree. Use differences between packet
+	// transit times to estimate jitter, rather than absolute wall clock delay.
+	if !late && !isSID && flags&transport.FlagRedundant == 0 {
+		jb.adaptDelay(now, ts, seq)
 	}
 
 	// Update clock drift controller with current buffer depth
@@ -360,25 +369,24 @@ func (jb *JitterBuffer) frameDuration() time.Duration {
 	return time.Duration(framesPerPacket) * time.Second / time.Duration(jb.sampleRate)
 }
 
-func (jb *JitterBuffer) adaptDelay(arrival, expected time.Time) {
-	// Calculate network delay variation
-	delay := arrival.Sub(expected)
-	if delay < 0 {
-		delay = 0
+func (jb *JitterBuffer) adaptDelay(arrival, senderTS time.Time, seq uint32) {
+	if jb.hasJitterSeq && int32(seq-jb.lastJitterSeq) <= 0 {
+		return // reordered packets cannot form a valid transit-time pair
 	}
-
-	// EWMA of delay and deviation
-	if jb.ewmaDelay == 0 {
-		jb.ewmaDelay = delay
-		jb.ewmaDeviation = delay / 2
-	} else {
-		jb.ewmaDelay = time.Duration(float64(jb.ewmaDelay)*(1-jb.alpha) + float64(delay)*jb.alpha)
-		dev := time.Duration(math.Abs(float64(delay - jb.ewmaDelay)))
-		jb.ewmaDeviation = time.Duration(float64(jb.ewmaDeviation)*(1-jb.alpha) + float64(dev)*jb.alpha)
+	if jb.hasJitterSeq {
+		variation := arrival.Sub(jb.lastArrival) - senderTS.Sub(jb.lastSenderTS)
+		if variation < 0 {
+			variation = -variation
+		}
+		// Ignore implausible discontinuities (e.g. source clock reset).
+		if variation <= jb.maxDelay {
+			jb.ewmaDeviation = time.Duration(float64(jb.ewmaDeviation)*(1-jb.alpha) + float64(variation)*jb.alpha)
+		}
 	}
+	jb.lastArrival, jb.lastSenderTS, jb.lastJitterSeq, jb.hasJitterSeq = arrival, senderTS, seq, true
 
-	// Target delay = ewmaDelay + 4*deviation (covers ~95% of variation)
-	newTarget := jb.ewmaDelay + 4*jb.ewmaDeviation
+	// Base latency plus a margin for observed transit variation.
+	newTarget := jb.minDelay + 4*jb.ewmaDeviation
 	if newTarget < jb.minDelay {
 		newTarget = jb.minDelay
 	}
@@ -387,6 +395,17 @@ func (jb *JitterBuffer) adaptDelay(arrival, expected time.Time) {
 	}
 	jb.targetDelay = newTarget
 	jb.atomicTargetDelay.Store(int64(newTarget))
+	// Do not jump the playout schedule: a sudden delay change would cause a
+	// skip or duplicate a packet. Move at most 1ms per received packet.
+	step := time.Millisecond
+	delta := newTarget - jb.playoutDelay
+	if delta > step {
+		delta = step
+	} else if delta < -step {
+		delta = -step
+	}
+	jb.playoutTime = jb.playoutTime.Add(delta)
+	jb.playoutDelay += delta
 }
 
 // AtomicLinkStats returns instantaneous jitter buffer metrics without locking the audio thread.
