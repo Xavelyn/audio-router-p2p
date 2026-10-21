@@ -290,7 +290,7 @@ func TestStreamerStopsOnEOF(t *testing.T) {
 
 // TestJitterBuffer tests the jitter buffer independently
 func TestJitterBuffer(t *testing.T) {
-	jb := NewJitterBuffer(2, 44100, 1, 10)
+	jb := NewJitterBuffer(2, 50, 1, 10)
 	defer jb.Close()
 
 	// Push some frames
@@ -324,10 +324,40 @@ func TestJitterBuffer(t *testing.T) {
 	}
 }
 
+func TestJitterBufferRespectsPlayoutDeadline(t *testing.T) {
+	// 480 samples at 48kHz is a 10ms packet; this test also guards against
+	// silently treating every packet as a 20ms frame.
+	jb := NewJitterBuffer(480*2, 48000, 1, 20)
+	defer jb.Close()
+	if got := jb.frameDuration(); got != 10*time.Millisecond {
+		t.Fatalf("frame duration = %s, want 10ms", got)
+	}
+	jb.targetDelay = 80 * time.Millisecond
+	frame := make([]byte, 480*2)
+	if _, err := jb.Push(0, time.Now().UnixNano(), frame); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := jb.PopNonBlock(); err != ErrBufferEmpty {
+		t.Fatalf("frame played before deadline: %v", err)
+	}
+	if got := jb.Stats().BufferedFrames; got != 1 {
+		t.Fatalf("early pop consumed frame: %d buffered", got)
+	}
+	// Pop must wait for the same deadline even when a frame is already present.
+	start := time.Now()
+	_, seq, err := jb.Pop()
+	if err != nil || seq != 0 {
+		t.Fatalf("Pop: seq=%d err=%v", seq, err)
+	}
+	if elapsed := time.Since(start); elapsed < 35*time.Millisecond {
+		t.Fatalf("Pop returned before playout deadline (%s)", elapsed)
+	}
+}
+
 // TestJitterBufferOutOfOrder verifies that packets arriving out of order are
 // played back in sequence order.
 func TestJitterBufferOutOfOrder(t *testing.T) {
-	jb := NewJitterBuffer(2, 44100, 1, 10)
+	jb := NewJitterBuffer(2, 50, 1, 10)
 	defer jb.Close()
 
 	baseTime := time.Now().UnixNano()
@@ -357,7 +387,7 @@ func TestJitterBufferOutOfOrder(t *testing.T) {
 // silence once its playout time passes, and later out-of-order arrival does not
 // disturb the playout cursor.
 func TestJitterBufferGapFill(t *testing.T) {
-	jb := NewJitterBuffer(2, 44100, 1, 10)
+	jb := NewJitterBuffer(2, 50, 1, 10)
 	defer jb.Close()
 
 	baseTime := time.Now().UnixNano()
@@ -408,7 +438,7 @@ func TestJitterBufferGapFill(t *testing.T) {
 // TestJitterBufferWraparound verifies the ring indexing survives uint32
 // sequence number wraparound.
 func TestJitterBufferWraparound(t *testing.T) {
-	jb := NewJitterBuffer(2, 44100, 1, 10)
+	jb := NewJitterBuffer(2, 50, 1, 10)
 	defer jb.Close()
 
 	baseTime := time.Now().UnixNano()
@@ -435,7 +465,7 @@ func TestJitterBufferWraparound(t *testing.T) {
 }
 
 func TestJitterBuffer_LatePackets(t *testing.T) {
-	jb := NewJitterBuffer(2, 44100, 1, 10)
+	jb := NewJitterBuffer(2, 50, 1, 10)
 	defer jb.Close()
 
 	baseTime := time.Now().UnixNano()

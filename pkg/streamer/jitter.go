@@ -246,7 +246,9 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 
 		idx := int(jb.nextSeq % uint32(jb.capacity))
 		frame := &jb.frames[idx]
-		if frame.valid && frame.seq == jb.nextSeq {
+		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
+		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
+		if !time.Now().Before(expectedPlayout) && frame.valid && frame.seq == jb.nextSeq {
 			frame.valid = false
 			jb.atomicBuffered.Add(-1)
 			jb.nextSeq++
@@ -263,9 +265,7 @@ func (jb *JitterBuffer) Pop() ([]byte, uint32, error) {
 		}
 
 		// Check if it's time to play out silence or run PLC (underrun or DTX comfort noise)
-		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
-		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
-		if time.Now().After(expectedPlayout) {
+		if !time.Now().Before(expectedPlayout) {
 			if !jb.dtxMode {
 				jb.underruns++
 				jb.atomicUnderruns.Add(1)
@@ -306,10 +306,13 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 
 	idx := int(jb.nextSeq % uint32(jb.capacity))
 	frame := &jb.frames[idx]
+	distFromOrigin := int32(jb.nextSeq - jb.originSeq)
+	expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
+	if time.Now().Before(expectedPlayout) {
+		return nil, 0, ErrBufferEmpty
+	}
 	if !frame.valid || frame.seq != jb.nextSeq {
-		distFromOrigin := int32(jb.nextSeq - jb.originSeq)
-		expectedPlayout := jb.playoutTime.Add(time.Duration(distFromOrigin) * jb.frameDuration())
-		if time.Now().After(expectedPlayout) {
+		if !time.Now().Before(expectedPlayout) {
 			if !jb.dtxMode {
 				jb.underruns++
 				jb.atomicUnderruns.Add(1)
@@ -344,13 +347,17 @@ func (jb *JitterBuffer) PopNonBlock() ([]byte, uint32, error) {
 }
 
 func (jb *JitterBuffer) frameDuration() time.Duration {
-	// Each ring slot holds one 20ms packet of audio, so the playout advances
-	// by the packet duration per sequence step - not the per-sample duration.
-	framesPerPacket := jb.sampleRate / 50 // 20ms = 1/50 sec
-	if framesPerPacket <= 0 {
-		framesPerPacket = 1
+	// A ring slot is one PCM packet; its duration follows its frame size,
+	// not a fixed 20ms assumption. The sender's packet size is determined by
+	// StreamConfig.PacketTime and sample rate.
+	if jb.sampleRate <= 0 || jb.channels <= 0 {
+		return 20 * time.Millisecond
 	}
-	return time.Duration(float64(time.Second) * float64(framesPerPacket) / float64(jb.sampleRate))
+	framesPerPacket := jb.frameSize / (jb.channels * 2)
+	if framesPerPacket <= 0 {
+		return 20 * time.Millisecond
+	}
+	return time.Duration(framesPerPacket) * time.Second / time.Duration(jb.sampleRate)
 }
 
 func (jb *JitterBuffer) adaptDelay(arrival, expected time.Time) {
