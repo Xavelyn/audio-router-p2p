@@ -98,4 +98,8 @@ func (m *routeMatrix) Write(p []byte) (int, error) {
 
 func (m *routeMatrix) Close() error { return m.device.Close() }
 
+// Counters delegates to the wrapped device so diagnostics can see the
+// hardware counters through the matrix.
+func (m *routeMatrix) Counters() audio.DeviceCounters { return audio.CountersOf(m.device) }
+
 var _ audio.AudioStream = (*routeMatrix)(nil)

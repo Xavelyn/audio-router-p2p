@@ -159,6 +159,29 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Check if this is a per-route status: /api/v1/routes/{id}/status
+	if strings.HasSuffix(sub, "/status") {
+		routeID := strings.TrimSuffix(sub, "/status")
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		provider, ok := s.streams.(interface {
+			RouteStatus(routeID string) (RouteStatus, bool)
+		})
+		if !ok || provider == nil {
+			s.WriteError(w, http.StatusNotImplemented, "ERR_UNSUPPORTED", "route status is not available on this server")
+			return
+		}
+		st, found := provider.RouteStatus(routeID)
+		if !found {
+			s.WriteError(w, http.StatusNotFound, "ERR_NOT_FOUND", "route is not running")
+			return
+		}
+		s.WriteJSON(w, http.StatusOK, st)
+		return
+	}
+
 	// Check if this is a crosspoint update: /api/v1/routes/{id}/crosspoint
 	if strings.HasSuffix(sub, "/crosspoint") {
 		routeID := strings.TrimSuffix(sub, "/crosspoint")

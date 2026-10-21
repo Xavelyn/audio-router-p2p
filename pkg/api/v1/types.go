@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"time"
+
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/telemetry"
 )
@@ -195,6 +197,42 @@ type StreamStats struct {
 	PLC               PLCStats               `json:"plc"`
 	ASRC              ASRCStats              `json:"asrc"`
 	Peers             map[string]JitterStats `json:"peers,omitempty"`
+}
+
+// RoutePeerStatus is the per-peer link view inside a route's status.
+type RoutePeerStatus struct {
+	PeerID            string     `json:"peer_id,omitempty"`
+	Address           string     `json:"address"`
+	Role              string     `json:"role"` // "send" (a destination) or "receive" (a learned source)
+	LastSend          *time.Time `json:"last_send,omitempty"`
+	LastRecv          *time.Time `json:"last_recv,omitempty"`
+	LastContact       *time.Time `json:"last_contact,omitempty"`
+	LastSendError     string     `json:"last_send_error,omitempty"`
+	PacketsSent       uint64     `json:"packets_sent"`
+	PacketsLost       uint64     `json:"packets_lost"`
+	FECRecovered      uint64     `json:"fec_recovered"`
+	JitterDepthFrames int        `json:"jitter_depth_frames"`
+	Underruns         uint64     `json:"underruns"`
+}
+
+// RouteStatus answers "why isn't this route playing" for one live route.
+// Reasons are human-readable, ordered from most to least likely cause.
+type RouteStatus struct {
+	RouteID           string            `json:"route_id"`
+	Direction         string            `json:"direction"` // "send", "receive", or "sendrecv"
+	Playing           bool              `json:"playing"`
+	Summary           string            `json:"summary"`
+	Reasons           []string          `json:"reasons,omitempty"`
+	Peers             []RoutePeerStatus `json:"peers,omitempty"`
+	PacketsReceived   uint64            `json:"packets_received"`
+	Underruns         uint64            `json:"underruns"`
+	Overruns          uint64            `json:"overruns"`
+	JitterDepthFrames int               `json:"jitter_depth_frames"`
+	DTXState          string            `json:"dtx_state,omitempty"`
+	CaptureOverflows  uint64            `json:"capture_overflows"`
+	OutputUnderruns   uint64            `json:"output_underflows"`
+	LastInput         *time.Time        `json:"last_input,omitempty"`
+	LastPlayout       *time.Time        `json:"last_playout,omitempty"`
 }
 
 // WSControlMessage represents command payloads received over live WebSocket.

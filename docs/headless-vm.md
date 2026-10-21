@@ -105,3 +105,14 @@ audio packets (configurable with `StreamConfig.PeerIdleTimeout` for embedded
 streamers). A returning sender gets fresh jitter/FEC and sequence state, so a
 restart at the same UDP address does not stay stuck behind the old sequence.
 Configured destinations are not expired by this receiver-side cleanup.
+
+`GET /api/v1/routes/{id}/status` answers "why isn't this route playing?" for a
+running route. It reports a `playing` flag, an ordered list of human-readable
+`reasons` (capture overflow or starvation, peer not discovered, no send
+destination, send errors, DTX-mutated silence, no audio from the peer, jitter
+underruns, output underflow), pipeline counters (packet loss, FEC recovery,
+jitter depth, underruns/overruns, capture overflows, output underflows), and
+last activity timestamps for capture, send, receive, and playout plus per-peer
+last contact. Unknown or stopped routes return 404; servers without a live
+stream manager return 501. A send route counts as playing while its sends are
+fresh or while capture is live and DTX intentionally mutes a silent input.

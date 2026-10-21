@@ -47,6 +47,9 @@ type portaudioInput struct {
 	// next is the first unread sample from the last PortAudio read.
 	next   int
 	closed bool
+	// overflows counts input buffer overflows: the host could not drain the
+	// device fast enough and audio was dropped before we ever saw it.
+	overflows atomic.Uint64
 }
 
 func resolveInputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
@@ -131,8 +134,11 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 		return 0, io.ErrShortBuffer
 	}
 	if p.next >= len(p.buf) {
-		if err := p.stream.Read(); err != nil && !errors.Is(err, portaudio.InputOverflowed) {
-			return 0, err
+		if err := p.stream.Read(); err != nil {
+			if !errors.Is(err, portaudio.InputOverflowed) {
+				return 0, err
+			}
+			p.overflows.Add(1)
 		}
 		p.next = 0
 	}
@@ -148,6 +154,11 @@ func (p *portaudioInput) Read(dst []byte) (int, error) {
 }
 
 func (p *portaudioInput) Write(b []byte) (int, error) { return 0, nil }
+
+// Counters reports input buffer overflows observed on this device stream.
+func (p *portaudioInput) Counters() DeviceCounters {
+	return DeviceCounters{Overflows: p.overflows.Load()}
+}
 
 func (p *portaudioInput) Close() error {
 	p.mu.Lock()
@@ -176,6 +187,9 @@ type portaudioOutput struct {
 	blockBytes int
 	spill      []byte
 	closed     bool
+	// underflows counts output buffer underflows: the device ran dry and
+	// played silence because we did not feed it in time.
+	underflows atomic.Uint64
 }
 
 func resolveOutputDevice(deviceID int) (*portaudio.DeviceInfo, error) {
@@ -269,9 +283,12 @@ func (o *portaudioOutput) Write(p []byte) (int, error) {
 		for i := range o.buf {
 			o.buf[i] = int16(binary.LittleEndian.Uint16(data[base+i*2:]))
 		}
-		if err := o.stream.Write(); err != nil && !errors.Is(err, portaudio.OutputUnderflowed) {
-			o.spill = append(o.spill[:0], data[off:end]...)
-			return off, err
+		if err := o.stream.Write(); err != nil {
+			if !errors.Is(err, portaudio.OutputUnderflowed) {
+				o.spill = append(o.spill[:0], data[off:end]...)
+				return off, err
+			}
+			o.underflows.Add(1)
 		}
 		off += o.blockBytes
 	}
@@ -280,6 +297,11 @@ func (o *portaudioOutput) Write(p []byte) (int, error) {
 }
 
 func (o *portaudioOutput) Read(b []byte) (int, error) { return 0, nil }
+
+// Counters reports output buffer underflows observed on this device stream.
+func (o *portaudioOutput) Counters() DeviceCounters {
+	return DeviceCounters{Underflows: o.underflows.Load()}
+}
 
 func (o *portaudioOutput) Close() error {
 	o.mu.Lock()

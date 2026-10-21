@@ -19,6 +19,31 @@ type AudioStream interface {
 	Close() error
 }
 
+// DeviceCounters holds hardware buffer failure counters for a device stream.
+type DeviceCounters struct {
+	Overflows  uint64 `json:"overflows"`  // input buffer overflows (capture dropped audio)
+	Underflows uint64 `json:"underflows"` // output buffer underflows (playback starved)
+}
+
+// CounterStream is implemented by audio streams that can report hardware
+// buffer counters (for example real PortAudio device streams).
+type CounterStream interface {
+	AudioStream
+	Counters() DeviceCounters
+}
+
+// CountersOf returns the hardware counters of streams that report them, or
+// zero counters for streams that do not track any.
+func CountersOf(s AudioStream) DeviceCounters {
+	if s == nil {
+		return DeviceCounters{}
+	}
+	if c, ok := s.(CounterStream); ok {
+		return c.Counters()
+	}
+	return DeviceCounters{}
+}
+
 // ringBuf is a bounded byte ring buffer. It is NOT safe for concurrent use;
 // callers must hold their own lock.
 type ringBuf struct {

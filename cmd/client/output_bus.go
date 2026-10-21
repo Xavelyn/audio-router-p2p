@@ -115,6 +115,10 @@ func (s *busSlot) Write(p []byte) (int, error) {
 
 func (s *busSlot) Read([]byte) (int, error) { return 0, nil }
 
+// Counters reports the shared output device's hardware counters; every route
+// on this bus drives the same physical device.
+func (s *busSlot) Counters() audio.DeviceCounters { return audio.CountersOf(s.bus.device) }
+
 func (s *busSlot) Close() error {
 	b := s.bus
 	b.mu.Lock()

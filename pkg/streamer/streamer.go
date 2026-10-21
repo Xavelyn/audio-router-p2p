@@ -97,6 +97,12 @@ type RemotePeer struct {
 	lastRateCalc  atomic.Int64 // unix nano
 	lastRateBytes atomic.Uint64
 	effectiveKbps atomic.Uint64 // bits representation of float64
+
+	// Send-side liveness (for "why isn't this playing" diagnostics). The send
+	// loop is the only writer; it updates these under peersMu.RLock, so they
+	// must stay atomic.
+	lastSendNano atomic.Int64           // unix nano of last successful send
+	lastSendErr  atomic.Pointer[string] // most recent send failure, cleared on success
 }
 
 // FECConfig configures RFC 5109 1-D XOR Parity Matrix Forward Error Correction.
@@ -164,6 +170,9 @@ type Streamer struct {
 	fecEncoder    *transport.FECEncoder
 	fecEncoderMu  sync.Mutex
 	fecParitySent atomic.Uint64
+	// lastInputNano is the unix-nanosecond time of the last non-empty capture
+	// read; zero means capture has not produced audio yet.
+	lastInputNano atomic.Int64
 
 	// Receive path
 	recvWG        sync.WaitGroup
@@ -172,6 +181,9 @@ type Streamer struct {
 	packetsRecv   atomic.Uint64
 	fecParityRecv atomic.Uint64
 	fecRecovered  atomic.Uint64
+	// lastPlayoutNano is the unix-nanosecond time of the last playout tick that
+	// produced audio for the output; zero means nothing has been played yet.
+	lastPlayoutNano atomic.Int64
 
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.
@@ -415,6 +427,7 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			continue
 		}
 		offset += n
+		s.lastInputNano.Store(time.Now().UnixNano())
 		if offset < packetBytes {
 			continue
 		}
@@ -464,8 +477,10 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
 						if !strings.Contains(err.Error(), "underflow") {
 							log.Printf("streamer: local write error: %v", err)
+							s.noteSendError(peer, err)
 						}
 					} else {
+						s.noteSendSuccess(peer)
 						peer.packetsSent.Add(1)
 						peer.bytesSent.Add(uint64(packetBytes))
 					}
@@ -473,7 +488,9 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			} else if s.transport != nil {
 				if err := s.transport.Send(peer.Addr, pkt); err != nil && !errors.Is(err, net.ErrClosed) {
 					log.Printf("streamer: send to %s: %v", peer.Addr, err)
+					s.noteSendError(peer, err)
 				} else {
+					s.noteSendSuccess(peer)
 					peer.packetsSent.Add(1)
 					peer.bytesSent.Add(uint64(len(pkt)))
 				}
@@ -502,7 +519,9 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 					if !s.isLocalDest(peer.Addr) && s.transport != nil {
 						if err := s.transport.Send(peer.Addr, parityPkt); err != nil && !errors.Is(err, net.ErrClosed) {
 							log.Printf("streamer: send parity to %s: %v", peer.Addr, err)
+							s.noteSendError(peer, err)
 						} else {
+							s.noteSendSuccess(peer)
 							peer.packetsSent.Add(1)
 							peer.bytesSent.Add(uint64(len(parityPkt)))
 						}
@@ -638,6 +657,8 @@ func (s *Streamer) playout() {
 	}
 	if _, err := s.output.Write(first); err != nil {
 		log.Printf("streamer: output write error: %v", err)
+	} else {
+		s.lastPlayoutNano.Store(time.Now().UnixNano())
 	}
 }
 
@@ -983,6 +1004,92 @@ func (s *Streamer) SetPeerID(addr string, peerID string) {
 	if p, ok := s.peers[addr]; ok {
 		p.PeerID = peerID
 	}
+}
+
+// noteSendSuccess records a successful packet delivery to a destination and
+// clears its last recorded send error. The caller is the send loop, the sole
+// writer of these fields; holding peersMu.RLock is sufficient.
+func (s *Streamer) noteSendSuccess(peer *RemotePeer) {
+	peer.lastSendNano.Store(time.Now().UnixNano())
+	peer.lastSendErr.Store(nil)
+}
+
+func (s *Streamer) noteSendError(peer *RemotePeer, err error) {
+	msg := err.Error()
+	peer.lastSendErr.Store(&msg)
+}
+
+// RoutePeerStatus is the latest-activity view of one peer of a streamer.
+type RoutePeerStatus struct {
+	Addr          string
+	PeerID        string
+	Direction     StreamDirection
+	LastSend      time.Time // zero: nothing sent to this destination yet
+	LastRecv      time.Time // zero: no audio received from this peer yet
+	LastSendError string
+	PacketsSent   uint64
+	PacketsLost   uint64
+	FECRecovered  uint64
+	JitterDepth   int
+	Underruns     uint64
+}
+
+// RouteStatus is a point-in-time snapshot of pipeline activity, the raw
+// material for a "why isn't this route playing" answer.
+type RouteStatus struct {
+	LastInput   time.Time // zero: capture has produced no audio yet
+	LastPlayout time.Time // zero: the receive path has played nothing yet
+	DTXState    string
+	Peers       []RoutePeerStatus
+}
+
+// RouteStatus returns pipeline activity for this streamer. It is safe to call
+// while audio is flowing.
+func (s *Streamer) RouteStatus() RouteStatus {
+	st := RouteStatus{
+		Peers: make([]RoutePeerStatus, 0, 1),
+	}
+	if n := s.lastInputNano.Load(); n > 0 {
+		st.LastInput = time.Unix(0, n)
+	}
+	if n := s.lastPlayoutNano.Load(); n > 0 {
+		st.LastPlayout = time.Unix(0, n)
+	}
+	if s.dtx != nil {
+		st.DTXState = s.dtx.State().String()
+	}
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
+	for addr, peer := range s.peers {
+		p := RoutePeerStatus{
+			Addr:        addr,
+			PeerID:      peer.PeerID,
+			Direction:   peer.Direction,
+			PacketsSent: peer.packetsSent.Load(),
+			PacketsLost: peer.packetsLost.Load(),
+		}
+		if n := peer.lastSendNano.Load(); n > 0 {
+			p.LastSend = time.Unix(0, n)
+		}
+		if !peer.lastPacket.IsZero() {
+			p.LastRecv = peer.lastPacket
+		}
+		if e := peer.lastSendErr.Load(); e != nil {
+			p.LastSendError = *e
+		}
+		if peer.FECDecoder != nil {
+			p.FECRecovered = peer.FECDecoder.Stats().PacketsRecoveredTotal
+		}
+		if peer.JitterBuf != nil {
+			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
+				jbStats := jb.Stats()
+				p.JitterDepth = jbStats.BufferedFrames
+				p.Underruns = jbStats.Underruns
+			}
+		}
+		st.Peers = append(st.Peers, p)
+	}
+	return st
 }
 
 // RebindPeer changes the destination of a send-only UDP stream without
