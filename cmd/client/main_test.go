@@ -196,10 +196,10 @@ func TestStreamManagersSendAndReceiveRoute(t *testing.T) {
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
-	for audio.OutputBufferSize(receiver.routes["shared-route"].matrix.device) == 0 && time.Now().Before(deadline) {
+	for audio.OutputBufferSize(receiver.routes["shared-route"].matrix.device.(*busSlot).bus.device) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := audio.OutputBufferSize(receiver.routes["shared-route"].matrix.device); got == 0 {
+	if got := audio.OutputBufferSize(receiver.routes["shared-route"].matrix.device.(*busSlot).bus.device); got == 0 {
 		t.Fatal("receiver did not play network audio")
 	}
 	if got := receiver.Stats()["shared-route"].PacketsReceived; got == 0 {
@@ -234,10 +234,52 @@ func TestLocalMatrixRouteUsesCurrentSocket(t *testing.T) {
 		t.Fatal("local matrix route did not open an output")
 	}
 	deadline := time.Now().Add(3 * time.Second)
-	for audio.OutputBufferSize(m.routes[mr.ID].out) == 0 && time.Now().Before(deadline) {
+	for audio.OutputBufferSize(m.routes[mr.ID].out.(*busSlot).bus.device) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if audio.OutputBufferSize(m.routes[mr.ID].out) == 0 {
+	if audio.OutputBufferSize(m.routes[mr.ID].out.(*busSlot).bus.device) == 0 {
 		t.Fatal("local matrix route did not play audio")
+	}
+}
+
+func TestReceiveRoutesShareOutputDevice(t *testing.T) {
+	trans, err := transport.NewUDPTransport("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer trans.Close()
+	cfg := &config.Config{AuthToken: "shared-output-test", UseEmulator: true,
+		AnnounceInterval: time.Second, PeerTTL: 3 * time.Second, SyncInterval: time.Second}
+	disc, err := discovery.New(cfg, "shared-output-node")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer disc.Close()
+	m := newStreamManager(cfg, trans, []string{"127.0.0.1"}, disc)
+	defer m.StopAll()
+	for _, id := range []string{"first", "second"} {
+		if err := m.StartRoute(router.StreamRoute{ID: id, Direction: "receive", DestDevice: 1, SampleRate: 48000, Channels: 2}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a := m.routes["first"].matrix.device.(*busSlot)
+	b := m.routes["second"].matrix.device.(*busSlot)
+	if a.bus != b.bus || len(m.outputs) != 1 {
+		t.Fatal("receive routes did not reuse a single output bus")
+	}
+	if err := m.StopRoute("first"); err != nil {
+		t.Fatal(err)
+	}
+	if b.bus.closed {
+		t.Fatal("stopping first route closed the remaining output")
+	}
+	if _, err := b.Write(make([]byte, b.bus.bytes)); err != nil {
+		t.Fatalf("remaining output unusable: %v", err)
+	}
+	if err := m.StopRoute("second"); err != nil {
+		t.Fatal(err)
+	}
+	if len(m.outputs) != 0 {
+		t.Fatal("output bus was not released after final route")
 	}
 }

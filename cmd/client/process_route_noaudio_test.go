@@ -61,8 +61,9 @@ func TestRouteProcessHelper(t *testing.T) {
 		fmt.Println("READY " + trans.Addr())
 		deadline := time.Now().Add(5 * time.Second)
 		for time.Now().Before(deadline) {
-			if audio.OutputBufferSize(m.routes[route.ID].matrix.device) > 0 && m.Stats()[route.ID].PacketsReceived > 0 {
-				if captured, ok := m.routes[route.ID].matrix.device.(interface{ ReadAll() []byte }); ok {
+			device := m.routes[route.ID].matrix.device.(*busSlot).bus.device
+			if audio.OutputBufferSize(device) > 0 && m.Stats()[route.ID].PacketsReceived > 0 {
+				if captured, ok := device.(interface{ ReadAll() []byte }); ok {
 					for _, sample := range captured.ReadAll() {
 						if sample != 0 {
 							fmt.Println("AUDIO")

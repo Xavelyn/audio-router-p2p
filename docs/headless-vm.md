@@ -75,3 +75,11 @@ changes. Sending routes process audio before network transmission; receive-only
 routes process audio before local playback. Live matrix routes currently require
 equal input/output channel counts; a route requiring channel-count conversion
 returns an error rather than silently ignoring its matrix.
+
+Compatible routes aimed at the same local output now share one device clock
+and are mixed into one saturated PCM block per tick. Each route keeps at most
+one pending block, replacing stale audio rather than letting output latency
+grow without bound. Routes sharing an output must use the same sample rate and
+channel count; an incompatible route is rejected without closing the active
+output. This is a bounded real-time mixer, not sample-accurate synchronization
+between independent network sources.

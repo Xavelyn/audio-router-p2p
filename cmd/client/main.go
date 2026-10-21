@@ -269,17 +269,19 @@ type streamManager struct {
 	disc     *discovery.Discovery
 	resolver *audio.DeviceResolver
 	hub      *apiTelemetry.TelemetryHub
+	outputs  map[string]*outputBus
 
 	mu     sync.Mutex
 	routes map[string]*activeStream
 }
 
 type activeStream struct {
-	route  router.StreamRoute
-	st     *streamer.Streamer
-	in     audio.AudioStream
-	out    audio.AudioStream
-	matrix *routeMatrix
+	route     router.StreamRoute
+	st        *streamer.Streamer
+	in        audio.AudioStream
+	out       audio.AudioStream
+	matrix    *routeMatrix
+	outputKey string
 }
 
 func newStreamManager(cfg *config.Config, trans streamer.Transport, localIPs []string, disc *discovery.Discovery) *streamManager {
@@ -290,6 +292,7 @@ func newStreamManager(cfg *config.Config, trans streamer.Transport, localIPs []s
 		disc:     disc,
 		resolver: audio.GlobalResolver(),
 		routes:   make(map[string]*activeStream),
+		outputs:  make(map[string]*outputBus),
 	}
 }
 
@@ -395,19 +398,6 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			}
 		}
 	}
-	if openOutput {
-		dstRef := sr.DestDeviceURN
-		if dstRef == "" {
-			dstRef = strconv.Itoa(sr.DestDevice)
-		}
-		out, err = m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
-		if err != nil {
-			if in != nil {
-				_ = in.Close()
-			}
-			return fmt.Errorf("open local output device %s: %w", dstRef, err)
-		}
-	}
 	streamCfg, err := streamer.NetworkPCMConfig(sr.SampleRate, sr.Channels)
 	if err != nil {
 		if in != nil {
@@ -417,6 +407,37 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 			_ = out.Close()
 		}
 		return err
+	}
+	var outputKey string
+	if openOutput {
+		dstRef := sr.DestDeviceURN
+		if dstRef == "" {
+			dstRef = strconv.Itoa(sr.DestDevice)
+		}
+		key := dstRef
+		if dev, found := m.resolver.Resolve(dstRef); found {
+			key = dev.URN
+		}
+		outputKey = key
+		bus := m.outputs[key]
+		if bus != nil && (bus.rate != sr.SampleRate || bus.ch != sr.Channels || bus.period != time.Duration(streamCfg.PacketTime)*time.Millisecond) {
+			if in != nil {
+				_ = in.Close()
+			}
+			return fmt.Errorf("output %s already in use with a different PCM format", dstRef)
+		}
+		if bus == nil {
+			device, openErr := m.resolver.OpenOutput(dstRef, sr.SampleRate, sr.Channels, m.cfg.UseEmulator)
+			if openErr != nil {
+				if in != nil {
+					_ = in.Close()
+				}
+				return fmt.Errorf("open local output device %s: %w", dstRef, openErr)
+			}
+			bus = newOutputBus(device, sr.SampleRate, sr.Channels, streamCfg.PacketTime)
+			m.outputs[key] = bus
+		}
+		out = bus.add(sr.ID)
 	}
 	var matrix *routeMatrix
 	if sr.Direction == "receive" {
@@ -436,6 +457,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		if out != nil {
 			_ = out.Close()
+			m.removeEmptyOutputLocked(outputKey)
 		}
 		return err
 	}
@@ -446,6 +468,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		if out != nil {
 			_ = out.Close()
+			m.removeEmptyOutputLocked(outputKey)
 		}
 		return err
 	}
@@ -459,6 +482,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		if out != nil {
 			_ = out.Close()
+			m.removeEmptyOutputLocked(outputKey)
 		}
 		return err
 	}
@@ -474,7 +498,7 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	// Save the potentially updated route (with peer binding)
-	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out, matrix: matrix}
+	m.routes[sr.ID] = &activeStream{route: sr, st: st, in: in, out: out, matrix: matrix, outputKey: outputKey}
 	log.Printf("route %s: streaming device %s -> %d destinations (peer: %s)", sr.ID, srcRef, len(destAddrs), sr.PeerID)
 	return nil
 }
@@ -559,6 +583,19 @@ func (m *streamManager) stopLocked(as *activeStream) {
 	}
 	if as.out != nil {
 		_ = as.out.Close()
+		m.removeEmptyOutputLocked(as.outputKey)
+	}
+}
+
+// Caller holds the stream manager lock; only this manager adds/removes slots.
+func (m *streamManager) removeEmptyOutputLocked(key string) {
+	if bus := m.outputs[key]; bus != nil {
+		bus.mu.Lock()
+		closed := bus.closed
+		bus.mu.Unlock()
+		if closed {
+			delete(m.outputs, key)
+		}
 	}
 }
 
