@@ -35,6 +35,15 @@ type Config struct {
 	SyncInterval     time.Duration
 	ShutdownTimeout  time.Duration
 
+	// Network simulation (development/QA): degrade the local audio UDP path
+	// to exercise loss recovery, jitter buffering, and bandwidth pacing.
+	SimLoss      float64 // egress packet loss, 0-100 percent
+	SimLatency   float64 // egress fixed delay, milliseconds
+	SimJitter    float64 // egress uniform extra delay, 0..N milliseconds
+	SimReorder   float64 // egress reorder fraction, 0-100 percent
+	SimDuplicate float64 // egress duplicate fraction, 0-100 percent
+	SimBandwidth float64 // egress bandwidth cap, kilobits/sec; 0 = unlimited
+
 	// Room orchestration flags
 	RoomID       string // Room ID to create/join
 	RoomName     string // Human-readable room name
@@ -84,6 +93,13 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.DurationVar(&cfg.SyncInterval, "sync-interval", 2*time.Second, "Heartbeat/clock-sync interval")
 	fs.DurationVar(&cfg.ShutdownTimeout, "shutdown-timeout", 5*time.Second, "Graceful shutdown timeout")
 
+	fs.Float64Var(&cfg.SimLoss, "sim-loss", 0, "Simulate egress audio packet loss (0-100 percent)")
+	fs.Float64Var(&cfg.SimLatency, "sim-latency", 0, "Simulate egress audio latency (milliseconds)")
+	fs.Float64Var(&cfg.SimJitter, "sim-jitter", 0, "Simulate egress audio jitter: uniform 0..N extra milliseconds per packet")
+	fs.Float64Var(&cfg.SimReorder, "sim-reorder", 0, "Simulate egress audio reordering (0-100 percent of packets held back)")
+	fs.Float64Var(&cfg.SimDuplicate, "sim-duplicate", 0, "Simulate egress audio duplication (0-100 percent of packets delivered twice)")
+	fs.Float64Var(&cfg.SimBandwidth, "sim-bandwidth", 0, "Cap egress audio bandwidth (kilobits/sec; 0 = unlimited)")
+
 	fs.StringVar(&cfg.RoomID, "room-id", "", "Room ID to create/join")
 	fs.StringVar(&cfg.RoomName, "room-name", "", "Human-readable name of the room")
 	fs.BoolVar(&cfg.RoomAutoJoin, "room-auto-join", false, "Auto-join room on daemon startup")
@@ -125,6 +141,11 @@ func LoadFromArgs(args []string) (*Config, error) {
 	}
 	if cfg.DTLSRole != "server" && cfg.DTLSRole != "client" {
 		return nil, fmt.Errorf("dtls-role must be server or client")
+	}
+	if cfg.SimLoss < 0 || cfg.SimLoss > 100 || cfg.SimReorder < 0 || cfg.SimReorder > 100 ||
+		cfg.SimDuplicate < 0 || cfg.SimDuplicate > 100 ||
+		cfg.SimLatency < 0 || cfg.SimJitter < 0 || cfg.SimBandwidth < 0 {
+		return nil, fmt.Errorf("sim-* values must be non-negative (percentages 0-100)")
 	}
 	if cfg.AnnounceInterval <= 0 || cfg.PeerTTL <= 0 || cfg.SyncInterval <= 0 {
 		return nil, fmt.Errorf("announce-interval, peer-ttl and sync-interval must be positive")

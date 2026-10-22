@@ -63,6 +63,7 @@ func main() {
 	// DTLS/SRTP transport supports a single remote peer; derive it from the
 	// route table and fail fast unless exactly one distinct peer is used.
 	var trans streamer.Transport
+	var sim *transport.NetworkSimulator
 	if cfg.Encrypt {
 		remote := singleDTLSPeer(routesOf(rt, disc))
 		if remote == "" {
@@ -98,8 +99,21 @@ func main() {
 		if err != nil {
 			log.Fatalf("audio transport: %v", err)
 		}
-		trans = udp
+		sim = transport.NewNetworkSimulator(udp, transport.SimProfile{
+			Enabled:       cfg.SimLoss+cfg.SimLatency+cfg.SimJitter+cfg.SimReorder+cfg.SimDuplicate+cfg.SimBandwidth > 0,
+			LossPct:       cfg.SimLoss,
+			LatencyMS:     cfg.SimLatency,
+			JitterMS:      cfg.SimJitter,
+			ReorderPct:    cfg.SimReorder,
+			DuplicatePct:  cfg.SimDuplicate,
+			BandwidthKbps: cfg.SimBandwidth,
+		})
+		trans = sim
 		log.Printf("audio UDP transport listening on %s", trans.Addr())
+		if sim.Profiles().Out.Enabled {
+			log.Printf("network simulation active on egress: loss %.1f%%, latency %.0f ms, jitter %.0f ms, reorder %.1f%%, duplicate %.1f%%, bandwidth %.0f kbps",
+				cfg.SimLoss, cfg.SimLatency, cfg.SimJitter, cfg.SimReorder, cfg.SimDuplicate, cfg.SimBandwidth)
+		}
 	}
 
 	// Clock sync.
@@ -140,6 +154,9 @@ func main() {
 	// HTTP API.
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
 	streams.SetHub(apiSrv.Hub())
+	if sim != nil {
+		apiSrv.SetNetworkSimulator(sim)
+	}
 	srv := &http.Server{Addr: cfg.ListenAddr, Handler: apiSrv.Handler()}
 
 	if agg := apiSrv.Aggregator(); agg != nil {

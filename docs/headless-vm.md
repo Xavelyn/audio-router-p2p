@@ -116,3 +116,35 @@ last activity timestamps for capture, send, receive, and playout plus per-peer
 last contact. Unknown or stopped routes return 404; servers without a live
 stream manager return 501. A send route counts as playing while its sends are
 fresh or while capture is live and DTX intentionally mutes a silent input.
+
+## Network-condition simulator (QA)
+
+The UDP audio path can be deliberately degraded on a per-node basis to exercise
+loss recovery, the jitter buffer, FEC, and bandwidth pacing without any real
+network fault. This is a development/QA tool only — DTLS (encrypt) mode is not
+simulated because it is a reliable stream.
+
+The egress profile is pre-set from flags (any non-zero value enables
+simulation):
+
+    -sim-loss 20        # drop 20% of outgoing packets
+    -sim-latency 30     # +30 ms fixed delay
+    -sim-jitter 20      # +0..20 ms uniform random delay
+    -sim-reorder 10     # hold back 10% of packets so later ones overtake
+    -sim-duplicate 5    # deliver 5% of packets twice
+    -sim-bandwidth 512  # cap sustained egress at 512 kbit/s (0 = unlimited)
+
+Profiles can also be read and changed at runtime, independently per direction:
+
+    curl -s $HOST/api/v1/network/sim                        # GET current
+    curl -s -X PUT $HOST/api/v1/network/sim \
+         -d '{"in":{"enabled":true,"loss_pct":10},"out":{...}}'
+
+Percentages are clamped to 0-100, delays and the bandwidth cap to >= 0. Drops
+return silently (like a real network), delayed packets are delivered
+asynchronously, and reordering holds a packet back a few packet-times so
+subsequent packets overtake it. Servers without a UDP simulator (read-only
+mode or DTLS/encrypt mode) return 501.
+
+In a two-daemon setup, degrade the *sender's* egress (or the *receiver's*
+ingress) to model the link between them.

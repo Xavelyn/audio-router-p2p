@@ -18,6 +18,7 @@ import (
 	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
 	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
+	"github.com/audio-router-p2p/pkg/transport"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -196,6 +197,12 @@ func (s *Server) SetClusterManager(mgr *cluster.Manager) {
 	if s.v1Server != nil {
 		s.v1Server.SetClusterManager(mgr)
 	}
+}
+
+// SetNetworkSimulator exposes the network-condition simulator for the
+// /api/v1/network/sim endpoint.
+func (s *Server) SetNetworkSimulator(sim *transport.NetworkSimulator) {
+	s.V1().SetSimulator(sim)
 }
 
 // Close gracefully shuts down the API server and its background subsystems.

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
@@ -16,6 +17,7 @@ import (
 	"github.com/audio-router-p2p/pkg/streamer"
 	"github.com/audio-router-p2p/pkg/sync"
 	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
+	"github.com/audio-router-p2p/pkg/transport"
 )
 
 // StreamManager provides route streaming operations.
@@ -53,6 +55,18 @@ type V1Server struct {
 
 	aggregator *netTelemetry.Aggregator
 	clusterMgr *cluster.Manager
+
+	// sim is the network-condition simulator, set when the daemon runs the
+	// UDP transport. Nil in read-only servers and DTLS (encrypt) mode.
+	sim atomic.Pointer[transport.NetworkSimulator]
+}
+
+// SetSimulator exposes the network-condition simulator for the
+// /api/v1/network/sim endpoint.
+func (s *V1Server) SetSimulator(sim *transport.NetworkSimulator) {
+	if sim != nil {
+		s.sim.Store(sim)
+	}
 }
 
 // SetAggregator configures the central network telemetry aggregator.
@@ -210,6 +224,7 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 
 	// Telemetry & Diagnostics
 	mux.HandleFunc("/api/v1/network/health", s.AuthMiddleware(s.handleNetworkHealth))
+	mux.HandleFunc("/api/v1/network/sim", s.AuthMiddleware(s.handleNetworkSim))
 	mux.HandleFunc("/api/v1/telemetry/stream-stats", s.AuthMiddleware(s.handleTelemetryStreamStats))
 	mux.HandleFunc("/api/v1/telemetry/meters", s.AuthMiddleware(s.handleTelemetryMetersSSE))
 	mux.HandleFunc("/api/v1/telemetry/ws", s.handleTelemetryWebSocket)
