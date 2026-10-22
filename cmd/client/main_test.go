@@ -234,13 +234,31 @@ func TestLocalMatrixRouteUsesCurrentSocket(t *testing.T) {
 	if m.routes[mr.ID].out == nil {
 		t.Fatal("local matrix route did not open an output")
 	}
+	slot, ok := busSlotOf(m.routes[mr.ID].out)
+	if !ok {
+		t.Fatalf("route output %T does not wrap the bus slot", m.routes[mr.ID].out)
+	}
 	deadline := time.Now().Add(3 * time.Second)
-	for audio.OutputBufferSize(m.routes[mr.ID].out.(*busSlot).bus.device) == 0 && time.Now().Before(deadline) {
+	for audio.OutputBufferSize(slot.bus.device) == 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if audio.OutputBufferSize(m.routes[mr.ID].out.(*busSlot).bus.device) == 0 {
+	if audio.OutputBufferSize(slot.bus.device) == 0 {
 		t.Fatal("local matrix route did not play audio")
 	}
+}
+
+// busSlotOf unwraps the calibration wrappers (probe detector, route matrix)
+// around a route output to reach the shared output bus slot.
+func busSlotOf(s audio.AudioStream) (*busSlot, bool) {
+	switch d := s.(type) {
+	case *busSlot:
+		return d, true
+	case *probeDetector:
+		return busSlotOf(d.device)
+	case *routeMatrix:
+		return busSlotOf(d.device)
+	}
+	return nil, false
 }
 
 func TestReceiveRoutesShareOutputDevice(t *testing.T) {

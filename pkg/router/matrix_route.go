@@ -112,6 +112,10 @@ type MatrixRoute struct {
 	Muted         bool             `json:"muted"`
 	State         string           `json:"state"`                    // active, slewing, paused, error
 	LatencyPreset string           `json:"latency_preset,omitempty"` // low, balanced, reliable
+
+	// ChannelDelaysMS holds the per-channel alignment offset in milliseconds,
+	// applied before the gain matrix (see StreamRoute.ChannelDelaysMS).
+	ChannelDelaysMS []float64 `json:"channel_delays_ms,omitempty"`
 }
 
 // Validate verifies dimensions, coefficient ranges [0.0, 2.0], and channel counts.

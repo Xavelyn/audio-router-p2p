@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/audio-router-p2p/pkg/router"
@@ -241,6 +243,66 @@ type RouteStatus struct {
 	LastInput         *time.Time        `json:"last_input,omitempty"`
 	LastPlayout       *time.Time        `json:"last_playout,omitempty"`
 }
+
+// CalibrateRequest is the optional body of POST /api/v1/routes/{id}/calibrate.
+// Zero values keep the probe defaults; Apply stores the computed offsets.
+type CalibrateRequest struct {
+	FreqHz     float64 `json:"freq_hz,omitempty"`     // 100-20000, default 4200
+	Amplitude  int16   `json:"amplitude,omitempty"`   // 1000-32000, default 16000
+	DurationMS int     `json:"duration_ms,omitempty"` // 100-5000, default 600
+	Apply      bool    `json:"apply,omitempty"`       // store the computed offsets as the route alignment
+}
+
+// Validate checks the probe parameters against their allowed ranges.
+func (r *CalibrateRequest) Validate() error {
+	if r.FreqHz != 0 && (r.FreqHz < 100 || r.FreqHz > 20000) {
+		return fmt.Errorf("freq_hz must be in [100, 20000], got %g", r.FreqHz)
+	}
+	if r.Amplitude != 0 && (r.Amplitude < 1000 || r.Amplitude > 32000) {
+		return fmt.Errorf("amplitude must be in [1000, 32000], got %d", r.Amplitude)
+	}
+	if r.DurationMS != 0 && (r.DurationMS < 100 || r.DurationMS > 5000) {
+		return fmt.Errorf("duration_ms must be in [100, 5000], got %d", r.DurationMS)
+	}
+	return nil
+}
+
+// CalibrateResult is the response of a route calibration. The probe is
+// injected after the route's gain stage, so the measured delays are the raw
+// pipeline delays; OffsetsMS are the route's alignment offsets (newly
+// computed when Applied is true, otherwise the ones already in place).
+type CalibrateResult struct {
+	RouteID         string    `json:"route_id"`
+	Detected        bool      `json:"detected"`
+	DelayMS         float64   `json:"delay_ms,omitempty"` // average over detected channels
+	ChannelDelaysMS []float64 `json:"channel_delays_ms,omitempty"`
+	OffsetsMS       []float64 `json:"offsets_ms,omitempty"`
+	Applied         bool      `json:"applied,omitempty"`
+	FreqHz          float64   `json:"freq_hz"`
+	DurationMS      int       `json:"duration_ms"`
+	Note            string    `json:"note,omitempty"`
+}
+
+// UpdateAlignmentRequest is the body of PUT /api/v1/routes/{id}/alignment.
+type UpdateAlignmentRequest struct {
+	OffsetsMS []float64 `json:"offsets_ms"` // per input channel, ms in [0, 1000]
+}
+
+// AlignmentInfo reports a route's per-channel alignment offsets.
+type AlignmentInfo struct {
+	RouteID   string    `json:"route_id"`
+	OffsetsMS []float64 `json:"offsets_ms"`
+}
+
+// ErrRouteNotCalibratable is returned by stream managers when a running
+// route cannot be calibrated: calibration needs both the route's input and
+// output on this node (a local input->output route), which send-only and
+// receive-only routes do not have.
+var ErrRouteNotCalibratable = errors.New("route is not calibratable: calibration needs both input and output on this node")
+
+// ErrInvalidAlignment is returned by stream managers when the requested
+// per-channel alignment offsets are malformed (wrong length or out of range).
+var ErrInvalidAlignment = errors.New("invalid alignment offsets")
 
 // WSControlMessage represents command payloads received over live WebSocket.
 type WSControlMessage struct {

@@ -177,3 +177,58 @@ multi-node room, set the same preset on every node: the group stream path
 stays symmetric only when all members use the same preset. A receiver whose
 preset disables FEC simply ignores parity packets from an FEC-enabled peer
 instead of failing.
+
+## Loopback calibration and per-channel alignment
+
+Routes whose input and output both live on the same node can be calibrated
+with an injected probe tone. The daemon plays a short sine burst (4.2 kHz,
+-6 dBFS, 600 ms by default — outside the speech band and well above the DTX
+silence threshold) into the route's input, detects it at the route's playout
+write, and reports the per-channel pipeline delay.
+
+    curl -s -X POST $HOST/api/v1/routes/{id}/calibrate
+    curl -s -X POST $HOST/api/v1/routes/{id}/calibrate \
+         -d '{"freq_hz":8000,"duration_ms":1000,"apply":true}'
+
+The body is optional; `freq_hz` (100-20000), `amplitude` (1000-32000), and
+`duration_ms` (100-5000) override the probe defaults, and `apply` stores the
+computed offsets as the route's alignment. The response carries
+`channel_delays_ms` (the measured per-channel delay), `offsets_ms` (the
+alignment in place, or the newly applied one when `apply` was set), and
+`detected` (false, with a `note`, when the tone was not found in time).
+
+What the measured delay includes: the capture read, the send loop, the UDP
+hop, the receiver, and the jitter buffer (including any playout re-anchoring
+a DTX gap causes). What it excludes: the output bus tick and the hardware
+capture/playout device latencies, which the sound card adds on top. On a
+healthy loopback route the raw delay is typically well under 200 ms.
+
+Calibration needs both ends of the route on this node (a local input->output
+route, including room routes). Send-only and receive-only routes return 501.
+Both timestamps come from the node's own clock, so this measures a route's
+delay, not the offset between two machines; aligning audio across nodes
+would need a shared time reference and is out of scope.
+
+The probe is injected after the route's gain stage and does not pass through
+the alignment delay line, so the measurement is the raw pipeline delay: it
+is independent of the route's current gain, mute, and offsets, and
+calibrating twice in a row yields the same numbers. The total delay a
+listener experiences is `channel_delays_ms[i] + offsets_ms[i]`.
+
+With `apply`, the daemon stores `offsets[i] = max(delays) - delays[i]` on
+the route: the slowest channel is untouched and the others are padded to
+match it, so channels that share an output arrive together. Because the
+probe keeps measuring the raw delay, re-applying is stable — it recomputes
+the same offsets instead of cancelling them. Offsets persist in the route
+table (`channelDelaysMs`) and are re-applied when the route starts.
+
+Offsets can also be set or read directly (useful for receive-only routes,
+whose playout side is on this node even though they cannot be calibrated):
+
+    curl -s $HOST/api/v1/routes/{id}/alignment            # GET current
+    curl -s -X PUT $HOST/api/v1/routes/{id}/alignment \
+         -d '{"offsets_ms":[0,20]}'                       # 200 + applied
+
+Each offset is 0-1000 ms, one per channel; wrong length or out-of-range
+values are rejected with 400. The delay is applied before the gain matrix,
+live, without restarting the route.

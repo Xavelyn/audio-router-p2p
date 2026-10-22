@@ -154,6 +154,7 @@ func main() {
 	// HTTP API.
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streams, roomMgr)
 	streams.SetHub(apiSrv.Hub())
+	streams.SetRouter(rt)
 	if sim != nil {
 		apiSrv.SetNetworkSimulator(sim)
 	}
@@ -286,6 +287,7 @@ type streamManager struct {
 	disc     *discovery.Discovery
 	resolver *audio.DeviceResolver
 	hub      *apiTelemetry.TelemetryHub
+	rt       *router.Router
 	outputs  map[string]*outputBus
 
 	mu     sync.Mutex
@@ -298,6 +300,9 @@ type activeStream struct {
 	in        audio.AudioStream
 	out       audio.AudioStream
 	matrix    *routeMatrix
+	session   *probeSession
+	injector  *probeInjector
+	detector  *probeDetector
 	outputKey string
 	watchStop chan struct{}
 	watchDone chan struct{}
@@ -319,6 +324,14 @@ func (m *streamManager) SetHub(hub *apiTelemetry.TelemetryHub) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.hub = hub
+}
+
+// SetRouter gives the manager the route table so calibration results (e.g.
+// alignment offsets) can be persisted alongside the route.
+func (m *streamManager) SetRouter(rt *router.Router) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rt = rt
 }
 
 // StartRoute opens the source device and begins streaming per the route.
@@ -490,6 +503,22 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		return err
 	}
+	// Calibration plumbing: the probe injector wraps the input after the gain
+	// matrix (the probe rides on at full amplitude, bypassing gain and mute),
+	// and the probe detector wraps the output at the playout write. A route is
+	// calibratable only when both ends live on this node (a local
+	// input->output route); otherwise the missing wrapper reports 501.
+	session := &probeSession{}
+	var injector *probeInjector
+	if in != nil {
+		injector = newProbeInjector(in, sr.SampleRate, sr.Channels, session)
+		in = injector
+	}
+	var detector *probeDetector
+	if out != nil {
+		detector = newProbeDetector(out, sr.SampleRate, sr.Channels, session)
+		out = detector
+	}
 	st, err := streamer.NewStreamer(m.trans, m.localIPs, streamCfg, m.disc.NodeID())
 	if err != nil {
 		if in != nil {
@@ -527,7 +556,17 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 	}
 
 	// Save the potentially updated route (with peer binding)
-	as := &activeStream{route: sr, st: st, in: in, out: out, matrix: matrix, outputKey: outputKey}
+	as := &activeStream{
+		route:     sr,
+		st:        st,
+		in:        in,
+		out:       out,
+		matrix:    matrix,
+		session:   session,
+		injector:  injector,
+		detector:  detector,
+		outputKey: outputKey,
+	}
 	m.routes[sr.ID] = as
 	if sr.Direction != "receive" && sr.PeerID != "" && sr.PeerID != "local" && out == nil && m.disc != nil {
 		if _, ok := m.trans.(*transport.UDPTransport); ok {

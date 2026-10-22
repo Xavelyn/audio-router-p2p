@@ -171,6 +171,13 @@ func newEmulatorInput(deviceID int, sampleRate, channels int) *emulatorInput {
 	return e
 }
 
+// emuMicLevel is the peak amplitude of the emulated microphone's 440 Hz
+// sine. It sits well above the DTX silence threshold so emulated routes
+// stay "active", but far below full scale so that calibration probes
+// (injected near full scale) remain detectable above the background and
+// the sum of the two never clips.
+const emuMicLevel = 4000
+
 // produce generates a 440 Hz sine wave as int16 little-endian PCM.
 func (e *emulatorInput) produce() {
 	const chunkFrames = 256
@@ -186,7 +193,7 @@ func (e *emulatorInput) produce() {
 			return
 		}
 		for i := 0; i < chunkFrames; i++ {
-			sample := uint16(int16(32767 * math.Sin(2*math.Pi*t/period)))
+			sample := uint16(int16(emuMicLevel * math.Sin(2*math.Pi*t/period)))
 			for c := 0; c < e.channels; c++ {
 				binary.LittleEndian.PutUint16(block[(i*e.channels+c)*2:], sample)
 			}

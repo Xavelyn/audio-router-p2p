@@ -40,6 +40,11 @@ type StreamRoute struct {
 	// LatencyPreset is the room latency preset applied to this route's
 	// playout timing (low, balanced, reliable). Empty = balanced.
 	LatencyPreset string `json:"latencyPreset,omitempty"`
+
+	// ChannelDelaysMS holds the per-channel alignment offset in milliseconds,
+	// applied to this route before its gain matrix so that routes sharing an
+	// output can be timed to the same arrival. Empty = no offset.
+	ChannelDelaysMS []float64 `json:"channelDelaysMs,omitempty"`
 }
 
 // Router is a persistent, file-backed store of StreamRoutes.
@@ -357,6 +362,8 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 		Muted:         sr.Muted,
 		State:         "active",
 		LatencyPreset: sr.LatencyPreset,
+
+		ChannelDelaysMS: append([]float64(nil), sr.ChannelDelaysMS...),
 	}
 }
 
@@ -407,5 +414,6 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		Muted:           mr.Muted,
 		PeerID:          mr.Destination.NodeID,
 		LatencyPreset:   mr.LatencyPreset,
+		ChannelDelaysMS: append([]float64(nil), mr.ChannelDelaysMS...),
 	}
 }
