@@ -101,16 +101,17 @@ func (fc *FormatConversion) Validate() error {
 
 // MatrixRoute defines an arbitrary N:M matrix routing session between endpoints.
 type MatrixRoute struct {
-	ID           string           `json:"id"`
-	Name         string           `json:"name,omitempty"`
-	Source       RouteSource      `json:"source"`
-	Destination  RouteDestination `json:"destination"`
-	InChannels   int              `json:"in_channels"`
-	OutChannels  int              `json:"out_channels"`
-	Coefficients []float64        `json:"coefficients"`
-	SlewMS       float64          `json:"slew_ms"`
-	Muted        bool             `json:"muted"`
-	State        string           `json:"state"` // active, slewing, paused, error
+	ID            string           `json:"id"`
+	Name          string           `json:"name,omitempty"`
+	Source        RouteSource      `json:"source"`
+	Destination   RouteDestination `json:"destination"`
+	InChannels    int              `json:"in_channels"`
+	OutChannels   int              `json:"out_channels"`
+	Coefficients  []float64        `json:"coefficients"`
+	SlewMS        float64          `json:"slew_ms"`
+	Muted         bool             `json:"muted"`
+	State         string           `json:"state"`                    // active, slewing, paused, error
+	LatencyPreset string           `json:"latency_preset,omitempty"` // low, balanced, reliable
 }
 
 // Validate verifies dimensions, coefficient ranges [0.0, 2.0], and channel counts.

@@ -126,6 +126,28 @@ func (jb *JitterBuffer) Push(seq uint32, timestamp int64, data []byte) (int, err
 	return jb.PushWithFlags(seq, timestamp, data, transport.FlagActive)
 }
 
+// SetDelayLimits updates the adaptive playout delay range, clamping the
+// current target into it. Safe to call while the buffer is running, e.g.
+// when a room's latency preset changes live.
+func (jb *JitterBuffer) SetDelayLimits(minDelay, maxDelay time.Duration) {
+	if minDelay < 0 {
+		minDelay = 0
+	}
+	if maxDelay < minDelay {
+		maxDelay = minDelay
+	}
+	jb.mu.Lock()
+	defer jb.mu.Unlock()
+	jb.minDelay = minDelay
+	jb.maxDelay = maxDelay
+	if jb.targetDelay < minDelay {
+		jb.targetDelay = minDelay
+	}
+	if jb.targetDelay > maxDelay {
+		jb.targetDelay = maxDelay
+	}
+}
+
 // PushWithFlags adds a frame to the jitter buffer with wire control flags.
 // When a packet carries FlagSID, it updates the playout sequence anchor and
 // marks the buffer as operating in DTX silence suppression mode.

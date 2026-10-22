@@ -61,6 +61,45 @@ func TestReceiveRoutePersists(t *testing.T) {
 	}
 }
 
+func TestLatencyPresetRoundTrips(t *testing.T) {
+	sr := StreamRoute{
+		ID:            "preset-route",
+		SourceDevice:  0,
+		Destinations:  []string{"peer1"},
+		LatencyPreset: "low",
+	}
+
+	mr := StreamRouteToMatrixRoute(sr)
+	if mr.LatencyPreset != "low" {
+		t.Fatalf("StreamRouteToMatrixRoute dropped preset: %+v", mr)
+	}
+	back := MatrixRouteToStreamRoute(mr)
+	if back.LatencyPreset != "low" {
+		t.Fatalf("MatrixRouteToStreamRoute dropped preset: %+v", back)
+	}
+
+	path := t.TempDir() + "/routes.json"
+	r, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Add(sr); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := New(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := reloaded.Get("preset-route")
+	if !ok || got.LatencyPreset != "low" {
+		t.Fatalf("preset not persisted across restart: %+v found=%v", got, ok)
+	}
+	gm, ok := reloaded.GetMatrix("preset-route")
+	if !ok || gm.LatencyPreset != "low" {
+		t.Fatalf("preset lost on reloaded matrix route: %+v found=%v", gm, ok)
+	}
+}
+
 func TestMatrixRouteRetainsLiveAudioSettings(t *testing.T) {
 	path := t.TempDir() + "/routes.json"
 	r, err := New(path)

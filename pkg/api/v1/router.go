@@ -39,6 +39,7 @@ type RoomManager interface {
 	RemoveOutput(roomID, deviceID string) error
 	SetRoomSync(roomID string, synced bool) error
 	SetRoomBindings(roomID string, inputs, outputs []string, synced bool) error
+	SetRoomLatencyPreset(roomID string, preset string) error
 }
 
 // V1Server provides REST, SSE, and WebSocket endpoints for OpenAPI 3.1 control plane.

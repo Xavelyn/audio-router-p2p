@@ -107,16 +107,17 @@ type CrosspointGainRequest struct {
 
 // RoomInfo captures distributed room session state.
 type RoomInfo struct {
-	ID          string             `json:"id"`
-	Name        string             `json:"name"`
-	Leader      string             `json:"leader,omitempty"`
-	State       string             `json:"state"` // idle, active, degraded
-	Members     []string           `json:"members,omitempty"`
-	Inputs      []string           `json:"inputs"`
-	Outputs     []string           `json:"outputs"`
-	Synced      bool               `json:"synced"`
-	InputGains  map[string]float64 `json:"input_gains,omitempty"`
-	OutputGains map[string]float64 `json:"output_gains,omitempty"`
+	ID            string             `json:"id"`
+	Name          string             `json:"name"`
+	Leader        string             `json:"leader,omitempty"`
+	State         string             `json:"state"` // idle, active, degraded
+	Members       []string           `json:"members,omitempty"`
+	Inputs        []string           `json:"inputs"`
+	Outputs       []string           `json:"outputs"`
+	Synced        bool               `json:"synced"`
+	LatencyPreset string             `json:"latency_preset,omitempty"`
+	InputGains    map[string]float64 `json:"input_gains,omitempty"`
+	OutputGains   map[string]float64 `json:"output_gains,omitempty"`
 }
 
 // RoomDeviceBindingRequest assigns or updates an input or output device in a room.
@@ -136,6 +137,12 @@ type UpdateRoomBindingsRequest struct {
 // SetRoomSyncRequest modifies peer synchronization status for a room.
 type SetRoomSyncRequest struct {
 	Synced *bool `json:"synced,omitempty"`
+}
+
+// UpdateRoomLatencyRequest selects a room's latency preset
+// (low, balanced, reliable).
+type UpdateRoomLatencyRequest struct {
+	Preset string `json:"preset"`
 }
 
 // CreateRoomRequest provisions a new conference audio room.

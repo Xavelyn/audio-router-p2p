@@ -91,6 +91,7 @@ type Room struct {
 	inputs         []string
 	outputs        []string
 	synced         bool
+	latencyPreset  string // low, balanced, reliable (balanced is the default)
 	inputGains     map[string]float64
 	outputGains    map[string]float64
 	compiledRoutes map[string]struct{}
@@ -144,6 +145,7 @@ func NewRoom(cfg RoomConfig) *Room {
 		streamMgr:      cfg.StreamManager,
 		inputs:         make([]string, 0),
 		outputs:        make([]string, 0),
+		latencyPreset:  string(streamer.LatencyPresetBalanced),
 		inputGains:     make(map[string]float64),
 		outputGains:    make(map[string]float64),
 		compiledRoutes: make(map[string]struct{}),
@@ -218,27 +220,29 @@ func (r *Room) MarshalJSON() ([]byte, error) {
 	}
 
 	return json.Marshal(struct {
-		ID          string             `json:"id"`
-		Name        string             `json:"name"`
-		Leader      string             `json:"leader"`
-		State       string             `json:"state"`
-		Members     []*RoomMember      `json:"members"`
-		Inputs      []string           `json:"inputs"`
-		Outputs     []string           `json:"outputs"`
-		Synced      bool               `json:"synced"`
-		InputGains  map[string]float64 `json:"input_gains,omitempty"`
-		OutputGains map[string]float64 `json:"output_gains,omitempty"`
+		ID            string             `json:"id"`
+		Name          string             `json:"name"`
+		Leader        string             `json:"leader"`
+		State         string             `json:"state"`
+		Members       []*RoomMember      `json:"members"`
+		Inputs        []string           `json:"inputs"`
+		Outputs       []string           `json:"outputs"`
+		Synced        bool               `json:"synced"`
+		LatencyPreset string             `json:"latency_preset,omitempty"`
+		InputGains    map[string]float64 `json:"input_gains,omitempty"`
+		OutputGains   map[string]float64 `json:"output_gains,omitempty"`
 	}{
-		ID:          string(r.id),
-		Name:        r.name,
-		Leader:      r.Leader(),
-		State:       r.State().String(),
-		Members:     members,
-		Inputs:      inputs,
-		Outputs:     outputs,
-		Synced:      r.synced,
-		InputGains:  inGains,
-		OutputGains: outGains,
+		ID:            string(r.id),
+		Name:          r.name,
+		Leader:        r.Leader(),
+		State:         r.State().String(),
+		Members:       members,
+		Inputs:        inputs,
+		Outputs:       outputs,
+		Synced:        r.synced,
+		LatencyPreset: r.latencyPreset,
+		InputGains:    inGains,
+		OutputGains:   outGains,
 	})
 }
 
@@ -462,6 +466,30 @@ func (r *Room) SetSynced(synced bool) {
 	r.synced = synced
 }
 
+// LatencyPreset returns the room's latency preset name (low, balanced, or
+// reliable).
+func (r *Room) LatencyPreset() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.latencyPreset
+}
+
+// SetLatencyPreset sets the room's latency preset and recompiles its routes
+// so the new playout timing takes effect on every room stream. Unknown
+// preset names are rejected.
+func (r *Room) SetLatencyPreset(preset string) error {
+	p := streamer.LatencyPreset(preset)
+	if preset == "" || !p.Valid() {
+		return fmt.Errorf("unknown latency preset %q (want one of %s)",
+			preset, strings.Join(streamer.ValidPresets(), ", "))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.latencyPreset = string(p)
+	r.recompileRoutesLocked()
+	return nil
+}
+
 // SetRoomSync sets the peer sync status.
 // Accepts (synced bool) or (roomID string, synced bool).
 func (r *Room) SetRoomSync(args ...any) error {
@@ -624,12 +652,13 @@ func (r *Room) recompileRoutesLocked() {
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},
-				InChannels:   2,
-				OutChannels:  2,
-				Coefficients: coeffs,
-				SlewMS:       20.0,
-				Muted:        false,
-				State:        "active",
+				InChannels:    2,
+				OutChannels:   2,
+				Coefficients:  coeffs,
+				SlewMS:        20.0,
+				Muted:         false,
+				State:         "active",
+				LatencyPreset: r.latencyPreset,
 			}
 		}
 	}

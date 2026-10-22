@@ -36,6 +36,10 @@ type StreamRoute struct {
 	NegSampleRate int    `json:"negSampleRate,omitempty"` // Negotiated sample rate
 	NegChannels   int    `json:"negChannels,omitempty"`   // Negotiated channels
 	NegCodec      string `json:"negCodec,omitempty"`      // Negotiated codec (e.g., "pcm16")
+
+	// LatencyPreset is the room latency preset applied to this route's
+	// playout timing (low, balanced, reliable). Empty = balanced.
+	LatencyPreset string `json:"latencyPreset,omitempty"`
 }
 
 // Router is a persistent, file-backed store of StreamRoutes.
@@ -346,12 +350,13 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 			Layout:   LayoutStereo,
 			Channels: outChans,
 		},
-		InChannels:   inCh,
-		OutChannels:  outCh,
-		Coefficients: coeffs,
-		SlewMS:       slew,
-		Muted:        sr.Muted,
-		State:        "active",
+		InChannels:    inCh,
+		OutChannels:   outCh,
+		Coefficients:  coeffs,
+		SlewMS:        slew,
+		Muted:         sr.Muted,
+		State:         "active",
+		LatencyPreset: sr.LatencyPreset,
 	}
 }
 
@@ -401,5 +406,6 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 		SlewMS:          mr.SlewMS,
 		Muted:           mr.Muted,
 		PeerID:          mr.Destination.NodeID,
+		LatencyPreset:   mr.LatencyPreset,
 	}
 }

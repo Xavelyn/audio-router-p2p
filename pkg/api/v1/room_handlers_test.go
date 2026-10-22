@@ -3,9 +3,12 @@ package v1
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
+
+	"github.com/audio-router-p2p/pkg/streamer"
 )
 
 type mockV1RoomManager struct {
@@ -170,6 +173,21 @@ func (m *mockV1RoomManager) SetRoomBindings(roomID string, inputs, outputs []str
 	r.Outputs = make([]string, len(outputs))
 	copy(r.Outputs, outputs)
 	r.Synced = synced
+	m.rooms[roomID] = r
+	return nil
+}
+
+func (m *mockV1RoomManager) SetRoomLatencyPreset(roomID string, preset string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	r, ok := m.rooms[roomID]
+	if !ok {
+		return errors.New("room not found")
+	}
+	if !streamer.LatencyPreset(preset).Valid() || preset == "" {
+		return fmt.Errorf("unknown latency preset %q", preset)
+	}
+	r.LatencyPreset = preset
 	m.rooms[roomID] = r
 	return nil
 }
@@ -408,5 +426,84 @@ func TestV1RoomErrorCases(t *testing.T) {
 	w = doV1Request(mux, http.MethodPost, "/api/v1/rooms/valid-room/outputs", RoomDeviceBindingRequest{DeviceID: ""}, "Bearer test-v1-token")
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400 for empty output device_id, got %d", w.Code)
+	}
+}
+
+func TestV1RoomLatencyPreset(t *testing.T) {
+	s, mux := newTestV1Server(t)
+	mockRM := newMockV1RoomManager()
+	s.roomMgr = mockRM
+
+	if _, err := mockRM.CreateRoom("lat-room", "Latency Room"); err != nil {
+		t.Fatalf("create room: %v", err)
+	}
+
+	// 1. PUT a valid preset.
+	w := doV1Request(mux, http.MethodPut, "/api/v1/rooms/lat-room/latency",
+		UpdateRoomLatencyRequest{Preset: "low"}, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for PUT latency, got %d: %s", w.Code, w.Body.String())
+	}
+	var room RoomInfo
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatalf("unmarshal room: %v", err)
+	}
+	if room.LatencyPreset != "low" {
+		t.Errorf("expected latency_preset low, got %q", room.LatencyPreset)
+	}
+
+	// 2. GET reflects the stored preset.
+	w = doV1Request(mux, http.MethodGet, "/api/v1/rooms/lat-room", nil, "Bearer test-v1-token")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for GET room, got %d", w.Code)
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+		t.Fatalf("unmarshal room: %v", err)
+	}
+	if room.LatencyPreset != "low" {
+		t.Errorf("GET does not reflect preset: %q", room.LatencyPreset)
+	}
+
+	// 3. Unknown preset -> 400.
+	w = doV1Request(mux, http.MethodPut, "/api/v1/rooms/lat-room/latency",
+		UpdateRoomLatencyRequest{Preset: "ultra"}, "Bearer test-v1-token")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for unknown preset, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 4. Empty preset -> 400.
+	w = doV1Request(mux, http.MethodPut, "/api/v1/rooms/lat-room/latency",
+		UpdateRoomLatencyRequest{}, "Bearer test-v1-token")
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for empty preset, got %d", w.Code)
+	}
+
+	// 5. Non-PUT method -> 405.
+	w = doV1Request(mux, http.MethodGet, "/api/v1/rooms/lat-room/latency", nil, "Bearer test-v1-token")
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for GET latency, got %d", w.Code)
+	}
+
+	// 6. Non-existent room -> 404.
+	w = doV1Request(mux, http.MethodPut, "/api/v1/rooms/ghost/latency",
+		UpdateRoomLatencyRequest{Preset: "low"}, "Bearer test-v1-token")
+	if w.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown room, got %d", w.Code)
+	}
+
+	// 7. All accepted presets are stored.
+	for _, p := range []string{"balanced", "reliable", "low"} {
+		w = doV1Request(mux, http.MethodPut, "/api/v1/rooms/lat-room/latency",
+			UpdateRoomLatencyRequest{Preset: p}, "Bearer test-v1-token")
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 for preset %s, got %d: %s", p, w.Code, w.Body.String())
+			continue
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &room); err != nil {
+			t.Fatalf("unmarshal room: %v", err)
+		}
+		if room.LatencyPreset != p {
+			t.Errorf("expected preset %s stored, got %q", p, room.LatencyPreset)
+		}
 	}
 }

@@ -148,3 +148,32 @@ mode or DTLS/encrypt mode) return 501.
 
 In a two-daemon setup, degrade the *sender's* egress (or the *receiver's*
 ingress) to model the link between them.
+
+## Per-room latency presets
+
+Each room has a latency preset that tunes the playout timing of every stream
+the room compiles: how early the jitter buffer starts playout, how far the
+adaptive delay may grow under jitter, the buffer capacity, and whether the
+stream is protected with RFC 5109 FEC. The 20 ms packet time is unchanged
+across presets, so both ends of a route and any output bus they share always
+agree on frame sizes.
+
+    low       start at 10 ms, adapt up to 50 ms, 20-frame buffer, no FEC
+    balanced  start at 20 ms, adapt up to 200 ms, 200-frame buffer, no FEC (default)
+    reliable  start at 40 ms, adapt up to 400 ms, 400-frame buffer, FEC K=4
+
+The preset is selected per room and applied live: existing routes are
+restarted with the new timing, and the group playback path of a joined room
+is retuned in place.
+
+    curl -s -X PUT $HOST/api/v1/rooms/{id}/latency \
+         -d '{"preset":"low"}'          # 200 + updated room
+    curl -s $HOST/api/v1/rooms/{id}     # GET shows "latency_preset"
+
+Unknown or empty preset names are rejected with 400 (the message lists the
+valid names). The preset rides on the room's compiled routes
+(`latencyPreset` in the route table), so it survives a daemon restart. In a
+multi-node room, set the same preset on every node: the group stream path
+stays symmetric only when all members use the same preset. A receiver whose
+preset disables FEC simply ignores parity packets from an FEC-enabled peer
+instead of failing.

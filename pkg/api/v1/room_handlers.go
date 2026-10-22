@@ -2,8 +2,11 @@ package v1
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/audio-router-p2p/pkg/streamer"
 )
 
 // handleRooms handles GET /api/v1/rooms and POST /api/v1/rooms.
@@ -49,6 +52,7 @@ func (s *V1Server) handleRooms(w http.ResponseWriter, r *http.Request) {
 // - POST /api/v1/rooms/{id}/join
 // - POST /api/v1/rooms/{id}/leave
 // - PUT /api/v1/rooms/{id}/bindings
+// - PUT /api/v1/rooms/{id}/latency
 // - POST /api/v1/rooms/{id}/inputs
 // - DELETE /api/v1/rooms/{id}/inputs/{devId}
 // - POST /api/v1/rooms/{id}/outputs
@@ -216,6 +220,30 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				}); ok {
 					_ = gSetter.SetOutputGain(roomID, req.DeviceID, *req.Gain)
 				}
+			}
+			updated := s.findRoom(roomID)
+			s.WriteJSON(w, http.StatusOK, updated)
+
+		case "latency":
+			if r.Method != http.MethodPut {
+				w.WriteHeader(http.StatusMethodNotAllowed)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			var req UpdateRoomLatencyRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
+				return
+			}
+			if !streamer.LatencyPreset(req.Preset).Valid() || req.Preset == "" {
+				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_PARAMS",
+					fmt.Sprintf("unknown preset %q (want one of %s)", req.Preset,
+						strings.Join(streamer.ValidPresets(), ", ")))
+				return
+			}
+			if err := s.roomMgr.SetRoomLatencyPreset(roomID, req.Preset); err != nil {
+				s.WriteError(w, http.StatusInternalServerError, "ERR_SET_LATENCY", err.Error())
+				return
 			}
 			updated := s.findRoom(roomID)
 			s.WriteJSON(w, http.StatusOK, updated)

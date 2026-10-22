@@ -434,6 +434,9 @@ func (m *streamManager) StartRoute(route router.StreamRoute) error {
 		}
 		return err
 	}
+	// Apply the route's latency preset (set by the owning room, if any).
+	// Empty or unknown presets keep the network defaults.
+	streamCfg = streamer.ApplyLatencyPreset(streamCfg, streamer.LatencyPreset(sr.LatencyPreset))
 	var outputKey string
 	if openOutput {
 		dstRef := sr.DestDeviceURN

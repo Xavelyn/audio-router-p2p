@@ -46,7 +46,13 @@ type GroupStreamer struct {
 	packetBytes int
 	streamID    [16]byte
 
+	// Playout timing from the room's latency preset at join time.
+	jitterFrames int
+	minDelay     time.Duration
+	maxDelay     time.Duration
+
 	jitterBuf  *streamer.JitterBuffer
+	bufMu      sync.Mutex
 	adapter    *streamer.IngressAdapter
 	unregister func()
 
@@ -77,17 +83,24 @@ func NewGroupStreamer(cfg GroupStreamerConfig) (*GroupStreamer, error) {
 
 	sid := streamer.DeriveStreamID("room", string(cfg.Room.ID()))
 
+	// Playout timing follows the room's latency preset. All members of a
+	// room should use the same preset so the group stream stays symmetric.
+	timing := streamer.LatencyPreset(cfg.Room.LatencyPreset()).Timing()
+
 	gs := &GroupStreamer{
-		room:        cfg.Room,
-		input:       cfg.Input,
-		output:      cfg.Output,
-		latency:     cfg.StartLatency,
-		sampleRate:  sr,
-		channels:    ch,
-		packetBytes: packetBytes,
-		streamID:    sid,
-		adapter:     streamer.NewIngressAdapter(sr, ch),
-		stopCh:      make(chan struct{}),
+		room:         cfg.Room,
+		input:        cfg.Input,
+		output:       cfg.Output,
+		latency:      cfg.StartLatency,
+		sampleRate:   sr,
+		channels:     ch,
+		packetBytes:  packetBytes,
+		streamID:     sid,
+		jitterFrames: timing.JitterFrames,
+		minDelay:     timing.MinDelay,
+		maxDelay:     timing.MaxDelay,
+		adapter:      streamer.NewIngressAdapter(sr, ch),
+		stopCh:       make(chan struct{}),
 	}
 	return gs, nil
 }
@@ -101,7 +114,11 @@ func (gs *GroupStreamer) Start() error {
 
 	// If output != nil and room has transport, listen for room audio packets
 	if gs.output != nil && gs.room.transport != nil {
-		gs.jitterBuf = streamer.NewJitterBuffer(gs.packetBytes, gs.sampleRate, gs.channels, 200)
+		jb := streamer.NewJitterBuffer(gs.packetBytes, gs.sampleRate, gs.channels, gs.jitterFrames)
+		jb.SetDelayLimits(gs.minDelay, gs.maxDelay)
+		gs.bufMu.Lock()
+		gs.jitterBuf = jb
+		gs.bufMu.Unlock()
 		gs.unregister = gs.room.transport.Receive(gs.handlePacket)
 		gs.wg.Add(1)
 		go gs.playoutLoop()
@@ -233,6 +250,20 @@ func (gs *GroupStreamer) State() GroupPlaybackState {
 		return GroupPlaybackPlaying
 	}
 	return GroupPlaybackIdle
+}
+
+// ApplyPreset retunes the running group playout's delay limits to the
+// preset's timing. The room manager calls it when the room's latency preset
+// changes while joined. It is a no-op before Start or after Stop. The buffer
+// capacity is fixed at join time.
+func (gs *GroupStreamer) ApplyPreset(p streamer.LatencyPreset) {
+	t := p.Timing()
+	gs.bufMu.Lock()
+	jb := gs.jitterBuf
+	gs.bufMu.Unlock()
+	if jb != nil {
+		jb.SetDelayLimits(t.MinDelay, t.MaxDelay)
+	}
 }
 
 // Stop halts group playback and leaves the room.

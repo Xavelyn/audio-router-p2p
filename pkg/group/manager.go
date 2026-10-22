@@ -213,16 +213,17 @@ func (m *DefaultRoomManager) roomInfoLocked(r *Room) api.RoomInfo {
 	}
 
 	return api.RoomInfo{
-		ID:          string(r.ID()),
-		Name:        r.Name(),
-		Leader:      r.Leader(),
-		State:       r.State().String(),
-		Members:     memberIDs,
-		Inputs:      r.Inputs(),
-		Outputs:     r.Outputs(),
-		Synced:      r.Synced(),
-		InputGains:  r.InputGains(),
-		OutputGains: r.OutputGains(),
+		ID:            string(r.ID()),
+		Name:          r.Name(),
+		Leader:        r.Leader(),
+		State:         r.State().String(),
+		Members:       memberIDs,
+		Inputs:        r.Inputs(),
+		Outputs:       r.Outputs(),
+		Synced:        r.Synced(),
+		LatencyPreset: r.LatencyPreset(),
+		InputGains:    r.InputGains(),
+		OutputGains:   r.OutputGains(),
 	}
 }
 
@@ -342,6 +343,28 @@ func (m *DefaultRoomManager) SetRoomBindings(roomID string, inputs, outputs []st
 		return fmt.Errorf("room %s not found", roomID)
 	}
 	return mr.room.SetRoomBindings(inputs, outputs, synced)
+}
+
+// SetRoomLatencyPreset sets the room's latency preset, recompiling its routes
+// and retuning any active group streamer in place.
+func (m *DefaultRoomManager) SetRoomLatencyPreset(roomID string, preset string) error {
+	m.mu.RLock()
+	mr, ok := m.rooms[roomID]
+	var gs *GroupStreamer
+	if ok {
+		gs = mr.streamer
+	}
+	m.mu.RUnlock()
+	if !ok {
+		return fmt.Errorf("room %s not found", roomID)
+	}
+	if err := mr.room.SetLatencyPreset(preset); err != nil {
+		return err
+	}
+	if gs != nil {
+		gs.ApplyPreset(streamer.LatencyPreset(preset))
+	}
+	return nil
 }
 
 // SetInputGain updates trim gain for an input device in a room.

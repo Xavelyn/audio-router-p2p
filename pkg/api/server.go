@@ -32,16 +32,17 @@ type StreamManager interface {
 
 // RoomInfo describes a room's state and members.
 type RoomInfo struct {
-	ID          string             `json:"id"`
-	Name        string             `json:"name"`
-	Leader      string             `json:"leader,omitempty"`
-	State       string             `json:"state,omitempty"`
-	Members     []string           `json:"members,omitempty"`
-	Inputs      []string           `json:"inputs,omitempty"`
-	Outputs     []string           `json:"outputs,omitempty"`
-	Synced      bool               `json:"synced"`
-	InputGains  map[string]float64 `json:"input_gains,omitempty"`
-	OutputGains map[string]float64 `json:"output_gains,omitempty"`
+	ID            string             `json:"id"`
+	Name          string             `json:"name"`
+	Leader        string             `json:"leader,omitempty"`
+	State         string             `json:"state,omitempty"`
+	Members       []string           `json:"members,omitempty"`
+	Inputs        []string           `json:"inputs,omitempty"`
+	Outputs       []string           `json:"outputs,omitempty"`
+	Synced        bool               `json:"synced"`
+	LatencyPreset string             `json:"latency_preset,omitempty"`
+	InputGains    map[string]float64 `json:"input_gains,omitempty"`
+	OutputGains   map[string]float64 `json:"output_gains,omitempty"`
 }
 
 // RoomManager provides management operations for group audio rooms.
@@ -460,16 +461,17 @@ func (a *v1RoomManagerAdapter) ListRooms() []v1.RoomInfo {
 	res := make([]v1.RoomInfo, len(rooms))
 	for i, r := range rooms {
 		res[i] = v1.RoomInfo{
-			ID:          r.ID,
-			Name:        r.Name,
-			Leader:      r.Leader,
-			State:       r.State,
-			Members:     r.Members,
-			Inputs:      r.Inputs,
-			Outputs:     r.Outputs,
-			Synced:      r.Synced,
-			InputGains:  r.InputGains,
-			OutputGains: r.OutputGains,
+			ID:            r.ID,
+			Name:          r.Name,
+			Leader:        r.Leader,
+			State:         r.State,
+			Members:       r.Members,
+			Inputs:        r.Inputs,
+			Outputs:       r.Outputs,
+			Synced:        r.Synced,
+			LatencyPreset: r.LatencyPreset,
+			InputGains:    r.InputGains,
+			OutputGains:   r.OutputGains,
 		}
 	}
 	return res
@@ -485,16 +487,17 @@ func (a *v1RoomManagerAdapter) CreateRoom(id, name string) (v1.RoomInfo, error) 
 		return v1.RoomInfo{}, err
 	}
 	return v1.RoomInfo{
-		ID:          r.ID,
-		Name:        r.Name,
-		Leader:      r.Leader,
-		State:       r.State,
-		Members:     r.Members,
-		Inputs:      r.Inputs,
-		Outputs:     r.Outputs,
-		Synced:      r.Synced,
-		InputGains:  r.InputGains,
-		OutputGains: r.OutputGains,
+		ID:            r.ID,
+		Name:          r.Name,
+		Leader:        r.Leader,
+		State:         r.State,
+		Members:       r.Members,
+		Inputs:        r.Inputs,
+		Outputs:       r.Outputs,
+		Synced:        r.Synced,
+		LatencyPreset: r.LatencyPreset,
+		InputGains:    r.InputGains,
+		OutputGains:   r.OutputGains,
 	}, nil
 }
 
@@ -560,6 +563,19 @@ func (a *v1RoomManagerAdapter) SetRoomBindings(roomID string, inputs, outputs []
 		return fmt.Errorf("room manager not configured")
 	}
 	return rm.SetRoomBindings(roomID, inputs, outputs, synced)
+}
+
+func (a *v1RoomManagerAdapter) SetRoomLatencyPreset(roomID string, preset string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	if pSetter, ok := rm.(interface {
+		SetRoomLatencyPreset(string, string) error
+	}); ok {
+		return pSetter.SetRoomLatencyPreset(roomID, preset)
+	}
+	return fmt.Errorf("room manager does not support latency presets")
 }
 
 func (a *v1RoomManagerAdapter) SetInputGain(roomID, deviceID string, gain float64) error {

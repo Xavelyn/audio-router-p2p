@@ -767,6 +767,11 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	// Handle RFC 5109 Parity Packet
 	if (hdr.Flags & transport.FlagFEC) != 0 {
 		s.fecParityRecv.Add(1)
+		if peer.FECDecoder == nil {
+			// FEC is disabled on this endpoint (e.g. the peer uses a
+			// different latency preset): drop the parity, keep the media.
+			return
+		}
 		reconstructed, err := peer.FECDecoder.ProcessParity(payload)
 		if err == nil && peer.Direction == DirRecvOnly {
 			peer.lastPacket = time.Now()
