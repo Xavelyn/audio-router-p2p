@@ -3,6 +3,7 @@
   import { clusterStore } from '$lib/stores/cluster.svelte';
   import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import type { ClusterNodeSummary, AudioDeviceSummary } from '$lib/api/types';
+  import NetworkSimulatorPanel from './NetworkSimulatorPanel.svelte';
 
   import Cpu from '@lucide/svelte/icons/cpu';
   import Activity from '@lucide/svelte/icons/activity';
@@ -727,6 +728,11 @@
           </div>
         </div>
       {/if}
+
+      <!-- ==================================================================== -->
+      <!-- 5. NETWORK CONDITION SIMULATOR (QA)                                 -->
+      <!-- ==================================================================== -->
+      <NetworkSimulatorPanel />
 
     </div>
   </div>

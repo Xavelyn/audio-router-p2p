@@ -10,10 +10,17 @@ import type {
   CreateRouteRequest,
   PatchRouteRequest,
   CrosspointGainRequest,
+  RouteStatus,
+  CalibrateRequest,
+  CalibrateResult,
+  UpdateAlignmentRequest,
+  AlignmentInfo,
   RoomInfo,
+  LatencyPreset,
   CreateRoomRequest,
   UpdateRoomBindingsRequest,
   StreamStats,
+  SimProfiles,
   ErrorResponse,
   NetworkHealthResponse,
   ClusterNodesResponse,
@@ -217,6 +224,41 @@ export class ApiClient {
   }
 
   // ==========================================================================
+  // Route Diagnostics, Calibration & Alignment
+  // ==========================================================================
+
+  // GET /api/v1/routes/{id}/status — "why isn't this route playing".
+  // 404: route not running; 501: not available on this server.
+  async getRouteStatus(routeId: string): Promise<RouteStatus> {
+    return this.request<RouteStatus>(`/api/v1/routes/${encodeURIComponent(routeId)}/status`);
+  }
+
+  // POST /api/v1/routes/{id}/calibrate — inject a probe tone and measure the
+  // per-channel pipeline delay. The body is optional (probe defaults apply).
+  // 404: route not running; 501: unsupported or not calibratable; 400: invalid body.
+  async calibrateRoute(routeId: string, req?: CalibrateRequest): Promise<CalibrateResult> {
+    return this.request<CalibrateResult>(`/api/v1/routes/${encodeURIComponent(routeId)}/calibrate`, {
+      method: 'POST',
+      body: JSON.stringify(req ?? {}),
+    });
+  }
+
+  // GET /api/v1/routes/{id}/alignment — current per-channel offsets.
+  // 404: route not found.
+  async getRouteAlignment(routeId: string): Promise<AlignmentInfo> {
+    return this.request<AlignmentInfo>(`/api/v1/routes/${encodeURIComponent(routeId)}/alignment`);
+  }
+
+  // PUT /api/v1/routes/{id}/alignment — set per-channel offsets (0-1000 ms).
+  // 404: route not running; 400: invalid offsets; 501: not calibratable/unsupported.
+  async setRouteAlignment(routeId: string, req: UpdateAlignmentRequest): Promise<AlignmentInfo> {
+    return this.request<AlignmentInfo>(`/api/v1/routes/${encodeURIComponent(routeId)}/alignment`, {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    });
+  }
+
+  // ==========================================================================
   // Room Orchestration
   // ==========================================================================
 
@@ -293,12 +335,40 @@ export class ApiClient {
     });
   }
 
+  // PUT /api/v1/rooms/{id}/latency — select the room's latency preset
+  // (low | balanced | reliable). Applied live; 400 for unknown presets.
+  async setRoomLatency(roomId: string, preset: LatencyPreset): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/latency`, {
+      method: 'PUT',
+      body: JSON.stringify({ preset }),
+    });
+  }
+
   // ==========================================================================
   // Telemetry Snapshot
   // ==========================================================================
 
   async getStreamStats(): Promise<Record<string, StreamStats>> {
     return this.request<Record<string, StreamStats>>('/api/v1/telemetry/stream-stats');
+  }
+
+  // ==========================================================================
+  // Network Condition Simulator (QA)
+  // ==========================================================================
+
+  // GET /api/v1/network/sim — current per-direction simulation profiles.
+  // 501 (ERR_UNSUPPORTED): not available on this server (UDP mode only).
+  async getNetworkSim(): Promise<SimProfiles> {
+    return this.request<SimProfiles>('/api/v1/network/sim');
+  }
+
+  // PUT /api/v1/network/sim — replace the per-direction simulation profiles.
+  // 501: unsupported; 400: invalid body.
+  async setNetworkSim(profiles: SimProfiles): Promise<SimProfiles> {
+    return this.request<SimProfiles>('/api/v1/network/sim', {
+      method: 'PUT',
+      body: JSON.stringify(profiles),
+    });
   }
 
   // ==========================================================================

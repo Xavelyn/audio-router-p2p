@@ -1,4 +1,4 @@
-import type { RoomInfo, CreateRoomRequest, UpdateRoomBindingsRequest } from '$lib/api/types';
+import type { RoomInfo, CreateRoomRequest, UpdateRoomBindingsRequest, LatencyPreset } from '$lib/api/types';
 import { apiClient } from '$lib/api/client';
 
 class RoomStore {
@@ -349,6 +349,29 @@ class RoomStore {
       if (target) {
         target.synced = synced;
       }
+    }
+  }
+
+  // Select a room's latency preset (low | balanced | reliable). Applied live
+  // by the daemon; the response carries the updated room.
+  async setRoomLatency(roomId: string, preset: LatencyPreset) {
+    this.lastError = null;
+    try {
+      const updated = await apiClient.setRoomLatency(roomId, preset);
+      const idx = this.rooms.findIndex((r) => r.id === roomId);
+      if (idx !== -1) {
+        this.rooms[idx] = {
+          ...this.rooms[idx],
+          ...updated,
+          inputs: updated.inputs || this.rooms[idx].inputs || [],
+          outputs: updated.outputs || this.rooms[idx].outputs || [],
+          synced: updated.synced ?? this.rooms[idx].synced,
+        };
+      }
+    } catch (err: any) {
+      const msg = err.message || `Failed to set room latency preset to ${preset}`;
+      this.lastError = msg;
+      this.error = msg;
     }
   }
 }

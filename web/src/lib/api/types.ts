@@ -161,8 +161,98 @@ export interface GainMatrix {
 }
 
 // ============================================================================
+// ROUTE DIAGNOSTICS, CALIBRATION & ALIGNMENT
+// ============================================================================
+
+// Per-peer link view inside a route's status.
+export interface RoutePeerStatus {
+  peer_id?: string;
+  address: string;
+  role: 'send' | 'receive' | string;
+  last_send?: string;
+  last_recv?: string;
+  last_contact?: string;
+  last_send_error?: string;
+  packets_sent: number;
+  packets_lost: number;
+  fec_recovered: number;
+  jitter_depth_frames: number;
+  underruns: number;
+}
+
+// Answers "why isn't this route playing" for one live route.
+export interface RouteStatus {
+  route_id: string;
+  direction: 'send' | 'receive' | 'sendrecv' | string;
+  playing: boolean;
+  summary: string;
+  reasons?: string[];
+  peers?: RoutePeerStatus[];
+  packets_received: number;
+  underruns: number;
+  overruns: number;
+  jitter_depth_frames: number;
+  dtx_state?: string;
+  capture_overflows: number;
+  output_underflows: number;
+  last_input?: string;
+  last_playout?: string;
+}
+
+// Optional body of POST /routes/{id}/calibrate. Zero values keep the probe
+// defaults; Apply stores the computed offsets as the route alignment.
+export interface CalibrateRequest {
+  freq_hz?: number; // 100-20000, default 4200
+  amplitude?: number; // 1000-32000, default 16000
+  duration_ms?: number; // 100-5000, default 600
+  apply?: boolean;
+}
+
+// Response of a route calibration. Measured delays are the raw pipeline
+// delays (probe is injected after the gain stage). OffsetsMS are the newly
+// computed offsets when Applied, otherwise the ones already in place.
+export interface CalibrateResult {
+  route_id: string;
+  detected: boolean;
+  delay_ms?: number;
+  channel_delays_ms?: number[];
+  offsets_ms?: number[];
+  applied?: boolean;
+  freq_hz: number;
+  duration_ms: number;
+  note?: string;
+}
+
+// Body of PUT /routes/{id}/alignment.
+export interface UpdateAlignmentRequest {
+  offsets_ms: number[]; // per input channel, ms in [0, 1000]
+}
+
+// A route's per-channel alignment offsets.
+export interface AlignmentInfo {
+  route_id: string;
+  offsets_ms: number[];
+}
+
+// ============================================================================
 // ROOM COORDINATION
 // ============================================================================
+
+// Per-room latency preset: tunes playout timing and FEC for the room's
+// compiled routes. low = 10->50ms, no FEC; balanced = 20->200ms, no FEC
+// (default); reliable = 40->400ms, FEC K=4.
+export type LatencyPreset = 'low' | 'balanced' | 'reliable';
+
+export const LATENCY_PRESETS: { id: LatencyPreset; label: string; hint: string }[] = [
+  { id: 'low', label: 'Low', hint: '10\u219250 ms \u00b7 no FEC' },
+  { id: 'balanced', label: 'Balanced', hint: '20\u2192200 ms \u00b7 no FEC' },
+  { id: 'reliable', label: 'Reliable', hint: '40\u2192400 ms \u00b7 FEC K=4' },
+];
+
+export function latencyPresetLabel(preset?: string): { label: string; hint: string } {
+  const found = LATENCY_PRESETS.find((p) => p.id === preset);
+  return found ?? LATENCY_PRESETS[1];
+}
 
 export interface RoomInfo {
   id: string;
@@ -173,6 +263,7 @@ export interface RoomInfo {
   inputs: string[];
   outputs: string[];
   synced: boolean;
+  latency_preset?: string;
   input_gains?: Record<string, number>;
   output_gains?: Record<string, number>;
 }
@@ -292,6 +383,47 @@ export interface SystemMetrics {
   memory_total_mb: number;
   goroutines: number;
   gc_pause_ns: number;
+}
+
+// ============================================================================
+// NETWORK CONDITION SIMULATOR (QA)
+// ============================================================================
+
+// Deliberate network conditions simulated in one direction of the UDP audio
+// path. Percentages are 0-100 and delays are milliseconds; zero values are
+// no-ops. This is a development/QA tool (UDP mode only) — it is not used for
+// DTLS, which is a reliable stream.
+export interface SimProfile {
+  enabled: boolean;
+  loss_pct: number; // drop this fraction of packets (0-100)
+  latency_ms: number; // fixed extra delay per packet
+  jitter_ms: number; // uniform random 0..N extra delay
+  reorder_pct: number; // swap this fraction of packets with the next one (0-100)
+  duplicate_pct: number; // deliver this fraction of packets twice (0-100)
+  bandwidth_kbps: number; // sustained rate cap; 0 = unlimited
+}
+
+// Per-direction simulation profiles applied by the daemon.
+export interface SimProfiles {
+  in: SimProfile; // ingress: packets received, before handler dispatch
+  out: SimProfile; // egress: packets handed to the socket
+}
+
+export const SIM_DIRECTIONS: { key: keyof SimProfiles; label: string }[] = [
+  { key: 'in', label: 'INGRESS (received)' },
+  { key: 'out', label: 'EGRESS (sent)' },
+];
+
+export function emptySimProfile(): SimProfile {
+  return {
+    enabled: false,
+    loss_pct: 0,
+    latency_ms: 0,
+    jitter_ms: 0,
+    reorder_pct: 0,
+    duplicate_pct: 0,
+    bandwidth_kbps: 0,
+  };
 }
 
 // ============================================================================

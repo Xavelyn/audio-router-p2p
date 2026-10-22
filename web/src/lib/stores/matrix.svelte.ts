@@ -57,6 +57,18 @@ class MatrixStore {
   activeFaderSourceDevice = $state<AudioDevice | null>(null);
   activeFaderDestinationDevice = $state<AudioDevice | null>(null);
 
+  // Route Inspector drawer target: non-null route id means the drawer is open.
+  inspectorRouteId = $state<string | null>(null);
+
+  openInspector(routeId: string) {
+    this.inspectorRouteId = routeId;
+    this.closeFaderPopover();
+  }
+
+  closeInspector() {
+    this.inspectorRouteId = null;
+  }
+
   clearError() {
     this.lastError = null;
     this.error = null;

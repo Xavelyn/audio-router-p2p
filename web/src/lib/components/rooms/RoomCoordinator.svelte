@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { roomStore } from '$lib/stores/rooms.svelte';
   import { peerStore } from '$lib/stores/peers.svelte';
+  import { LATENCY_PRESETS, latencyPresetLabel } from '$lib/api/types';
   import Network from '@lucide/svelte/icons/network';
   import Crown from '@lucide/svelte/icons/crown';
   import Plus from '@lucide/svelte/icons/plus';
@@ -147,6 +148,7 @@
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {#each roomStore.rooms as room}
             {@const isJoined = roomStore.activeJoinedRoomId === room.id}
+            {@const currentPreset = room.latency_preset || 'balanced'}
             <div class="rounded-xl border transition-all p-5 shadow-xl flex flex-col justify-between {isJoined
               ? 'border-cyan-500/60 bg-gradient-to-b from-cyan-950/20 to-zinc-900/90 shadow-cyan-950/30'
               : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-700'}">
@@ -203,6 +205,27 @@
                       class="pointer-events-none inline-block h-4 w-4 transform rounded-full bg-zinc-200 shadow-md transition duration-200 ease-in-out data-[state=checked]:translate-x-5 data-[state=checked]:bg-zinc-950 data-[state=unchecked]:translate-x-0.5"
                     />
                   </Switch.Root>
+                </div>
+
+                <!-- Latency Preset Selector -->
+                <div class="mt-3 rounded-lg bg-zinc-950/70 p-2.5 border border-zinc-800/80">
+                  <div class="flex items-center justify-between mb-2">
+                    <span class="text-[10px] font-mono text-zinc-400">LATENCY PRESET</span>
+                    <span class="text-[10px] font-mono text-cyan-300">{latencyPresetLabel(currentPreset).hint}</span>
+                  </div>
+                  <div class="grid grid-cols-3 gap-1">
+                    {#each LATENCY_PRESETS as preset}
+                      <button
+                        onclick={() => roomStore.setRoomLatency(room.id, preset.id)}
+                        class="rounded-md px-2 py-1 text-[10px] font-mono font-semibold uppercase tracking-wide border transition-colors {currentPreset === preset.id
+                          ? 'bg-cyan-500 text-zinc-950 border-cyan-400'
+                          : 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:border-cyan-500/50 hover:text-cyan-300'}"
+                        title={preset.hint}
+                      >
+                        {preset.label}
+                      </button>
+                    {/each}
+                  </div>
                 </div>
 
                 <!-- Assigned Audio Devices Bus -->

@@ -5,11 +5,13 @@
   import type { AudioDevice } from '$lib/api/types';
   import { formatDb } from '$lib/api/types';
   import GainFaderPopover from './GainFaderPopover.svelte';
+  import RouteInspector from './RouteInspector.svelte';
   import Sliders from '@lucide/svelte/icons/sliders';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
   import Search from '@lucide/svelte/icons/search';
   import AlertCircle from '@lucide/svelte/icons/alert-circle';
   import X from '@lucide/svelte/icons/x';
+  import Gauge from '@lucide/svelte/icons/gauge';
 
   let filterText = $state('');
   let isClearing = $state(false);
@@ -200,6 +202,7 @@
     <div class="flex items-center gap-4">
       <span><strong class="text-zinc-200">Left Click:</strong> Connect / Disconnect (Unity 0 dB)</span>
       <span><strong class="text-zinc-200">Right Click / Shift+Click:</strong> Open Route Gain Fader</span>
+      <span><strong class="text-zinc-200">Hover &rarr; gauge icon:</strong> Route Inspector (status &bull; calibrate &bull; align)</span>
     </div>
     <div class="flex items-center gap-2">
       <span class="inline-block h-2 w-2 rounded-full bg-cyan-400 shadow-[0_0_6px_rgba(6,182,212,0.8)]"></span>
@@ -300,7 +303,7 @@
                   {@const cell = getCell(dst.id, src.id)}
                   {@const isConnected = !!cell}
                   {@const isMuted = cell?.muted ?? false}
-                  <td class="border border-zinc-800/80 p-0 text-center w-28 min-w-[112px] max-w-[112px] h-14 bg-zinc-950/60 hover:bg-zinc-800/30 transition-colors">
+                  <td class="relative group/cell border border-zinc-800/80 p-0 text-center w-28 min-w-[112px] max-w-[112px] h-14 bg-zinc-950/60 hover:bg-zinc-800/30 transition-colors">
                     <button
                       type="button"
                       onclick={(e) => handleCellClick(e, src, dst)}
@@ -330,6 +333,22 @@
                         ></div>
                       {/if}
                     </button>
+
+                    <!-- Route Inspector trigger (connected cells only) -->
+                    {#if isConnected}
+                      <button
+                        type="button"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          matrixStore.openInspector(cell.routeId);
+                        }}
+                        class="absolute top-1 right-1 z-10 rounded p-1 bg-zinc-900/90 border border-cyan-500/40 text-cyan-300 opacity-0 group-hover/cell:opacity-100 hover:bg-cyan-500/20 transition-opacity"
+                        title="Open Route Inspector (status, calibration, alignment)"
+                        aria-label="Open route inspector"
+                      >
+                        <Gauge class="w-3 h-3" />
+                      </button>
+                    {/if}
                   </td>
                 {/each}
               </tr>
@@ -342,3 +361,7 @@
 </div>
 
 <GainFaderPopover />
+
+{#if matrixStore.inspectorRouteId}
+  <RouteInspector routeId={matrixStore.inspectorRouteId} key={matrixStore.inspectorRouteId} />
+{/if}
