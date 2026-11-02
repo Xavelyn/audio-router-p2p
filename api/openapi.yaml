@@ -374,6 +374,112 @@ paths:
         '404':
           $ref: '#/components/responses/NotFoundError'
 
+  /api/v1/routes/{routeId}/status:
+    get:
+      tags:
+        - Routing
+      summary: Get route playback diagnostics
+      description: Returns playback state, ordered human-readable failure reasons, pipeline counters, and activity timestamps for capture, network, and playout.
+      operationId: getRouteStatus
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      responses:
+        '200':
+          description: Route status diagnostics.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RouteStatus'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '501':
+          $ref: '#/components/responses/NotImplementedError'
+
+  /api/v1/routes/{routeId}/calibrate:
+    post:
+      tags:
+        - Routing
+      summary: Calibrate loopback route latency
+      description: Injects a probe tone into local route input and measures per-channel delay at playout write. Optionally stores alignment offsets.
+      operationId: calibrateRoute
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalibrateRequest'
+      responses:
+        '200':
+          description: Calibration probe result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalibrateResult'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '501':
+          $ref: '#/components/responses/NotImplementedError'
+
+  /api/v1/routes/{routeId}/alignment:
+    get:
+      tags:
+        - Routing
+      summary: Get per-channel alignment offsets
+      description: Returns active or persisted per-channel delay offsets in milliseconds.
+      operationId: getRouteAlignment
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      responses:
+        '200':
+          description: Route alignment offsets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlignmentInfo'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '501':
+          $ref: '#/components/responses/NotImplementedError'
+    put:
+      tags:
+        - Routing
+      summary: Set per-channel alignment offsets
+      description: Sets per-channel alignment offsets (0-1000 ms) applied live before the gain matrix.
+      operationId: setRouteAlignment
+      parameters:
+        - $ref: '#/components/parameters/RouteIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAlignmentRequest'
+      responses:
+        '200':
+          description: Applied sample-quantized alignment offsets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlignmentInfo'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '501':
+          $ref: '#/components/responses/NotImplementedError'
+
   # ============================================================================
   # ROOM ORCHESTRATION (/api/v1/rooms)
   # ============================================================================
@@ -486,6 +592,143 @@ paths:
                 $ref: '#/components/schemas/RoomInfo'
         '404':
           $ref: '#/components/responses/NotFoundError'
+
+  /api/v1/rooms/{roomId}/latency:
+    put:
+      tags:
+        - Rooms
+      summary: Set room latency preset
+      description: Sets the room latency preset (low, balanced, or reliable), tuning jitter buffer timing limits and FEC protection for all room routes.
+      operationId: setRoomLatencyPreset
+      parameters:
+        - $ref: '#/components/parameters/RoomIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateRoomLatencyRequest'
+      responses:
+        '200':
+          description: Updated room details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoomInfo'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+
+  # ============================================================================
+  # NETWORK SIMULATOR & HEALTH (/api/v1/network)
+  # ============================================================================
+  /api/v1/network/sim:
+    get:
+      tags:
+        - Network
+      summary: Get network condition simulator profiles
+      description: Returns active simulated packet loss, latency, jitter, reorder, duplicate, and bandwidth limits for UDP audio path.
+      operationId: getNetworkSim
+      responses:
+        '200':
+          description: Ingress and egress simulation profiles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimProfiles'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '501':
+          $ref: '#/components/responses/NotImplementedError'
+    put:
+      tags:
+        - Network
+      summary: Update network condition simulator profiles
+      description: Updates simulated packet loss, latency, jitter, reorder, duplicate, and bandwidth limits per direction at runtime.
+      operationId: setNetworkSim
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SimProfiles'
+      responses:
+        '200':
+          description: Updated simulation profiles.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimProfiles'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '501':
+          $ref: '#/components/responses/NotImplementedError'
+
+  /api/v1/network/health:
+    get:
+      tags:
+        - Network
+      summary: Get cluster network health snapshot
+      description: Returns node health score, SWIM discovery membership metrics, clock sync health, peer link grades, and latency matrix.
+      operationId: getNetworkHealth
+      responses:
+        '200':
+          description: Network health snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NetworkHealthResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  # ============================================================================
+  # CLUSTER OBSERVABILITY (/api/v1/cluster)
+  # ============================================================================
+  /api/v1/cluster/nodes:
+    get:
+      tags:
+        - Cluster
+      summary: Enumerate cluster nodes
+      description: Returns summaries for all nodes in the mesh cluster including health grades and metrics.
+      operationId: getClusterNodes
+      responses:
+        '200':
+          description: Cluster nodes summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterNodesResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/cluster/devices:
+    get:
+      tags:
+        - Cluster
+      summary: Enumerate cluster-wide audio devices
+      description: Lists audio interfaces across all mesh nodes.
+      operationId: getClusterDevices
+      parameters:
+        - name: direction
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [all, input, output]
+      responses:
+        '200':
+          description: Cluster audio devices list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClusterDevicesResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
 
   # ============================================================================
   # HIGH-FREQUENCY TELEMETRY (/api/v1/telemetry)
@@ -817,6 +1060,12 @@ components:
         application/json:
           schema:
             $ref: '#/components/schemas/ErrorResponse'
+    NotImplementedError:
+      description: Requested feature or operation is unsupported or uncalibratable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
 
   schemas:
     # --------------------------------------------------------------------------
@@ -1097,6 +1346,12 @@ components:
           type: string
           enum: [active, slewing, paused, error]
           example: active
+        channel_delays_ms:
+          type: array
+          items:
+            type: number
+          description: Per-channel delay offsets in milliseconds applied before matrix mixing.
+          example: [0.0, 15.5]
 
     CreateRouteRequest:
       type: object
@@ -1168,6 +1423,212 @@ components:
           default: 20.0
           example: 20.0
 
+    RoutePeerStatus:
+      type: object
+      required:
+        - address
+        - role
+        - packets_sent
+        - packets_lost
+        - fec_recovered
+        - jitter_depth_frames
+        - underruns
+      properties:
+        peer_id:
+          type: string
+          example: node-b
+        address:
+          type: string
+          example: 10.0.0.2:45678
+        role:
+          type: string
+          enum: [send, receive, sendrecv]
+          example: receive
+        last_send:
+          type: string
+          format: date-time
+        last_recv:
+          type: string
+          format: date-time
+        last_contact:
+          type: string
+          format: date-time
+        last_send_error:
+          type: string
+        packets_sent:
+          type: integer
+          example: 1200
+        packets_lost:
+          type: integer
+          example: 3
+        fec_recovered:
+          type: integer
+          example: 2
+        jitter_depth_frames:
+          type: integer
+          example: 12
+        underruns:
+          type: integer
+          example: 0
+
+    RouteStatus:
+      type: object
+      required:
+        - route_id
+        - direction
+        - playing
+        - summary
+        - packets_received
+        - underruns
+        - overruns
+        - jitter_depth_frames
+        - capture_overflows
+        - output_underflows
+      properties:
+        route_id:
+          type: string
+          example: local-matrix-1
+        direction:
+          type: string
+          enum: [send, receive, sendrecv]
+          example: sendrecv
+        playing:
+          type: boolean
+          example: true
+        summary:
+          type: string
+          example: playing
+        reasons:
+          type: array
+          items:
+            type: string
+          example: ["no audio received from any peer yet"]
+        peers:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoutePeerStatus'
+        packets_received:
+          type: integer
+          example: 15400
+        underruns:
+          type: integer
+          example: 0
+        overruns:
+          type: integer
+          example: 0
+        jitter_depth_frames:
+          type: integer
+          example: 60
+        dtx_state:
+          type: string
+          example: active
+        capture_overflows:
+          type: integer
+          example: 0
+        output_underflows:
+          type: integer
+          example: 0
+        last_input:
+          type: string
+          format: date-time
+        last_playout:
+          type: string
+          format: date-time
+
+    CalibrateRequest:
+      type: object
+      properties:
+        freq_hz:
+          type: number
+          minimum: 100
+          maximum: 20000
+          default: 4200
+          example: 4200
+        amplitude:
+          type: integer
+          minimum: 1000
+          maximum: 32000
+          default: 16000
+          example: 16000
+        duration_ms:
+          type: integer
+          minimum: 100
+          maximum: 5000
+          default: 600
+          example: 600
+        apply:
+          type: boolean
+          default: false
+          example: true
+
+    CalibrateResult:
+      type: object
+      required:
+        - route_id
+        - detected
+        - freq_hz
+        - duration_ms
+      properties:
+        route_id:
+          type: string
+          example: local-1
+        detected:
+          type: boolean
+          example: true
+        delay_ms:
+          type: number
+          example: 12.5
+        channel_delays_ms:
+          type: array
+          items:
+            type: number
+          example: [10.2, 14.8]
+        offsets_ms:
+          type: array
+          items:
+            type: number
+          example: [4.6, 0.0]
+        applied:
+          type: boolean
+          example: true
+        freq_hz:
+          type: number
+          example: 4200
+        duration_ms:
+          type: integer
+          example: 600
+        note:
+          type: string
+          example: "probe detected on 2 of 2 channels"
+
+    UpdateAlignmentRequest:
+      type: object
+      required:
+        - offsets_ms
+      properties:
+        offsets_ms:
+          type: array
+          items:
+            type: number
+            minimum: 0
+            maximum: 1000
+          example: [0.0, 15.0]
+
+    AlignmentInfo:
+      type: object
+      required:
+        - route_id
+        - offsets_ms
+      properties:
+        route_id:
+          type: string
+          example: local-1
+        offsets_ms:
+          type: array
+          items:
+            type: number
+          example: [0.0, 15.0]
+
     # --------------------------------------------------------------------------
     # Room Management
     # --------------------------------------------------------------------------
@@ -1196,6 +1657,43 @@ components:
           items:
             type: string
           example: ["node-nyc-master", "node-lon-monitor", "node-fra-backup"]
+        latency_preset:
+          type: string
+          enum: [low, balanced, reliable]
+          default: balanced
+          example: low
+        inputs:
+          type: array
+          items:
+            type: string
+          example: ["hw:0"]
+        outputs:
+          type: array
+          items:
+            type: string
+          example: ["hw:1"]
+        synced:
+          type: boolean
+          default: false
+          example: true
+        input_gains:
+          type: object
+          additionalProperties:
+            type: number
+        output_gains:
+          type: object
+          additionalProperties:
+            type: number
+
+    UpdateRoomLatencyRequest:
+      type: object
+      required:
+        - preset
+      properties:
+        preset:
+          type: string
+          enum: [low, balanced, reliable]
+          example: low
 
     CreateRoomRequest:
       type: object
@@ -1415,6 +1913,495 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/JitterStats'
           description: Per-remote-peer jitter and reception statistics.
+
+    # --------------------------------------------------------------------------
+    # Network Condition Simulator
+    # --------------------------------------------------------------------------
+    SimProfile:
+      type: object
+      required:
+        - enabled
+        - loss_pct
+        - latency_ms
+        - jitter_ms
+        - reorder_pct
+        - duplicate_pct
+        - bandwidth_kbps
+      properties:
+        enabled:
+          type: boolean
+          example: true
+        loss_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 10.0
+        latency_ms:
+          type: number
+          minimum: 0
+          example: 25.0
+        jitter_ms:
+          type: number
+          minimum: 0
+          example: 15.0
+        reorder_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 5.0
+        duplicate_pct:
+          type: number
+          minimum: 0
+          maximum: 100
+          example: 2.0
+        bandwidth_kbps:
+          type: number
+          minimum: 0
+          description: Sustained rate limit in kbps (0 = unlimited).
+          example: 1024.0
+
+    SimProfiles:
+      type: object
+      required:
+        - in
+        - out
+      properties:
+        in:
+          $ref: '#/components/schemas/SimProfile'
+        out:
+          $ref: '#/components/schemas/SimProfile'
+
+    # --------------------------------------------------------------------------
+    # Network Health & Cluster Observability
+    # --------------------------------------------------------------------------
+    ClockSyncHealth:
+      type: object
+      required:
+        - offset_us
+        - drift_ppm
+        - sync_rtt_us
+        - packets_sent
+        - packets_lost
+        - is_master
+      properties:
+        offset_us:
+          type: number
+          example: 0.12
+        drift_ppm:
+          type: number
+          example: -0.45
+        sync_rtt_us:
+          type: number
+          example: 120.0
+        packets_sent:
+          type: integer
+          example: 500
+        packets_lost:
+          type: integer
+          example: 0
+        is_master:
+          type: boolean
+          example: true
+
+    DiscoveryHealth:
+      type: object
+      required:
+        - active_members
+        - suspect_members
+        - dead_members
+        - lan_beacon_active
+        - beacons_sent
+        - beacons_received
+        - token_rejections
+        - seed_retry_active
+        - seed_join_attempts
+        - seed_join_successes
+      properties:
+        active_members:
+          type: integer
+          example: 3
+        suspect_members:
+          type: integer
+          example: 0
+        dead_members:
+          type: integer
+          example: 0
+        lan_beacon_active:
+          type: boolean
+          example: true
+        beacons_sent:
+          type: integer
+          example: 1420
+        beacons_received:
+          type: integer
+          example: 2840
+        token_rejections:
+          type: integer
+          example: 0
+        seed_retry_active:
+          type: boolean
+          example: false
+        seed_join_attempts:
+          type: integer
+          example: 1
+        seed_join_successes:
+          type: integer
+          example: 1
+
+    StreamLinkStats:
+      type: object
+      required:
+        - stream_id
+        - packets_sent
+        - packets_received
+        - packets_lost
+        - loss_ratio
+        - effective_kbps
+        - jitter_depth_frames
+        - jitter_target_delay_ms
+        - underruns
+        - overruns
+        - fec_recovered
+        - plc_concealed
+      properties:
+        stream_id:
+          type: string
+          example: stream-main-1
+        peer_id:
+          type: string
+          example: node-b
+        packets_sent:
+          type: integer
+          example: 15400
+        packets_received:
+          type: integer
+          example: 15392
+        packets_lost:
+          type: integer
+          example: 8
+        loss_ratio:
+          type: number
+          example: 0.0005
+        effective_kbps:
+          type: number
+          example: 1536.0
+        jitter_depth_frames:
+          type: integer
+          example: 60
+        jitter_target_delay_ms:
+          type: number
+          example: 20.0
+        underruns:
+          type: integer
+          example: 0
+        overruns:
+          type: integer
+          example: 0
+        fec_recovered:
+          type: integer
+          example: 6
+        plc_concealed:
+          type: integer
+          example: 2
+
+    PeerLinkHealth:
+      type: object
+      required:
+        - peer_id
+        - address
+        - health_score
+        - health_grade
+        - swim_state
+        - direct_ping_failed
+        - rtt_ms
+        - last_seen
+        - loss_ratio
+        - bitrate_kbps
+      properties:
+        peer_id:
+          type: string
+          example: node-b
+        address:
+          type: string
+          example: 10.0.0.2:7001
+        health_score:
+          type: number
+          example: 95.0
+        health_grade:
+          type: string
+          enum: [EXCELLENT, GOOD, FAIR, POOR, CRITICAL]
+          example: EXCELLENT
+        swim_state:
+          type: string
+          enum: [alive, suspect, dead]
+          example: alive
+        direct_ping_failed:
+          type: boolean
+          example: false
+        rtt_ms:
+          type: number
+          example: 1.45
+        last_seen:
+          type: string
+          format: date-time
+        loss_ratio:
+          type: number
+          example: 0.001
+        bitrate_kbps:
+          type: number
+          example: 1536.0
+        streaming:
+          $ref: '#/components/schemas/StreamLinkStats'
+        sync:
+          $ref: '#/components/schemas/ClockSyncHealth'
+
+    NetworkHealthResponse:
+      type: object
+      required:
+        - node_id
+        - timestamp
+        - health_score
+        - health_grade
+        - cluster
+        - sync
+        - latency_matrix
+        - peers
+        - local_underruns
+      properties:
+        node_id:
+          type: string
+          example: node-a
+        timestamp:
+          type: string
+          format: date-time
+        health_score:
+          type: number
+          example: 98.0
+        health_grade:
+          type: string
+          enum: [EXCELLENT, GOOD, FAIR, POOR, CRITICAL]
+          example: EXCELLENT
+        cluster:
+          $ref: '#/components/schemas/DiscoveryHealth'
+        sync:
+          $ref: '#/components/schemas/ClockSyncHealth'
+        latency_matrix:
+          type: object
+          additionalProperties:
+            type: number
+          example: {"node-b": 1.45}
+        peers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/PeerLinkHealth'
+        streams:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/StreamLinkStats'
+        local_underruns:
+          type: integer
+          example: 0
+
+    ClusterDeviceSummary:
+      type: object
+      required:
+        - id
+        - node_id
+        - name
+        - direction
+        - max_input
+        - max_output
+        - default_sample_rate
+        - is_virtual
+        - volume
+        - muted
+      properties:
+        id:
+          type: string
+          example: hw:0
+        urn:
+          type: string
+          example: urn:audio:dev:hw:0
+        legacy_id:
+          type: string
+          example: "0"
+        device_id:
+          type: string
+          example: hw:0
+        node_id:
+          type: string
+          example: node-a
+        node_name:
+          type: string
+          example: Studio Gateway
+        name:
+          type: string
+          example: Built-in Audio
+        direction:
+          type: string
+          enum: [input, output, duplex]
+          example: duplex
+        max_input:
+          type: integer
+          example: 2
+        max_output:
+          type: integer
+          example: 2
+        default_sample_rate:
+          type: integer
+          example: 48000
+        is_virtual:
+          type: boolean
+          example: false
+        volume:
+          type: number
+          example: 1.0
+        muted:
+          type: boolean
+          example: false
+        supported_layouts:
+          type: array
+          items:
+            type: string
+          example: ["stereo"]
+        state:
+          type: string
+          example: active
+        status:
+          type: string
+          example: active
+
+    ClusterDevicesResponse:
+      type: object
+      required:
+        - timestamp
+        - devices
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDeviceSummary'
+
+    ClusterNodeSummary:
+      type: object
+      required:
+        - id
+        - name
+        - api_addr
+        - is_local
+        - swim_state
+        - health_score
+        - health_grade
+        - clock_sync
+        - devices
+        - active_streams
+      properties:
+        id:
+          type: string
+          example: node-a
+        node_id:
+          type: string
+          example: node-a
+        name:
+          type: string
+          example: Local Studio Node
+        api_addr:
+          type: string
+          example: 127.0.0.1:8443
+        is_local:
+          type: boolean
+          example: true
+        swim_state:
+          type: string
+          enum: [alive, suspect, dead]
+          example: alive
+        health_score:
+          type: number
+          example: 98.0
+        health_grade:
+          type: string
+          enum: [EXCELLENT, GOOD, FAIR, POOR, CRITICAL]
+          example: EXCELLENT
+        clock_sync:
+          $ref: '#/components/schemas/ClockSyncHealth'
+        clock_role:
+          type: string
+          example: master
+        clock_offset_us:
+          type: number
+          example: 0.15
+        clock_drift_ppm:
+          type: number
+          example: -0.2
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterDeviceSummary'
+        active_streams:
+          type: integer
+          example: 2
+        uptime_seconds:
+          type: number
+          example: 3600.0
+        last_seen:
+          type: string
+          format: date-time
+        error_reason:
+          type: string
+        packet_loss_ratio:
+          type: number
+          example: 0.001
+        rtt_ms:
+          type: number
+          example: 1.2
+        bitrate_kbps:
+          type: number
+          example: 1536.0
+
+    ClusterNodesResponse:
+      type: object
+      required:
+        - total_nodes
+        - healthy_nodes
+        - degraded_nodes
+        - timestamp
+        - nodes
+      properties:
+        cluster_id:
+          type: string
+          example: mesh-cluster-1
+        total_nodes:
+          type: integer
+          example: 3
+        healthy_nodes:
+          type: integer
+          example: 3
+        degraded_nodes:
+          type: integer
+          example: 0
+        active_nodes:
+          type: integer
+          example: 3
+        timestamp:
+          type: string
+          format: date-time
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClusterNodeSummary'
+        nodes_map:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ClusterNodeSummary'
+        latency_matrix:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties:
+              type: number
 
     # --------------------------------------------------------------------------
     # Legacy Format Types

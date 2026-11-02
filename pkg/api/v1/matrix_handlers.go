@@ -221,10 +221,12 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var req CalibrateRequest
-		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
-			return
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
+				return
+			}
 		}
 		if err := req.Validate(); err != nil {
 			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
@@ -268,6 +270,10 @@ func (s *V1Server) handleRoutesSubpath(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			var req UpdateAlignmentRequest
+			if r.Body == nil {
+				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", "missing request body")
+				return
+			}
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())

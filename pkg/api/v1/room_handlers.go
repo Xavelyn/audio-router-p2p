@@ -229,6 +229,10 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
+			if r.Body == nil {
+				s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", "missing request body")
+				return
+			}
 			r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 			var req UpdateRoomLatencyRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

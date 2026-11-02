@@ -26,6 +26,10 @@ func (s *V1Server) handleNetworkSim(w http.ResponseWriter, r *http.Request) {
 		s.WriteJSON(w, http.StatusOK, sim.Profiles())
 
 	case http.MethodPut:
+		if r.Body == nil {
+			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", "missing request body")
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
 		var profiles transport.SimProfiles
 		if err := json.NewDecoder(r.Body).Decode(&profiles); err != nil {

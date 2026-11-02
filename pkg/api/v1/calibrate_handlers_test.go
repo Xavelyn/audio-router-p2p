@@ -146,6 +146,16 @@ func TestV1RouteCalibrate(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for bad duration, got %d: %s", w.Code, w.Body.String())
 	}
+	w = doV1Request(mux, http.MethodPost, "/api/v1/routes/local-1/calibrate",
+		map[string]any{"amplitude": 500}, calibAuth)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for low amplitude, got %d: %s", w.Code, w.Body.String())
+	}
+	w = doV1Request(mux, http.MethodPost, "/api/v1/routes/local-1/calibrate",
+		map[string]any{"amplitude": 40000}, calibAuth)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for high amplitude, got %d: %s", w.Code, w.Body.String())
+	}
 
 	// Route not running → 404.
 	w = doV1Request(mux, http.MethodPost, "/api/v1/routes/missing/calibrate", nil, calibAuth)
