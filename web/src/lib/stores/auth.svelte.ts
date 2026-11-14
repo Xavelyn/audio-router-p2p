@@ -68,6 +68,9 @@ class AuthStore {
       this.connectionStatus = 'connected';
       this.version = status.version;
       this.uptimeSeconds = status.uptime_seconds;
+      if (status.node_name || status.node_id) {
+        this.nodeName = status.node_name || status.node_id || this.nodeName;
+      }
       this.lastError = null;
       return true;
     } catch (err: any) {

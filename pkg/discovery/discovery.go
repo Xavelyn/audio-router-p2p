@@ -264,6 +264,41 @@ func (d *Discovery) AddPeer(peer *Peer) {
 	d.peers[peer.ID] = &cp
 }
 
+// ConnectPeer validates a peer address, attempts a Memberlist join when running,
+// and ensures the peer is recorded in the discovery table.
+func (d *Discovery) ConnectPeer(addr string) (*Peer, error) {
+	addr = strings.TrimSpace(addr)
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil || host == "" || port == "" {
+		return nil, fmt.Errorf("invalid peer address %q", addr)
+	}
+	portNum, err := strconv.Atoi(port)
+	if err != nil || portNum < 1 || portNum > 65535 {
+		return nil, fmt.Errorf("invalid peer address %q", addr)
+	}
+	p := d.PeerByAddr(addr)
+	if p == nil {
+		p = &Peer{
+			ID:       "peer-" + addr,
+			Addr:     addr,
+			LastSeen: time.Now(),
+		}
+		d.AddPeer(p)
+	}
+	d.mlistMu.RLock()
+	mlist := d.mlist
+	d.mlistMu.RUnlock()
+	if mlist != nil && !d.isStopping() {
+		go func(target string) {
+			d.seedJoinAttempts.Add(1)
+			if _, err := mlist.Join([]string{target}); err == nil {
+				d.seedJoinSuccesses.Add(1)
+			}
+		}(addr)
+	}
+	return p, nil
+}
+
 // Telemetry returns cluster health, discovery, and bootstrap metrics safely for telemetry consumers.
 func (d *Discovery) Telemetry() telemetry.DiscoveryHealth {
 	var active, suspect, dead int

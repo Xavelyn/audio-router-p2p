@@ -16,15 +16,20 @@
   import PanelLeftClose from '@lucide/svelte/icons/panel-left-close';
   import GripVertical from '@lucide/svelte/icons/grip-vertical';
   import Server from '@lucide/svelte/icons/server';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
+  import Volume2 from '@lucide/svelte/icons/volume-2';
+  import VolumeX from '@lucide/svelte/icons/volume-x';
 
   type DirectionFilter = 'all' | 'in' | 'out' | 'virt';
 
   interface Props {
     onAddDevice?: (device: AudioDevice | AudioDeviceSummary, direction?: 'input' | 'output') => void;
     onFocusDevice?: (deviceId: string, direction?: 'input' | 'output') => void;
+    onCreateVirtual?: () => void;
+    onDeleteVirtual?: (deviceId: string) => void;
   }
 
-  let { onAddDevice, onFocusDevice }: Props = $props();
+  let { onAddDevice, onFocusDevice, onCreateVirtual, onDeleteVirtual }: Props = $props();
 
   let searchQuery = $state('');
   let directionFilter = $state<DirectionFilter>('all');
@@ -192,16 +197,29 @@
       </div>
     </div>
 
-    <!-- Collapse Palette Button -->
-    <button
-      type="button"
-      onclick={() => flowLayoutStore.setSidebarOpen(false)}
-      class="rounded-lg p-1.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/80 transition-colors"
-      title="Collapse Device Palette"
-      aria-label="Collapse Device Palette"
-    >
-      <PanelLeftClose class="w-4 h-4" />
-    </button>
+    <!-- Header Actions (+ Virtual & Collapse Palette Button) -->
+    <div class="flex items-center gap-1.5 shrink-0">
+      {#if onCreateVirtual}
+        <button
+          type="button"
+          onclick={() => onCreateVirtual()}
+          class="inline-flex items-center gap-1 rounded-lg border border-purple-500/30 bg-purple-500/10 px-2 py-1 text-[10px] font-mono font-semibold text-purple-300 hover:bg-purple-500/20 transition-colors cursor-pointer"
+          title="Create Virtual Audio Loopback"
+        >
+          <Plus class="w-3 h-3 text-purple-400" />
+          <span>Virtual</span>
+        </button>
+      {/if}
+      <button
+        type="button"
+        onclick={() => flowLayoutStore.setSidebarOpen(false)}
+        class="rounded-lg p-1.5 text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/80 transition-colors"
+        title="Collapse Device Palette"
+        aria-label="Collapse Device Palette"
+      >
+        <PanelLeftClose class="w-4 h-4" />
+      </button>
+    </div>
   </div>
 
   <!-- Search & Direction Filter Chips -->
@@ -406,6 +424,38 @@
 
                   <!-- Staging Status Pill / Add Button (ADR 0027, ADR 0028 Directional & Canonical Isolation) -->
                   <div class="shrink-0 flex items-center gap-1">
+                    <button
+                      type="button"
+                      onclick={(e) => {
+                        e.stopPropagation();
+                        clusterStore.patchDevice(node.id, (device as any).device_id || device.id, { muted: !device.muted });
+                      }}
+                      class="rounded p-1 border transition-colors cursor-pointer {device.muted
+                        ? 'bg-red-950/60 text-red-400 border-red-500/40'
+                        : 'bg-zinc-800/80 text-zinc-400 border-zinc-700 hover:text-cyan-300'}"
+                      title={device.muted ? 'Unmute device' : 'Mute device'}
+                      aria-label={device.muted ? 'Unmute device' : 'Mute device'}
+                    >
+                      {#if device.muted}
+                        <VolumeX class="w-2.5 h-2.5" />
+                      {:else}
+                        <Volume2 class="w-2.5 h-2.5" />
+                      {/if}
+                    </button>
+                    {#if device.is_virtual && node.isLocal && onDeleteVirtual}
+                      <button
+                        type="button"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          onDeleteVirtual(device.id);
+                        }}
+                        class="rounded p-1 border border-zinc-700 bg-zinc-800/80 text-zinc-400 hover:text-red-400 hover:border-red-500/40 transition-colors cursor-pointer"
+                        title="Delete virtual device"
+                        aria-label="Delete virtual device"
+                      >
+                        <Trash2 class="w-2.5 h-2.5" />
+                      </button>
+                    {/if}
                     {#if isDuplex}
                       {#if isBothStaged}
                         <button

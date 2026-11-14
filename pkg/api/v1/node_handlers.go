@@ -2,10 +2,11 @@ package v1
 
 import (
 	"encoding/json"
+	"math"
+	"net"
 	"net/http"
+	"strings"
 	"time"
-
-	"github.com/audio-router-p2p/pkg/discovery"
 )
 
 // handleSystemStatus handles GET /api/v1/system/status.
@@ -15,8 +16,18 @@ func (s *V1Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	nodeID := ""
+	if s.discovery != nil {
+		nodeID = s.discovery.NodeID()
+	} else if s.cfg != nil {
+		nodeID = s.cfg.NodeID
+	}
+
 	activeRoutes := 0
-	if s.router != nil {
+	if s.streams != nil {
+		activeRoutes = len(s.streams.Stats())
+	}
+	if activeRoutes == 0 && s.router != nil {
 		activeRoutes = len(s.router.ListMatrix())
 	}
 
@@ -28,12 +39,19 @@ func (s *V1Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	syncLocked := false
 	if s.syncMgr != nil {
 		syncInfo := s.syncMgr.Offsets()
-		syncLocked = len(syncInfo) > 0
+		for _, off := range syncInfo {
+			if math.Abs(float64(off.Offset)) < float64(10*time.Millisecond) {
+				syncLocked = true
+				break
+			}
+		}
 	}
 
 	status := SystemStatus{
 		Status:          "ok",
 		Version:         "1.0.0",
+		NodeID:          nodeID,
+		NodeName:        nodeID,
 		UptimeSeconds:   time.Since(s.startTime).Seconds(),
 		ActiveRoutes:    activeRoutes,
 		DiscoveredPeers: peerCount,
@@ -51,12 +69,29 @@ func (s *V1Server) handleSystemPeers(w http.ResponseWriter, r *http.Request) {
 		if s.discovery != nil {
 			discPeers := s.discovery.Peers()
 			peers = make([]PeerNode, 0, len(discPeers))
+			var offsets map[string]float64
+			if s.syncMgr != nil {
+				raw := s.syncMgr.Offsets()
+				offsets = make(map[string]float64, len(raw))
+				for id, off := range raw {
+					offsets[id] = float64(off.RTT.Microseconds()) / 1000.0
+				}
+			}
 			for _, p := range discPeers {
+				state := s.discovery.PeerState(p.ID)
+				status := state
+				if state == "alive" || state == "unknown" {
+					status = "connected"
+				}
+				var rttMS float64
+				if offsets != nil {
+					rttMS = offsets[p.ID]
+				}
 				peers = append(peers, PeerNode{
 					ID:       p.ID,
 					Addr:     p.Addr,
-					Status:   "connected",
-					RTTMS:    0.0,
+					Status:   status,
+					RTTMS:    rttMS,
 					LastSeen: p.LastSeen.Format(time.RFC3339),
 				})
 			}
@@ -72,8 +107,13 @@ func (s *V1Server) handleSystemPeers(w http.ResponseWriter, r *http.Request) {
 			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
 			return
 		}
+		req.Addr = strings.TrimSpace(req.Addr)
 		if req.Addr == "" {
 			s.WriteError(w, http.StatusBadRequest, "ERR_MISSING_ADDR", "peer address is required")
+			return
+		}
+		if host, port, err := net.SplitHostPort(req.Addr); err != nil || host == "" || port == "" {
+			s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_ADDR", "invalid peer host:port address")
 			return
 		}
 
@@ -86,12 +126,18 @@ func (s *V1Server) handleSystemPeers(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if s.discovery != nil {
-			// Record peer discovery if available
-			s.discovery.AddPeer(&discovery.Peer{
-				ID:       peer.ID,
-				Addr:     req.Addr,
-				LastSeen: time.Now(),
-			})
+			p, err := s.discovery.ConnectPeer(req.Addr)
+			if err != nil {
+				s.WriteError(w, http.StatusBadGateway, "ERR_PEER_CONNECT", err.Error())
+				return
+			}
+			if p != nil {
+				peer.ID = p.ID
+				peer.Addr = p.Addr
+				if !p.LastSeen.IsZero() {
+					peer.LastSeen = p.LastSeen.Format(time.RFC3339)
+				}
+			}
 		}
 
 		s.WriteJSON(w, http.StatusCreated, peer)

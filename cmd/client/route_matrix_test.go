@@ -64,12 +64,39 @@ func TestRouteMatrixLiveGainAndMute(t *testing.T) {
 	check(5000, 4000)
 }
 
-func TestRouteMatrixRejectedChannelConversion(t *testing.T) {
+func TestRouteMatrixChannelAdaptation(t *testing.T) {
 	sink := audio.NewVirtualAudioDevice()
 	defer sink.Close()
-	if _, err := newRouteMatrix(sink, router.StreamRoute{
-		ID: "unsupported", SampleRate: 48000, Channels: 2, InChannels: 1, OutChannels: 2,
-	}); err == nil {
-		t.Fatal("expected explicit error for unsupported live channel conversion")
+	route := router.StreamRoute{
+		ID: "adapted", SampleRate: 48000, Channels: 2,
+		InChannels: 1, OutChannels: 2, Coefficients: []float64{0.5, 1.0},
+	}
+	filter, err := newRouteMatrix(sink, route)
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := constantStereo(960, 10000, 4000)
+	sink.Reset()
+	if n, err := filter.Write(block); err != nil || n != len(block) {
+		t.Fatalf("Write: n=%d err=%v", n, err)
+	}
+	got := sink.CapturedBytes()
+	last := got[len(got)-4:]
+	if l, r := int16(binary.LittleEndian.Uint16(last)), int16(binary.LittleEndian.Uint16(last[2:])); l != 5000 || r != 4000 {
+		t.Fatalf("last frame = (%d, %d), want (5000, 4000)", l, r)
+	}
+	mr := router.StreamRouteToMatrixRoute(route)
+	mr.Muted = true
+	if err := filter.Update(mr); err != nil {
+		t.Fatal(err)
+	}
+	sink.Reset()
+	if _, err := filter.Write(block); err != nil {
+		t.Fatal(err)
+	}
+	got = sink.CapturedBytes()
+	last = got[len(got)-4:]
+	if l, r := int16(binary.LittleEndian.Uint16(last)), int16(binary.LittleEndian.Uint16(last[2:])); l != 0 || r != 0 {
+		t.Fatalf("muted frame = (%d, %d), want (0, 0)", l, r)
 	}
 }

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
   import { Switch } from 'bits-ui';
-  import { LATENCY_PRESETS, type RoomInfo, type AudioDevice } from '$lib/api/types';
+  import { LATENCY_PRESETS, linearToDb, formatDb, type RoomInfo, type AudioDevice } from '$lib/api/types';
   import { roomStore } from '$lib/stores/rooms.svelte';
   import Crown from '@lucide/svelte/icons/crown';
   import Network from '@lucide/svelte/icons/network';
@@ -10,6 +10,10 @@
   import X from '@lucide/svelte/icons/x';
   import Zap from '@lucide/svelte/icons/zap';
   import ArrowRight from '@lucide/svelte/icons/arrow-right';
+  import Volume2 from '@lucide/svelte/icons/volume-2';
+  import VolumeX from '@lucide/svelte/icons/volume-x';
+  import Gauge from '@lucide/svelte/icons/gauge';
+  import Sliders from '@lucide/svelte/icons/sliders';
 
   interface RoomBusData {
     room: RoomInfo;
@@ -23,6 +27,7 @@
     onAddOutput: (devId: string) => void;
     onRemoveOutput: (devId: string) => void;
     onDeleteRoom: () => void;
+    onInspectRoute?: (endpointId?: string) => void;
   }
 
   let { id, data, selected = false }: { id: string; data: RoomBusData; selected?: boolean } = $props();
@@ -209,21 +214,62 @@
       </div>
 
       <!-- Inputs List -->
-      <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+      <div class="space-y-1.5 max-h-48 overflow-y-auto pr-1">
         {#each data.inputDevices as dev ((dev as any).endpoint_id || dev.id)}
-          <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
-            <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
-              <span class="text-cyan-300 font-medium truncate block">{dev.name}</span>
+          {@const epId = (dev as any).endpoint_id || dev.id}
+          {@const gain = data.room.input_gains?.[epId] ?? data.room.input_gains?.[dev.id] ?? 1.0}
+          <div class="rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1.5 text-[10px] font-mono text-zinc-200 space-y-1">
+            <div class="flex items-center justify-between min-w-0 gap-1">
+              <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
+                <span class="text-cyan-300 font-medium truncate block">{dev.name}</span>
+              </div>
+              <button
+                type="button"
+                onclick={() => roomStore.setRoomInputGain(data.room.id, epId, 1.0)}
+                class="nodrag rounded px-1 py-0.5 text-[9px] font-mono border transition-colors cursor-pointer shrink-0 {gain <= 0.0001
+                  ? 'bg-red-950/60 text-red-400 border-red-500/40'
+                  : 'bg-zinc-950 text-cyan-300 border-zinc-700 hover:border-cyan-500/50'}"
+                title="Click to reset input gain to unity (0.0 dB)"
+              >
+                {gain <= 0.0001 ? 'MUTE' : formatDb(linearToDb(gain))}
+              </button>
+              <button
+                type="button"
+                onclick={() => roomStore.setRoomInputGain(data.room.id, epId, gain <= 0.0001 ? 1.0 : 0.0)}
+                class="nodrag text-zinc-400 hover:text-cyan-300 p-0.5 transition-colors shrink-0 cursor-pointer"
+                title={gain <= 0.0001 ? 'Unmute input in room' : 'Mute input in room'}
+                aria-label={gain <= 0.0001 ? 'Unmute input in room' : 'Mute input in room'}
+              >
+                {#if gain <= 0.0001}
+                  <VolumeX class="w-3 h-3 text-red-400" />
+                {:else}
+                  <Volume2 class="w-3 h-3 text-cyan-400" />
+                {/if}
+              </button>
+              <button
+                type="button"
+                onclick={() => data.onRemoveInput(epId)}
+                class="nodrag text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
+                title="Remove {dev.name} from room"
+                aria-label="Remove {dev.name} from room"
+              >
+                <X class="w-3 h-3" />
+              </button>
             </div>
-            <button
-              type="button"
-              onclick={() => data.onRemoveInput((dev as any).endpoint_id || dev.id)}
-              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
-              title="Remove {dev.name} from room"
-              aria-label="Remove {dev.name} from room"
-            >
-              <X class="w-3 h-3" />
-            </button>
+            <div class="flex items-center gap-1.5">
+              <Sliders class="w-2.5 h-2.5 text-zinc-500 shrink-0" />
+              <input
+                type="range"
+                min="0"
+                max="2"
+                step="0.02"
+                value={gain}
+                oninput={(e) => roomStore.setRoomInputGain(data.room.id, epId, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                onchange={(e) => roomStore.setRoomInputGain(data.room.id, epId, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                class="nodrag w-full h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                aria-label="Input gain for {dev.name}"
+              />
+            </div>
           </div>
         {/each}
         {#if data.inputDevices.length === 0}
@@ -279,21 +325,62 @@
       </div>
 
       <!-- Outputs List -->
-      <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
+      <div class="space-y-1.5 max-h-48 overflow-y-auto pr-1">
         {#each data.outputDevices as dev ((dev as any).endpoint_id || dev.id)}
-          <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
-            <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
-              <span class="text-purple-300 font-medium truncate block">{dev.name}</span>
+          {@const epId = (dev as any).endpoint_id || dev.id}
+          {@const gain = data.room.output_gains?.[epId] ?? data.room.output_gains?.[dev.id] ?? 1.0}
+          <div class="rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1.5 text-[10px] font-mono text-zinc-200 space-y-1">
+            <div class="flex items-center justify-between min-w-0 gap-1">
+              <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
+                <span class="text-purple-300 font-medium truncate block">{dev.name}</span>
+              </div>
+              <button
+                type="button"
+                onclick={() => roomStore.setRoomOutputGain(data.room.id, epId, 1.0)}
+                class="nodrag rounded px-1 py-0.5 text-[9px] font-mono border transition-colors cursor-pointer shrink-0 {gain <= 0.0001
+                  ? 'bg-red-950/60 text-red-400 border-red-500/40'
+                  : 'bg-zinc-950 text-purple-300 border-zinc-700 hover:border-purple-500/50'}"
+                title="Click to reset output gain to unity (0.0 dB)"
+              >
+                {gain <= 0.0001 ? 'MUTE' : formatDb(linearToDb(gain))}
+              </button>
+              <button
+                type="button"
+                onclick={() => roomStore.setRoomOutputGain(data.room.id, epId, gain <= 0.0001 ? 1.0 : 0.0)}
+                class="nodrag text-zinc-400 hover:text-purple-300 p-0.5 transition-colors shrink-0 cursor-pointer"
+                title={gain <= 0.0001 ? 'Unmute output in room' : 'Mute output in room'}
+                aria-label={gain <= 0.0001 ? 'Unmute output in room' : 'Mute output in room'}
+              >
+                {#if gain <= 0.0001}
+                  <VolumeX class="w-3 h-3 text-red-400" />
+                {:else}
+                  <Volume2 class="w-3 h-3 text-purple-400" />
+                {/if}
+              </button>
+              <button
+                type="button"
+                onclick={() => data.onRemoveOutput(epId)}
+                class="nodrag text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
+                title="Remove {dev.name} from room"
+                aria-label="Remove {dev.name} from room"
+              >
+                <X class="w-3 h-3" />
+              </button>
             </div>
-            <button
-              type="button"
-              onclick={() => data.onRemoveOutput((dev as any).endpoint_id || dev.id)}
-              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
-              title="Remove {dev.name} from room"
-              aria-label="Remove {dev.name} from room"
-            >
-              <X class="w-3 h-3" />
-            </button>
+            <div class="flex items-center gap-1.5">
+              <Sliders class="w-2.5 h-2.5 text-zinc-500 shrink-0" />
+              <input
+                type="range"
+                min="0"
+                max="2"
+                step="0.02"
+                value={gain}
+                oninput={(e) => roomStore.setRoomOutputGain(data.room.id, epId, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                onchange={(e) => roomStore.setRoomOutputGain(data.room.id, epId, parseFloat((e.currentTarget as HTMLInputElement).value))}
+                class="nodrag w-full h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-purple-400"
+                aria-label="Output gain for {dev.name}"
+              />
+            </div>
           </div>
         {/each}
         {#if data.outputDevices.length === 0}
@@ -309,10 +396,21 @@
   <div class="mt-3 flex items-center justify-between pt-2 border-t border-zinc-800/80 text-[10px] font-mono text-zinc-400 min-w-0 gap-2">
     <div class="flex items-center gap-1 min-w-0 flex-1">
       <Crown class="w-3 h-3 text-amber-400 shrink-0" />
-      <span class="truncate">Leader: <strong class="text-amber-300 font-bold">{data.room.leader || 'node-local'}</strong></span>
+      <span class="truncate">Leader: <strong class="text-amber-300 font-bold">{data.room.leader || 'local'}</strong></span>
     </div>
-    <div class="flex items-center gap-1.5 shrink-0">
+    <div class="flex items-center gap-2 shrink-0">
       <span>{data.room.members?.length || 1} peer node(s)</span>
+      {#if activeLinkCount > 0 && data.onInspectRoute}
+        <button
+          type="button"
+          onclick={() => data.onInspectRoute?.()}
+          class="nodrag inline-flex items-center gap-1 rounded bg-cyan-500/15 hover:bg-cyan-500/25 px-1.5 py-0.5 text-[9px] font-mono font-semibold text-cyan-300 border border-cyan-500/30 transition-colors cursor-pointer"
+          title="Inspect room route status and run acoustic latency calibration"
+        >
+          <Gauge class="w-2.5 h-2.5" />
+          <span>Inspect / Calibrate</span>
+        </button>
+      {/if}
     </div>
   </div>
 </div>

@@ -246,7 +246,7 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/telemetry/stream-stats", s.AuthMiddleware(s.handleTelemetryStreamStats))
 	mux.HandleFunc("/api/v1/telemetry/device-artifacts", s.AuthMiddleware(s.handleTelemetryDeviceArtifacts))
 	mux.HandleFunc("/api/v1/telemetry/meters", s.AuthMiddleware(s.handleTelemetryMetersSSE))
-	mux.HandleFunc("/api/v1/telemetry/ws", s.handleTelemetryWebSocket)
+	mux.HandleFunc("/api/v1/telemetry/ws", s.AuthMiddleware(s.handleTelemetryWebSocket))
 }
 
 // handleNetworkHealth handles GET /api/v1/network/health.

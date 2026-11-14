@@ -4,7 +4,6 @@
   import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import { peerStore } from '$lib/stores/peers.svelte';
   import type { ClusterNodeSummary, AudioDeviceSummary } from '$lib/api/types';
-  import NetworkSimulatorPanel from './NetworkSimulatorPanel.svelte';
   import RouteHealthPanel from './RouteHealthPanel.svelte';
 
   import Cpu from '@lucide/svelte/icons/cpu';
@@ -873,11 +872,6 @@
           </div>
         </div>
       {/if}
-
-      <!-- ==================================================================== -->
-      <!-- 5. NETWORK CONDITION SIMULATOR (QA)                                 -->
-      <!-- ==================================================================== -->
-      <NetworkSimulatorPanel />
 
     </div>
   </div>

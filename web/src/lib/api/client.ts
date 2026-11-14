@@ -316,6 +316,13 @@ export class ApiClient {
     });
   }
 
+  async setRoomInputGain(roomId: string, devId: string, gain: number): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/inputs/${encodeURIComponent(devId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ gain }),
+    });
+  }
+
   async addRoomOutput(roomId: string, devId: string, gain?: number, nodeId?: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs`, {
       method: 'POST',
@@ -326,6 +333,13 @@ export class ApiClient {
   async removeRoomOutput(roomId: string, devId: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs/${encodeURIComponent(devId)}`, {
       method: 'DELETE',
+    });
+  }
+
+  async setRoomOutputGain(roomId: string, devId: string, gain: number): Promise<RoomInfo> {
+    return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs/${encodeURIComponent(devId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ gain }),
     });
   }
 

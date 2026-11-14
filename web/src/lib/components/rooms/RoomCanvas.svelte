@@ -18,13 +18,15 @@
   import { meterStore } from '$lib/stores/meters.svelte';
   import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import { flowLayoutStore } from '$lib/stores/flowLayout.svelte';
-  import type { AudioDevice, AudioDeviceSummary } from '$lib/api/types';
+  import { matrixStore } from '$lib/stores/matrix.svelte';
+  import { linearToDb, formatDb, type AudioDevice, type AudioDeviceSummary } from '$lib/api/types';
   import DevicePalette from './flow/DevicePalette.svelte';
   import InputDeviceNode from './flow/InputDeviceNode.svelte';
   import RoomBusNode from './flow/RoomBusNode.svelte';
   import OutputDeviceNode from './flow/OutputDeviceNode.svelte';
   import CreateRoomModal from './flow/CreateRoomModal.svelte';
   import CreateVirtualModal from './flow/CreateVirtualModal.svelte';
+  import RouteInspector from '$lib/components/matrix/RouteInspector.svelte';
   import Plus from '@lucide/svelte/icons/plus';
   import Radio from '@lucide/svelte/icons/radio';
   import RefreshCw from '@lucide/svelte/icons/refresh-cw';
@@ -66,6 +68,7 @@
       roomStore.loadRooms(),
       deviceStore.loadDevices(),
       clusterStore.pollCluster(),
+      matrixStore.loadRoutes(),
     ]);
     meterStore.init();
 
@@ -234,7 +237,7 @@
         const d = allKnown.get(devId);
         nodeId = (d as any)?.node_id || '';
       }
-      roomStore.addRoomInput(roomId, devId, nodeId);
+      roomStore.addRoomInput(roomId, devId, nodeId).then(() => matrixStore.loadRoutes(true));
     } else if (connection.source.startsWith('room-') && connection.target.startsWith('output-')) {
       const roomId = connection.source.replace('room-', '');
       const rawOut = connection.target.replace('output-', '');
@@ -248,7 +251,7 @@
         const d = allKnown.get(devId);
         nodeId = (d as any)?.node_id || '';
       }
-      roomStore.addRoomOutput(roomId, devId, nodeId);
+      roomStore.addRoomOutput(roomId, devId, nodeId).then(() => matrixStore.loadRoutes(true));
     } else {
       invalidConnectionNotice =
         'Direct connection rejected: In Room-Centric Audio Flow, connect Input devices to a Room, and the Room to Output devices.';
@@ -319,6 +322,70 @@
     }
 
     flowLayoutStore.persistNow();
+    syncFlowGraph();
+    matrixStore.loadRoutes(true);
+  }
+
+  async function openRouteInspectorForRoom(roomId: string, devId?: string) {
+    if (matrixStore.routes.length === 0) {
+      await matrixStore.loadRoutes(true);
+    }
+    const cleanDevId = devId && devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+    const roomRoutes = matrixStore.routes.filter((r) => r.id.startsWith(`room-${roomId}-`) || r.id === `room-${roomId}`);
+    let matched = cleanDevId
+      ? roomRoutes.find(
+          (r) =>
+            r.source?.device_id === cleanDevId ||
+            r.destination?.device_id === cleanDevId ||
+            r.source?.device_id === devId ||
+            r.destination?.device_id === devId ||
+            r.id.includes(cleanDevId)
+        )
+      : undefined;
+    if (!matched) {
+      matched = roomRoutes[0];
+    }
+    matrixStore.openInspector(matched ? matched.id : `room-${roomId}`);
+  }
+
+  function handleEdgeClick(edge: Edge) {
+    if (edge.source.startsWith('input-') && edge.target.startsWith('room-')) {
+      const devKey = edge.source.replace('input-', '');
+      const roomId = edge.target.replace('room-', '');
+      openRouteInspectorForRoom(roomId, devKey);
+    } else if (edge.source.startsWith('room-') && edge.target.startsWith('output-')) {
+      const roomId = edge.source.replace('room-', '');
+      const devKey = edge.target.replace('output-', '');
+      openRouteInspectorForRoom(roomId, devKey);
+    }
+  }
+
+  async function handleDeleteVirtualDevice(deviceId: string) {
+    const cleanId = deviceId.includes('/') ? deviceId.slice(deviceId.indexOf('/') + 1) : deviceId;
+    await handleDismissDevice(deviceId);
+    try {
+      await deviceStore.deleteVirtual(cleanId);
+      await Promise.allSettled([clusterStore.pollCluster(), matrixStore.loadRoutes(true)]);
+    } catch (err) {
+      console.error(`[RoomCanvas] Failed to delete virtual device ${cleanId}:`, err);
+    }
+    syncFlowGraph();
+  }
+
+  async function handleDeviceMutation(dev: AudioDevice | AudioDeviceSummary, devNodeId: string, updates: { volume?: number; muted?: boolean }) {
+    const targetId = (dev as any).device_id || dev.id;
+    const localIdx = deviceStore.devices.findIndex((d) => d.id === dev.id || d.id === targetId);
+    if (localIdx !== -1) {
+      if (updates.volume !== undefined) deviceStore.devices[localIdx].volume = updates.volume;
+      if (updates.muted !== undefined) deviceStore.devices[localIdx].muted = updates.muted;
+    }
+    try {
+      await clusterStore.patchDevice(devNodeId || 'local', targetId, updates);
+    } catch {
+      if (localIdx !== -1) {
+        await deviceStore.updateVolume(dev.id, updates.volume ?? dev.volume ?? 1.0, updates.muted ?? dev.muted);
+      }
+    }
     syncFlowGraph();
   }
 
@@ -685,9 +752,13 @@
           device: dev,
           assignedRooms,
           allRooms: roomSummaries,
-          onAddToRoom: (roomId: string) => roomStore.addRoomInput(roomId, dev.id, devNodeId),
-          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomInput(roomId, canvasKey),
+          onAddToRoom: (roomId: string) => roomStore.addRoomInput(roomId, dev.id, devNodeId).then(() => matrixStore.loadRoutes(true)),
+          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomInput(roomId, canvasKey).then(() => matrixStore.loadRoutes(true)),
           onDismiss: () => handleDismissDevice(canvasKey, 'input'),
+          onVolumeChange: (vol: number) => handleDeviceMutation(dev, devNodeId, { volume: vol }),
+          onToggleMute: () => handleDeviceMutation(dev, devNodeId, { muted: !dev.muted }),
+          onDeleteVirtual: dev.is_virtual ? () => handleDeleteVirtualDevice(canvasKey) : undefined,
+          onInspectRoute: assignedRooms.length > 0 ? () => openRouteInspectorForRoom(assignedRooms[0].id, canvasKey) : undefined,
         },
       });
     });
@@ -743,9 +814,9 @@
               const d = allKnown.get(devId);
               devNodeId = (d as any)?.node_id || '';
             }
-            roomStore.addRoomInput(room.id, targetDev, devNodeId);
+            roomStore.addRoomInput(room.id, targetDev, devNodeId).then(() => matrixStore.loadRoutes(true));
           },
-          onRemoveInput: (endpointId: string) => roomStore.removeRoomInput(room.id, endpointId),
+          onRemoveInput: (endpointId: string) => roomStore.removeRoomInput(room.id, endpointId).then(() => matrixStore.loadRoutes(true)),
           onAddOutput: (devId: string) => {
             let devNodeId = '';
             let targetDev = devId;
@@ -756,15 +827,17 @@
               const d = allKnown.get(devId);
               devNodeId = (d as any)?.node_id || '';
             }
-            roomStore.addRoomOutput(room.id, targetDev, devNodeId);
+            roomStore.addRoomOutput(room.id, targetDev, devNodeId).then(() => matrixStore.loadRoutes(true));
           },
-          onRemoveOutput: (endpointId: string) => roomStore.removeRoomOutput(room.id, endpointId),
+          onRemoveOutput: (endpointId: string) => roomStore.removeRoomOutput(room.id, endpointId).then(() => matrixStore.loadRoutes(true)),
+          onInspectRoute: (endpointId?: string) => openRouteInspectorForRoom(room.id, endpointId),
           onDeleteRoom: async () => {
             if (confirm(`Delete audio room "${room.name}" (${room.id})?`)) {
               flowLayoutStore.deleteNodePosition(`room-${room.id}`);
               flowLayoutStore.persistNow();
               try {
                 await roomStore.deleteRoom(room.id);
+                await matrixStore.loadRoutes(true);
               } catch (err) {
                 console.error(`Failed to delete room ${room.id}:`, err);
               }
@@ -788,6 +861,8 @@
           if (matchDev) {
             const devNodeId = (matchDev as any).node_id || clusterStore.localNode?.node_id || '';
             const canvasKey = devNodeId && !matchDev.id.includes('/') ? `${devNodeId}/${matchDev.id}` : matchDev.id;
+            const inGain = room.input_gains?.[inputDevId] ?? room.input_gains?.[canvasKey] ?? room.input_gains?.[matchDev.id] ?? 1.0;
+            const inLabel = Math.abs(inGain - 1.0) > 0.005 ? (inGain <= 0.0001 ? 'MUTE' : formatDb(linearToDb(inGain))) : undefined;
             nextEdges.push({
               id: `edge-in-${canvasKey}-to-${room.id}`,
               source: `input-${canvasKey}`,
@@ -795,6 +870,7 @@
               sourceHandle: 'out',
               targetHandle: 'in',
               animated: true,
+              label: inLabel,
               style:
                 'stroke: #06b6d4; stroke-width: 2.5px; filter: drop-shadow(0 0 5px rgba(6, 182, 212, 0.7));',
             });
@@ -815,6 +891,8 @@
           if (matchDev) {
             const devNodeId = (matchDev as any).node_id || clusterStore.localNode?.node_id || '';
             const canvasKey = devNodeId && !matchDev.id.includes('/') ? `${devNodeId}/${matchDev.id}` : matchDev.id;
+            const outGain = room.output_gains?.[outputDevId] ?? room.output_gains?.[canvasKey] ?? room.output_gains?.[matchDev.id] ?? 1.0;
+            const outLabel = Math.abs(outGain - 1.0) > 0.005 ? (outGain <= 0.0001 ? 'MUTE' : formatDb(linearToDb(outGain))) : undefined;
             nextEdges.push({
               id: `edge-room-${room.id}-to-out-${canvasKey}`,
               source: `room-${room.id}`,
@@ -822,6 +900,7 @@
               sourceHandle: 'out',
               targetHandle: 'in',
               animated: true,
+              label: outLabel,
               style:
                 'stroke: #a855f7; stroke-width: 2.5px; filter: drop-shadow(0 0 5px rgba(168, 85, 247, 0.7));',
             });
@@ -853,9 +932,13 @@
           device: dev,
           sourceRooms,
           allRooms: roomSummaries,
-          onAddToRoom: (roomId: string) => roomStore.addRoomOutput(roomId, dev.id, devNodeId),
-          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomOutput(roomId, canvasKey),
+          onAddToRoom: (roomId: string) => roomStore.addRoomOutput(roomId, dev.id, devNodeId).then(() => matrixStore.loadRoutes(true)),
+          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomOutput(roomId, canvasKey).then(() => matrixStore.loadRoutes(true)),
           onDismiss: () => handleDismissDevice(canvasKey, 'output'),
+          onVolumeChange: (vol: number) => handleDeviceMutation(dev, devNodeId, { volume: vol }),
+          onToggleMute: () => handleDeviceMutation(dev, devNodeId, { muted: !dev.muted }),
+          onDeleteVirtual: dev.is_virtual ? () => handleDeleteVirtualDevice(canvasKey) : undefined,
+          onInspectRoute: sourceRooms.length > 0 ? () => openRouteInspectorForRoom(sourceRooms[0].id, canvasKey) : undefined,
         },
       });
     });
@@ -892,6 +975,8 @@
     <DevicePalette
       onAddDevice={handleAddDevice}
       onFocusDevice={handleFocusDevice}
+      onCreateVirtual={() => (isCreateVirtualOpen = true)}
+      onDeleteVirtual={handleDeleteVirtualDevice}
     />
   {/if}
 
@@ -945,6 +1030,7 @@
       }}
       onconnect={handleConnect}
       ondelete={handleDelete}
+      onedgeclick={({ edge }) => handleEdgeClick(edge)}
       {isValidConnection}
       class="bg-zinc-950"
     >
@@ -1040,19 +1126,6 @@
             <span class="hidden sm:inline">Auto-Arrange</span>
           </button>
 
-          <!-- Simulate Metering Toggle -->
-          <button
-            type="button"
-            onclick={() => meterStore.toggleSimulation()}
-            class="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-mono transition-colors cursor-pointer shrink-0 {meterStore.useSimulation
-              ? 'border-emerald-500/50 bg-emerald-950/30 text-emerald-300'
-              : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200'}"
-            title="Toggle audio signal simulation for live LED meters"
-          >
-            <Activity class="w-3.5 h-3.5 {meterStore.useSimulation ? 'text-emerald-400 animate-pulse' : 'text-zinc-500'}" />
-            <span class="hidden md:inline">{meterStore.useSimulation ? 'Sim ON' : 'Sim Meters'}</span>
-          </button>
-
           <!-- Refresh Button -->
           <button
             type="button"
@@ -1060,6 +1133,7 @@
               roomStore.loadRooms();
               deviceStore.loadDevices();
               clusterStore.pollCluster();
+              matrixStore.loadRoutes();
             }}
             class="inline-flex items-center justify-center h-8 w-8 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
             title="Reload devices and rooms"
@@ -1071,6 +1145,11 @@
       </Panel>
     </SvelteFlow>
   </div>
+
+  <!-- Route Inspector Drawer -->
+  {#if matrixStore.inspectorRouteId}
+    <RouteInspector routeId={matrixStore.inspectorRouteId} />
+  {/if}
 
   <!-- Modals -->
   <CreateRoomModal bind:isOpen={isCreateRoomOpen} />

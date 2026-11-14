@@ -1085,6 +1085,11 @@ func (r *Room) recompileRoutesLocked() {
 			log.Printf("[ROOM:ROUTE] ERROR adding matrix route %s: %v", routeID, err)
 		}
 		if _, alreadyCompiled := r.compiledRoutes[routeID]; alreadyCompiled {
+			if r.streamMgr != nil {
+				if updater, ok := r.streamMgr.(interface{ UpdateMatrix(router.MatrixRoute) error }); ok {
+					_ = updater.UpdateMatrix(mr)
+				}
+			}
 			continue
 		}
 		r.compiledRoutes[routeID] = struct{}{}

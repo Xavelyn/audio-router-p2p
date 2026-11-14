@@ -484,6 +484,16 @@ export class MockBackendServer {
           if (!room.inputs.includes(devId)) {
             room.inputs.push(devId);
           }
+          if (typeof body?.gain === 'number') {
+            room.input_gains = { ...(room.input_gains || {}), [devId]: body.gain };
+          }
+          return json(room);
+        }
+        if (method === 'PATCH' && parts[2]) {
+          const devId = parts.slice(2).join('/');
+          if (typeof body?.gain === 'number') {
+            room.input_gains = { ...(room.input_gains || {}), [devId]: body.gain };
+          }
           return json(room);
         }
         if (method === 'DELETE' && parts[2]) {
@@ -503,6 +513,16 @@ export class MockBackendServer {
           const devId = body.node_id ? `${body.node_id}/${body.device_id}` : body.device_id;
           if (!room.outputs.includes(devId)) {
             room.outputs.push(devId);
+          }
+          if (typeof body?.gain === 'number') {
+            room.output_gains = { ...(room.output_gains || {}), [devId]: body.gain };
+          }
+          return json(room);
+        }
+        if (method === 'PATCH' && parts[2]) {
+          const devId = parts.slice(2).join('/');
+          if (typeof body?.gain === 'number') {
+            room.output_gains = { ...(room.output_gains || {}), [devId]: body.gain };
           }
           return json(room);
         }

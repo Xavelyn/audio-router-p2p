@@ -4,25 +4,21 @@
   import { clusterStore } from '$lib/stores/cluster.svelte';
   import AuthModal from './AuthModal.svelte';
   import Radio from '@lucide/svelte/icons/radio';
-  import Activity from '@lucide/svelte/icons/activity';
-  import Speaker from '@lucide/svelte/icons/speaker';
   import Network from '@lucide/svelte/icons/network';
   import Cpu from '@lucide/svelte/icons/cpu';
   import Key from '@lucide/svelte/icons/key';
   import Clock from '@lucide/svelte/icons/clock';
   import Workflow from '@lucide/svelte/icons/workflow';
 
-  export type TabId = 'flow' | 'meters' | 'devices' | 'diagnostics';
+  export type TabId = 'flow' | 'diagnostics';
 
   let { activeTab = $bindable('flow' as TabId) } = $props<{ activeTab: TabId }>();
 
   let isAuthOpen = $state(false);
 
   const tabs: { id: TabId; label: string; icon: any }[] = [
-    { id: 'flow', label: 'Audio Flow', icon: Workflow },
-    { id: 'meters', label: 'Live Meters', icon: Activity },
-    { id: 'devices', label: 'Audio Devices', icon: Speaker },
-    { id: 'diagnostics', label: 'Cluster Diagnostics', icon: Cpu },
+    { id: 'flow', label: 'Audio Routing', icon: Workflow },
+    { id: 'diagnostics', label: 'Node & Cluster Health', icon: Cpu },
   ];
 
   function getStatusBadge(status: string) {
@@ -77,7 +73,9 @@
             P2P
           </span>
         </div>
-        <span class="text-[10px] font-mono text-zinc-400 tracking-tight hidden sm:block">CONTROL PLANE v{authStore.version}</span>
+        <span class="text-[10px] font-mono text-zinc-400 tracking-tight hidden sm:block">
+          {authStore.nodeName} &bull; v{authStore.version}
+        </span>
       </div>
     </div>
 
@@ -88,8 +86,8 @@
       title="Click to configure Daemon Gateway connection"
     >
       <span class="h-2 w-2 rounded-full shrink-0 {badge.color} {badge.glow}"></span>
-      <span class="font-mono text-xs text-zinc-300 group-hover:text-cyan-300 truncate max-w-[130px]">
-        {authStore.activeDaemonUrl.replace(/^https?:\/\//, '')}
+      <span class="font-mono text-xs text-zinc-300 group-hover:text-cyan-300 truncate max-w-[160px]">
+        {authStore.activeDaemonUrl.replace(/^https?:\/\//, '') || authStore.nodeName}
       </span>
       <span class="text-[10px] font-mono text-zinc-400 shrink-0">({badge.label})</span>
     </button>

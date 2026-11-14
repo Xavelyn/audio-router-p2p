@@ -27,9 +27,6 @@ type routeMatrix struct {
 
 func newRouteMatrix(device audio.AudioStream, route router.StreamRoute) (*routeMatrix, error) {
 	ch := route.Channels
-	if route.InChannels != 0 && route.InChannels != ch || route.OutChannels != 0 && route.OutChannels != ch {
-		return nil, fmt.Errorf("route %s: channel-count conversion is not supported by live PCM routes", route.ID)
-	}
 	weights := routeWeights(route)
 	mixer, err := router.NewSlewGainMatrixWithSampleRate(ch, ch, route.SampleRate, weights)
 	if err != nil {
@@ -50,36 +47,73 @@ func newRouteMatrix(device audio.AudioStream, route router.StreamRoute) (*routeM
 }
 
 func routeWeights(route router.StreamRoute) []float32 {
-	ch := route.Channels
+	return projectRouteWeights(route.Channels, route.InChannels, route.OutChannels, route.Coefficients, route.Muted)
+}
+
+func projectRouteWeights(ch, inCh, outCh int, coeffs []float64, muted bool) []float32 {
 	weights := make([]float32, ch*ch)
-	if route.Muted {
+	if muted {
 		return weights
 	}
-	if len(route.Coefficients) == len(weights) {
-		for i, v := range route.Coefficients {
+	if inCh <= 0 {
+		inCh = ch
+	}
+	if outCh <= 0 {
+		outCh = ch
+	}
+	if inCh == ch && outCh == ch && len(coeffs) == ch*ch {
+		for i, v := range coeffs {
 			weights[i] = float32(v)
 		}
-	} else {
-		for i := 0; i < ch; i++ {
-			weights[i*ch+i] = 1
+		return weights
+	}
+	if len(coeffs) == outCh*inCh {
+		if ch == 1 {
+			var g float64
+			if inCh == outCh {
+				for i := 0; i < inCh; i++ {
+					g += coeffs[i*inCh+i]
+				}
+				g /= float64(inCh)
+			} else {
+				for _, v := range coeffs {
+					g += v
+				}
+				g /= float64(len(coeffs))
+			}
+			if g < 0 {
+				g = 0
+			} else if g > 2 {
+				g = 2
+			}
+			weights[0] = float32(g)
+		} else {
+			for o := 0; o < ch; o++ {
+				srcOut := o % outCh
+				if inCh == 1 {
+					weights[o*ch+o] = float32(coeffs[srcOut])
+				} else {
+					for i := 0; i < ch; i++ {
+						if o < outCh && i < inCh {
+							weights[o*ch+i] = float32(coeffs[o*inCh+i])
+						}
+					}
+				}
+			}
 		}
+		return weights
+	}
+	for i := 0; i < ch; i++ {
+		weights[i*ch+i] = 1
 	}
 	return weights
 }
 
 func (m *routeMatrix) Update(route router.MatrixRoute) error {
-	if route.InChannels != m.channels || route.OutChannels != m.channels {
-		return fmt.Errorf("route %s: live channel-count changes require restarting the route", route.ID)
-	}
 	if err := route.Validate(); err != nil {
 		return err
 	}
-	weights := make([]float32, m.channels*m.channels)
-	if !route.Muted {
-		for i, v := range route.Coefficients {
-			weights[i] = float32(v)
-		}
-	}
+	weights := projectRouteWeights(m.channels, route.InChannels, route.OutChannels, route.Coefficients, route.Muted)
 	samples := int(math.Ceil(route.SlewMS * float64(m.mixer.SampleRate()) / 1000))
 	return m.mixer.SetTarget(weights, samples)
 }

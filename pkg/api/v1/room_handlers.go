@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"sort"
 	"strings"
@@ -443,7 +444,7 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 
 		switch category {
 		case "inputs":
-			if r.Method != http.MethodDelete {
+			if r.Method != http.MethodDelete && r.Method != http.MethodPatch && r.Method != http.MethodPut {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
@@ -466,6 +467,30 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 
+			if r.Method == http.MethodPatch || r.Method == http.MethodPut {
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+				var req RoomDeviceBindingRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
+					return
+				}
+				if req.Gain == nil || math.IsNaN(*req.Gain) || *req.Gain < 0.0 || *req.Gain > 2.0 {
+					s.WriteError(w, http.StatusBadRequest, "ERR_OUT_OF_BOUNDS", "gain must be in [0.0, 2.0]")
+					return
+				}
+				if gSetter, ok := s.roomMgr.(interface {
+					SetInputGain(string, string, float64) error
+				}); ok {
+					if err := gSetter.SetInputGain(roomID, targetDevID, *req.Gain); err != nil {
+						s.WriteError(w, http.StatusInternalServerError, "ERR_SET_GAIN", err.Error())
+						return
+					}
+				}
+				updated := s.findRoom(roomID)
+				s.WriteJSON(w, http.StatusOK, updated)
+				return
+			}
+
 			if err := s.roomMgr.RemoveInput(roomID, targetDevID); err != nil {
 				s.WriteError(w, http.StatusInternalServerError, "ERR_REMOVE_INPUT", err.Error())
 				return
@@ -474,7 +499,7 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 			s.WriteJSON(w, http.StatusOK, updated)
 
 		case "outputs":
-			if r.Method != http.MethodDelete {
+			if r.Method != http.MethodDelete && r.Method != http.MethodPatch && r.Method != http.MethodPut {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
@@ -495,6 +520,30 @@ func (s *V1Server) handleRoomsSubpath(w http.ResponseWriter, r *http.Request) {
 				if normDevID, err := s.normalizeEndpoint(devID, ""); err == nil && normDevID != "" {
 					targetDevID = normDevID
 				}
+			}
+
+			if r.Method == http.MethodPatch || r.Method == http.MethodPut {
+				r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+				var req RoomDeviceBindingRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					s.WriteError(w, http.StatusBadRequest, "ERR_INVALID_BODY", err.Error())
+					return
+				}
+				if req.Gain == nil || math.IsNaN(*req.Gain) || *req.Gain < 0.0 || *req.Gain > 2.0 {
+					s.WriteError(w, http.StatusBadRequest, "ERR_OUT_OF_BOUNDS", "gain must be in [0.0, 2.0]")
+					return
+				}
+				if gSetter, ok := s.roomMgr.(interface {
+					SetOutputGain(string, string, float64) error
+				}); ok {
+					if err := gSetter.SetOutputGain(roomID, targetDevID, *req.Gain); err != nil {
+						s.WriteError(w, http.StatusInternalServerError, "ERR_SET_GAIN", err.Error())
+						return
+					}
+				}
+				updated := s.findRoom(roomID)
+				s.WriteJSON(w, http.StatusOK, updated)
+				return
 			}
 
 			if err := s.roomMgr.RemoveOutput(roomID, targetDevID); err != nil {

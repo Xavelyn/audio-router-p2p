@@ -559,7 +559,7 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 		}
 		log.Printf("[STREAM:MGR] Stopping pre-existing stream for route=%s", sr.ID)
 		delete(m.routes, sr.ID)
-		m.stopActiveStream(old)
+		m.stopLocked(old)
 	}
 
 	tokenHash := sha256.Sum256([]byte(m.cfg.AuthToken))
@@ -742,7 +742,7 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 		}
 		outputKey = key
 		bus := m.outputs[key]
-		if bus != nil && (bus.rate != srcRate || bus.ch != srcChans || bus.period != time.Duration(streamCfg.PacketTime)*time.Millisecond) {
+		if bus != nil && (bus.rate != srcRate || bus.ch != srcChans) {
 			if in != nil {
 				_ = in.Close()
 			}
@@ -757,29 +757,26 @@ func (m *streamManager) startLocked(route router.StreamRoute) error {
 		out = bus.add(sr.ID)
 	}
 	var matrix *routeMatrix
-	sameChans := (sr.InChannels == 0 || sr.InChannels == srcChans) && (sr.OutChannels == 0 || sr.OutChannels == srcChans)
-	if sameChans {
-		if sr.Direction == "receive" {
-			matrix, err = newRouteMatrix(out, sr)
-			if err == nil {
-				out = matrix
-			}
-		} else {
-			matrix, err = newRouteMatrix(in, sr)
-			if err == nil {
-				in = matrix
-			}
+	if sr.Direction == "receive" {
+		matrix, err = newRouteMatrix(out, sr)
+		if err == nil {
+			out = matrix
 		}
-		if err != nil {
-			if in != nil {
-				_ = in.Close()
-			}
-			if out != nil {
-				_ = out.Close()
-				m.removeEmptyOutputLocked(outputKey)
-			}
-			return err
+	} else {
+		matrix, err = newRouteMatrix(in, sr)
+		if err == nil {
+			in = matrix
 		}
+	}
+	if err != nil {
+		if in != nil {
+			_ = in.Close()
+		}
+		if out != nil {
+			_ = out.Close()
+			m.removeEmptyOutputLocked(outputKey)
+		}
+		return err
 	}
 	// Calibration plumbing: the probe injector wraps the input after the gain
 	// matrix (the probe rides on at full amplitude, bypassing gain and mute),
@@ -1144,10 +1141,14 @@ func (m *streamManager) StreamLinkStats() []telemetry.StreamLinkStats {
 }
 
 func (m *streamManager) stopLocked(as *activeStream) {
-	m.stopActiveStream(as)
+	m.stopActiveStreamInternal(as, true)
 }
 
 func (m *streamManager) stopActiveStream(as *activeStream) {
+	m.stopActiveStreamInternal(as, false)
+}
+
+func (m *streamManager) stopActiveStreamInternal(as *activeStream, callerHoldsLock bool) {
 	if as == nil {
 		return
 	}
@@ -1178,9 +1179,13 @@ func (m *streamManager) stopActiveStream(as *activeStream) {
 	}
 	if out != nil {
 		_ = out.Close()
-		m.mu.Lock()
-		m.removeEmptyOutputLocked(outputKey)
-		m.mu.Unlock()
+		if callerHoldsLock {
+			m.removeEmptyOutputLocked(outputKey)
+		} else {
+			m.mu.Lock()
+			m.removeEmptyOutputLocked(outputKey)
+			m.mu.Unlock()
+		}
 	}
 
 	if st != nil {

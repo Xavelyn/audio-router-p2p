@@ -21,6 +21,8 @@ class RoomStore {
         ...r,
         inputs: r.inputs || [],
         outputs: r.outputs || [],
+        input_gains: r.input_gains || {},
+        output_gains: r.output_gains || {},
         synced: r.synced ?? false,
       }));
       if (JSON.stringify(normalized) !== JSON.stringify(this.rooms)) {
@@ -49,6 +51,8 @@ class RoomStore {
         ...created,
         inputs: created.inputs || [],
         outputs: created.outputs || [],
+        input_gains: created.input_gains || {},
+        output_gains: created.output_gains || {},
         synced: created.synced ?? false,
       };
       this.rooms = [...this.rooms, normalized];
@@ -66,11 +70,19 @@ class RoomStore {
   async deleteRoom(roomId: string) {
     this.isLoading = true;
     this.lastError = null;
+    const prevRooms = this.rooms.map((r) => ({
+      ...r,
+      inputs: [...(r.inputs || [])],
+      outputs: [...(r.outputs || [])],
+      input_gains: { ...(r.input_gains || {}) },
+      output_gains: { ...(r.output_gains || {}) },
+    }));
     // Optimistic local removal
     this.rooms = this.rooms.filter((r) => r.id !== roomId);
     try {
       await apiClient.deleteRoom(roomId);
     } catch (err: any) {
+      this.rooms = prevRooms;
       const msg = err.message || 'Failed to delete room';
       this.lastError = msg;
       this.error = msg;
@@ -92,6 +104,8 @@ class RoomStore {
           ...updated,
           inputs: updated.inputs || [],
           outputs: updated.outputs || [],
+          input_gains: updated.input_gains || this.rooms[idx].input_gains || {},
+          output_gains: updated.output_gains || this.rooms[idx].output_gains || {},
           synced: updated.synced ?? false,
         };
       }
@@ -117,6 +131,8 @@ class RoomStore {
                 ...updated,
                 inputs: updated.inputs || [],
                 outputs: updated.outputs || [],
+                input_gains: updated.input_gains || r.input_gains || {},
+                output_gains: updated.output_gains || r.output_gains || {},
                 synced: updated.synced ?? r.synced,
               }
             : r
@@ -131,6 +147,13 @@ class RoomStore {
 
   async removeRoomInput(roomId: string, devId: string) {
     this.lastError = null;
+    const prevRooms = this.rooms.map((r) => ({
+      ...r,
+      inputs: [...(r.inputs || [])],
+      outputs: [...(r.outputs || [])],
+      input_gains: { ...(r.input_gains || {}) },
+      output_gains: { ...(r.output_gains || {}) },
+    }));
     const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
     // Optimistic local unbinding (ADR 0028 strict canonical isolation)
     const idx = this.rooms.findIndex((r) => r.id === roomId);
@@ -162,12 +185,15 @@ class RoomStore {
                 ...updated,
                 inputs: updated.inputs || [],
                 outputs: updated.outputs || [],
+                input_gains: updated.input_gains || r.input_gains || {},
+                output_gains: updated.output_gains || r.output_gains || {},
                 synced: updated.synced ?? r.synced,
               }
             : r
         );
       }
     } catch (err: any) {
+      this.rooms = prevRooms;
       const msg = err.message || `Failed to remove input ${devId} from room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
@@ -187,6 +213,8 @@ class RoomStore {
                 ...updated,
                 inputs: updated.inputs || [],
                 outputs: updated.outputs || [],
+                input_gains: updated.input_gains || r.input_gains || {},
+                output_gains: updated.output_gains || r.output_gains || {},
                 synced: updated.synced ?? r.synced,
               }
             : r
@@ -201,6 +229,13 @@ class RoomStore {
 
   async removeRoomOutput(roomId: string, devId: string) {
     this.lastError = null;
+    const prevRooms = this.rooms.map((r) => ({
+      ...r,
+      inputs: [...(r.inputs || [])],
+      outputs: [...(r.outputs || [])],
+      input_gains: { ...(r.input_gains || {}) },
+      output_gains: { ...(r.output_gains || {}) },
+    }));
     const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
     // Optimistic local unbinding (ADR 0028 strict canonical isolation)
     const idx = this.rooms.findIndex((r) => r.id === roomId);
@@ -232,13 +267,108 @@ class RoomStore {
                 ...updated,
                 inputs: updated.inputs || [],
                 outputs: updated.outputs || [],
+                input_gains: updated.input_gains || r.input_gains || {},
+                output_gains: updated.output_gains || r.output_gains || {},
                 synced: updated.synced ?? r.synced,
               }
             : r
         );
       }
     } catch (err: any) {
+      this.rooms = prevRooms;
       const msg = err.message || `Failed to remove output ${devId} from room ${roomId}`;
+      this.lastError = msg;
+      this.error = msg;
+    }
+  }
+
+  async setRoomInputGain(roomId: string, devId: string, gain: number) {
+    this.lastError = null;
+    const prevRooms = this.rooms.map((r) => ({
+      ...r,
+      inputs: [...(r.inputs || [])],
+      outputs: [...(r.outputs || [])],
+      input_gains: { ...(r.input_gains || {}) },
+      output_gains: { ...(r.output_gains || {}) },
+    }));
+    const idx = this.rooms.findIndex((r) => r.id === roomId);
+    if (idx !== -1) {
+      this.rooms = this.rooms.map((r, i) =>
+        i === idx
+          ? {
+              ...r,
+              input_gains: { ...(r.input_gains || {}), [devId]: gain },
+            }
+          : r
+      );
+    }
+    try {
+      const updated = await apiClient.setRoomInputGain(roomId, devId, gain);
+      const updatedIdx = this.rooms.findIndex((r) => r.id === roomId);
+      if (updatedIdx !== -1) {
+        this.rooms = this.rooms.map((r, i) =>
+          i === updatedIdx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || r.inputs || [],
+                outputs: updated.outputs || r.outputs || [],
+                input_gains: updated.input_gains || { ...(r.input_gains || {}), [devId]: gain },
+                output_gains: updated.output_gains || r.output_gains || {},
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
+      }
+    } catch (err: any) {
+      this.rooms = prevRooms;
+      const msg = err.message || `Failed to set input gain for ${devId} in room ${roomId}`;
+      this.lastError = msg;
+      this.error = msg;
+    }
+  }
+
+  async setRoomOutputGain(roomId: string, devId: string, gain: number) {
+    this.lastError = null;
+    const prevRooms = this.rooms.map((r) => ({
+      ...r,
+      inputs: [...(r.inputs || [])],
+      outputs: [...(r.outputs || [])],
+      input_gains: { ...(r.input_gains || {}) },
+      output_gains: { ...(r.output_gains || {}) },
+    }));
+    const idx = this.rooms.findIndex((r) => r.id === roomId);
+    if (idx !== -1) {
+      this.rooms = this.rooms.map((r, i) =>
+        i === idx
+          ? {
+              ...r,
+              output_gains: { ...(r.output_gains || {}), [devId]: gain },
+            }
+          : r
+      );
+    }
+    try {
+      const updated = await apiClient.setRoomOutputGain(roomId, devId, gain);
+      const updatedIdx = this.rooms.findIndex((r) => r.id === roomId);
+      if (updatedIdx !== -1) {
+        this.rooms = this.rooms.map((r, i) =>
+          i === updatedIdx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || r.inputs || [],
+                outputs: updated.outputs || r.outputs || [],
+                input_gains: updated.input_gains || r.input_gains || {},
+                output_gains: updated.output_gains || { ...(r.output_gains || {}), [devId]: gain },
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
+      }
+    } catch (err: any) {
+      this.rooms = prevRooms;
+      const msg = err.message || `Failed to set output gain for ${devId} in room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
     }
@@ -255,6 +385,8 @@ class RoomStore {
           ...updated,
           inputs: updated.inputs || [],
           outputs: updated.outputs || [],
+          input_gains: updated.input_gains || this.rooms[idx].input_gains || {},
+          output_gains: updated.output_gains || this.rooms[idx].output_gains || {},
           synced: updated.synced,
         };
       }
@@ -278,6 +410,8 @@ class RoomStore {
           ...updated,
           inputs: updated.inputs || this.rooms[idx].inputs || [],
           outputs: updated.outputs || this.rooms[idx].outputs || [],
+          input_gains: updated.input_gains || this.rooms[idx].input_gains || {},
+          output_gains: updated.output_gains || this.rooms[idx].output_gains || {},
           synced: updated.synced ?? this.rooms[idx].synced,
         };
       }

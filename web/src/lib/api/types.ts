@@ -20,6 +20,8 @@ export interface SystemStatus {
   active_routes: number;
   discovered_peers: number;
   clock_sync_locked?: boolean;
+  node_id?: string;
+  node_name?: string;
 }
 
 export interface PeerNode {

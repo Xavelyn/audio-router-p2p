@@ -20,6 +20,8 @@ type ErrorResponse struct {
 type SystemStatus struct {
 	Status          string  `json:"status"` // ok, degraded, error
 	Version         string  `json:"version"`
+	NodeID          string  `json:"node_id,omitempty"`
+	NodeName        string  `json:"node_name,omitempty"`
 	UptimeSeconds   float64 `json:"uptime_seconds"`
 	ActiveRoutes    int     `json:"active_routes"`
 	DiscoveredPeers int     `json:"discovered_peers"`

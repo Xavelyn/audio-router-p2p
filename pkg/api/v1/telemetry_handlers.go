@@ -306,8 +306,14 @@ func (s *V1Server) processWSCommand(ws *websocket.Conn, cmd WSControlMessage) {
 		if slew <= 0 {
 			slew = 20.0
 		}
+		old, _ := s.router.GetMatrix(cmd.RouteID)
 		mr, err := s.router.UpdateCrosspoint(cmd.RouteID, outCh, inCh, gain, slew)
 		if err != nil {
+			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.updateLiveMatrix(mr); err != nil {
+			s.restoreMatrix(old)
 			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
 			return
 		}
@@ -319,8 +325,14 @@ func (s *V1Server) processWSCommand(ws *websocket.Conn, cmd WSControlMessage) {
 		if slew > 0 {
 			slewPtr = &slew
 		}
+		old, _ := s.router.GetMatrix(cmd.RouteID)
 		mr, err := s.router.PatchMatrix(cmd.RouteID, nil, cmd.Coefficients, slewPtr, cmd.Muted)
 		if err != nil {
+			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.updateLiveMatrix(mr); err != nil {
+			s.restoreMatrix(old)
 			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
 			return
 		}
@@ -331,8 +343,14 @@ func (s *V1Server) processWSCommand(ws *websocket.Conn, cmd WSControlMessage) {
 			_ = websocket.JSON.Send(ws, map[string]string{"error": "missing muted value"})
 			return
 		}
+		old, _ := s.router.GetMatrix(cmd.RouteID)
 		mr, err := s.router.PatchMatrix(cmd.RouteID, nil, nil, nil, cmd.Muted)
 		if err != nil {
+			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := s.updateLiveMatrix(mr); err != nil {
+			s.restoreMatrix(old)
 			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
 			return
 		}

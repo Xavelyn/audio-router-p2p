@@ -73,7 +73,8 @@ func (b *outputBus) run() {
 				continue
 			}
 			active = true
-			for i := range acc {
+			n := min(len(acc), len(slot.pending)/2)
+			for i := 0; i < n; i++ {
 				acc[i] += int32(int16(binary.LittleEndian.Uint16(slot.pending[2*i:])))
 			}
 			slot.ready = false
@@ -106,6 +107,9 @@ func (s *busSlot) Write(p []byte) (int, error) {
 	}
 	if len(p)%(b.ch*2) != 0 {
 		return 0, fmt.Errorf("output bus: unaligned PCM block of %d bytes", len(p))
+	}
+	if len(s.pending) < len(p) {
+		s.pending = make([]byte, len(p))
 	}
 	clear(s.pending)
 	copy(s.pending, p) // ASRC may differ by a frame; silence-pad or trim to the bus clock.

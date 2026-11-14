@@ -17,6 +17,9 @@
   import Plus from '@lucide/svelte/icons/plus';
   import X from '@lucide/svelte/icons/x';
   import Layers from '@lucide/svelte/icons/layers';
+  import Volume2 from '@lucide/svelte/icons/volume-2';
+  import VolumeX from '@lucide/svelte/icons/volume-x';
+  import Trash2 from '@lucide/svelte/icons/trash-2';
 
   interface RoomSummary {
     id: string;
@@ -30,6 +33,10 @@
     onAddToRoom: (roomId: string) => void;
     onRemoveFromRoom: (roomId: string) => void;
     onDismiss?: () => void;
+    onVolumeChange?: (vol: number) => void;
+    onToggleMute?: () => void;
+    onDeleteVirtual?: () => void;
+    onInspectRoute?: () => void;
   }
 
   let { id, data, selected = false }: { id: string; data: InputNodeData; selected?: boolean } = $props();
@@ -243,7 +250,8 @@
   </div>
 
   <!-- Hardware Details Bar -->
-  <div class="mt-2.5 flex items-center justify-between text-[10px] font-mono text-zinc-400 bg-zinc-950/60 rounded-md px-2 py-1 border border-zinc-800/80">
+  <div class="mt-2.5 flex items-center justify-between text-[10px] font-mono text-zinc-400 bg-zinc-950/60 rounded-md px-2 py-1 border border-zinc-800/80 gap-1">
+    <span class="text-cyan-300/90 truncate max-w-[90px]" title={(data.device as any).node_id || 'local'}>{(data.device as any).node_id || 'local'}</span>
     <span class="text-zinc-300 font-semibold">{data.device.max_input} In Ch</span>
     <span>{data.device.default_sample_rate / 1000} kHz</span>
     <span class="text-zinc-500">24-bit</span>
@@ -257,7 +265,7 @@
         {#if data.assignedRooms.length === 0}
           unrouted (-inf)
         {:else if leftMeter.peakDb > -60}
-          {leftMeter.peakDb.toFixed(1)} dB
+          RMS {leftMeter.rmsDb > -60 ? leftMeter.rmsDb.toFixed(1) : '-inf'} / Pk {leftMeter.peakDb.toFixed(1)} dB
         {:else}
           -inf dB
         {/if}
@@ -292,6 +300,48 @@
         {/if}
       </div>
     </div>
+  </div>
+
+  <!-- Device Gain & Mute Control Bar -->
+  <div class="mt-2 flex items-center justify-between gap-2 rounded-md bg-zinc-950/60 px-2 py-1.5 border border-zinc-800/80 text-[10px] font-mono">
+    <button
+      type="button"
+      onclick={() => data.onToggleMute?.()}
+      class="nodrag rounded p-1 border transition-colors cursor-pointer shrink-0 {data.device.muted
+        ? 'bg-red-950/60 text-red-400 border-red-500/40'
+        : 'bg-zinc-900 text-cyan-400 border-zinc-700 hover:border-cyan-500/50'}"
+      title={data.device.muted ? 'Unmute device' : 'Mute device'}
+      aria-label={data.device.muted ? 'Unmute device' : 'Mute device'}
+    >
+      {#if data.device.muted}
+        <VolumeX class="w-3 h-3" />
+      {:else}
+        <Volume2 class="w-3 h-3" />
+      {/if}
+    </button>
+    <input
+      type="range"
+      min="0"
+      max="1.5"
+      step="0.05"
+      value={data.device.volume ?? 1.0}
+      oninput={(e) => data.onVolumeChange?.(parseFloat((e.currentTarget as HTMLInputElement).value))}
+      onchange={(e) => data.onVolumeChange?.(parseFloat((e.currentTarget as HTMLInputElement).value))}
+      class="nodrag flex-1 h-1 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+      aria-label="Device gain for {data.device.name}"
+    />
+    <span class="w-9 text-right text-zinc-300 shrink-0">{Math.round((data.device.volume ?? 1.0) * 100)}%</span>
+    {#if data.device.is_virtual && data.onDeleteVirtual}
+      <button
+        type="button"
+        onclick={() => data.onDeleteVirtual?.()}
+        class="nodrag rounded p-1 text-zinc-500 hover:text-red-400 hover:bg-red-950/30 transition-colors cursor-pointer shrink-0"
+        title="Delete virtual device"
+        aria-label="Delete virtual device"
+      >
+        <Trash2 class="w-3 h-3" />
+      </button>
+    {/if}
   </div>
 
   <!-- Assigned Rooms (Target Rooms) -->
