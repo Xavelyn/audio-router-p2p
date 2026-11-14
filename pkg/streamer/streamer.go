@@ -82,6 +82,8 @@ type RemotePeer struct {
 	FECDecoder     *transport.FECDecoder
 	ASRC           *dsp.ASRCResampler
 	asrcOutBuf     []byte
+	normSpill      []byte
+	normSeq        uint32
 	lastPacket     time.Time // guarded by Streamer.peersMu for dynamically learned peers
 
 	// Telemetry atomic accumulators for lock-free interrogation
@@ -103,6 +105,24 @@ type RemotePeer struct {
 	// must stay atomic.
 	lastSendNano atomic.Int64           // unix nano of last successful send
 	lastSendErr  atomic.Pointer[string] // most recent send failure, cleared on success
+
+	// ADR 0021 Observability & Telemetry Primitives
+	firstSendOnce         sync.Once
+	totalUnderruns        atomic.Uint64
+	consecutiveUnderruns  atomic.Uint64
+	lastUnderrunLogNano   atomic.Int64
+	playoutFrames         atomic.Uint64
+	lastWriteErrorLogNano atomic.Int64
+}
+
+// TotalUnderruns returns cumulative jitter buffer underruns for this peer.
+func (p *RemotePeer) TotalUnderruns() uint64 {
+	return p.totalUnderruns.Load()
+}
+
+// ConsecutiveUnderruns returns the current streak of jitter buffer underruns.
+func (p *RemotePeer) ConsecutiveUnderruns() uint64 {
+	return p.consecutiveUnderruns.Load()
 }
 
 // FECConfig configures RFC 5109 1-D XOR Parity Matrix Forward Error Correction.
@@ -149,6 +169,8 @@ type Streamer struct {
 	streamID    [16]byte
 	localNodeID string
 
+	localOutputWarnCount uint64
+
 	mu       sync.Mutex
 	started  bool
 	output   audio.AudioStream
@@ -188,6 +210,35 @@ type Streamer struct {
 	// unregister removes this streamer's handler from the (possibly shared)
 	// transport. Set in Start, called in Stop.
 	unregister func()
+
+	// ADR 0021 Observability & Telemetry Primitives
+	firstRecvOnce            sync.Once
+	demuxDropsUnmarshal      atomic.Uint64
+	demuxDropsStreamID       atomic.Uint64
+	demuxDropsNilOutput      atomic.Uint64
+	lastUnmarshalDropLogNano atomic.Int64
+	lastStreamIDDropLogNano  atomic.Int64
+	lastNilOutputDropLogNano atomic.Int64
+}
+
+// AtomicShouldLogRateLimited forwards to transport.ShouldLogRateLimited for backward compatibility.
+func AtomicShouldLogRateLimited(lastLogNano *atomic.Int64, intervalNs int64) bool {
+	return transport.ShouldLogRateLimited(lastLogNano, intervalNs)
+}
+
+// DemuxDropsStreamID returns cumulative drops due to StreamID mismatch.
+func (s *Streamer) DemuxDropsStreamID() uint64 {
+	return s.demuxDropsStreamID.Load()
+}
+
+// DemuxDropsNilOutput returns cumulative drops due to unassigned local output sink.
+func (s *Streamer) DemuxDropsNilOutput() uint64 {
+	return s.demuxDropsNilOutput.Load()
+}
+
+// DemuxDropsUnmarshal returns cumulative drops due to corrupt or unmarshalable datagrams.
+func (s *Streamer) DemuxDropsUnmarshal() uint64 {
+	return s.demuxDropsUnmarshal.Load()
 }
 
 // DeriveStreamID deterministically computes a 16-byte stream identifier using
@@ -401,6 +452,9 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 	packetBytes := s.packetBytes()
 	packetBuf := make([]byte, packetBytes)
 	offset := 0
+	var frameCount uint64
+	lastDTXState := dsp.DTXStateActive
+	streamIDShort := hex.EncodeToString(s.streamID[:4])
 
 	for {
 		select {
@@ -410,10 +464,12 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		}
 		n, err := input.Read(packetBuf[offset:])
 		if err == io.EOF {
+			log.Printf("[AUDIO:DEV] input.Read returned EOF for stream %s; sendLoop terminating", streamIDShort)
 			s.stopOnce.Do(func() { close(s.stopCh) })
 			return
 		}
 		if err != nil {
+			log.Printf("[AUDIO:DEV] ERROR: input.Read error on stream %s: %v; sendLoop terminating", streamIDShort, err)
 			s.errCh <- err
 			s.stopOnce.Do(func() { close(s.stopCh) })
 			return
@@ -433,16 +489,72 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		}
 
 		offset = 0
+		frameCount++
 
 		// Step DTX finite state machine and analyze signal energy
-		shouldSend, isSID, _ := s.dtx.ProcessFrame(packetBuf[:packetBytes], s.config.Channels)
+		shouldSend, isSID, metrics := s.dtx.ProcessFrame(packetBuf[:packetBytes], s.config.Channels)
+		currentState := s.dtx.State()
+
+		// Throttled Level Diagnostics: 1 Hz heartbeat (~50 frames @ 20ms) and on DTX transitions
+		clipped := metrics.Peak >= 32767 || metrics.Peak <= -32768
+		if frameCount%50 == 0 {
+			log.Printf("[AUDIO:LEVEL] stream=%s frame=%d RMS=%.2f dBFS Peak=%.2f dBFS DTX=%s clipped=%t",
+				streamIDShort, frameCount, metrics.RMSdBFS, metrics.PeakdBFS, currentState.String(), clipped)
+			s.peersMu.RLock()
+			for _, peer := range s.peers {
+				log.Printf("[UDP:SEND] stream=%s dest=%s pkts_sent=%d bytes_sent=%d",
+					hex.EncodeToString(s.streamID[:]), peer.Addr, peer.packetsSent.Load(), peer.bytesSent.Load())
+			}
+			s.peersMu.RUnlock()
+		}
+		if currentState != lastDTXState {
+			log.Printf("[AUDIO:LEVEL] stream=%s DTX transition %s -> %s (RMS=%.2f dBFS, Peak=%.2f dBFS)",
+				streamIDShort, lastDTXState.String(), currentState.String(), metrics.RMSdBFS, metrics.PeakdBFS)
+			lastDTXState = currentState
+		}
 
 		s.audioTapMu.RLock()
 		tap := s.audioTap
 		s.audioTapMu.RUnlock()
 		if tap != nil {
 			tap.RecordBlock(packetBuf[:packetBytes], s.config.Channels)
-			tap.SetDTXState(s.dtx.State().String())
+			tap.SetDTXState(currentState.String())
+		}
+
+		// Always play live audio to local outputs (avoid robotic DTX silence gating on local routes)
+		s.peersMu.RLock()
+		localWritten := false
+		hasPeers := len(s.peers) > 0
+		for _, peer := range s.peers {
+			if s.isLocalDest(peer.Addr) && peer.Output != nil {
+				if !localWritten {
+					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
+						if !strings.Contains(err.Error(), "underflow") {
+							log.Printf("[AUDIO:IO] streamer local write error on route: %v", err)
+							s.noteSendError(peer, err)
+						}
+					} else {
+						s.noteSendSuccess(peer)
+						peer.packetsSent.Add(1)
+						peer.bytesSent.Add(uint64(packetBytes))
+					}
+					localWritten = true
+				}
+			} else if s.isLocalDest(peer.Addr) && peer.Output == nil {
+				warnCount := atomic.AddUint64(&s.localOutputWarnCount, 1)
+				if warnCount <= 3 || warnCount%100 == 0 {
+					log.Printf("[STREAM:MGR] WARN: peer %s is local but peer.Output is nil and transport is nil; dropping audio block (dropCount=%d)", peer.Addr, warnCount)
+				}
+			}
+		}
+		s.peersMu.RUnlock()
+
+		if !localWritten && s.output != nil && !hasPeers {
+			if _, err := s.output.Write(packetBuf[:packetBytes]); err != nil {
+				if !strings.Contains(err.Error(), "underflow") {
+					log.Printf("[AUDIO:IO] streamer direct local write error on route: %v", err)
+				}
+			}
 		}
 
 		if !shouldSend {
@@ -451,8 +563,12 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 		}
 
 		var flags uint8 = transport.FlagActive
+		var payloadToSend []byte
 		if isSID {
 			flags = transport.FlagSID
+			payloadToSend = nil
+		} else {
+			payloadToSend = packetBuf[:packetBytes]
 		}
 
 		s.mu.Lock()
@@ -468,24 +584,11 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 			Flags:      flags,
 			StreamID:   sid,
 		}
-		pkt := transport.Marshal(hdr, packetBuf[:packetBytes])
+		pkt := transport.Marshal(hdr, payloadToSend)
 
 		s.peersMu.RLock()
 		for _, peer := range s.peers {
-			if s.isLocalDest(peer.Addr) {
-				if peer.Output != nil {
-					if _, err := peer.Output.Write(packetBuf[:packetBytes]); err != nil {
-						if !strings.Contains(err.Error(), "underflow") {
-							log.Printf("streamer: local write error: %v", err)
-							s.noteSendError(peer, err)
-						}
-					} else {
-						s.noteSendSuccess(peer)
-						peer.packetsSent.Add(1)
-						peer.bytesSent.Add(uint64(packetBytes))
-					}
-				}
-			} else if s.transport != nil {
+			if (!s.isLocalDest(peer.Addr) || peer.Output == nil) && s.transport != nil {
 				if err := s.transport.Send(peer.Addr, pkt); err != nil && !errors.Is(err, net.ErrClosed) {
 					log.Printf("streamer: send to %s: %v", peer.Addr, err)
 					s.noteSendError(peer, err)
@@ -493,6 +596,10 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 					s.noteSendSuccess(peer)
 					peer.packetsSent.Add(1)
 					peer.bytesSent.Add(uint64(len(pkt)))
+					peer.firstSendOnce.Do(func() {
+						log.Printf("[UDP:SEND] first packet transmitted stream=%s to=%s seq=%d",
+							hex.EncodeToString(sid[:]), peer.Addr, seq)
+					})
 				}
 			}
 		}
@@ -516,7 +623,7 @@ func (s *Streamer) sendLoop(input audio.AudioStream, stopCh chan struct{}) {
 				parityPkt := transport.Marshal(parityHdr, parityPayload)
 				s.peersMu.RLock()
 				for _, peer := range s.peers {
-					if !s.isLocalDest(peer.Addr) && s.transport != nil {
+					if (!s.isLocalDest(peer.Addr) || peer.Output == nil) && s.transport != nil {
 						if err := s.transport.Send(peer.Addr, parityPkt); err != nil && !errors.Is(err, net.ErrClosed) {
 							log.Printf("streamer: send parity to %s: %v", peer.Addr, err)
 							s.noteSendError(peer, err)
@@ -590,33 +697,70 @@ func (s *Streamer) playout() {
 	defer s.peersMu.RUnlock()
 
 	var first []byte
+	var firstPeer *RemotePeer
+	outSink := s.output
 	contributors := 0
 	for _, peer := range s.peers {
-		if peer.JitterBuf == nil || peer.Output == nil {
+		if peer.JitterBuf == nil || (peer.Output == nil && outSink == nil) {
 			continue
 		}
+		if outSink == nil && peer.Output != nil {
+			outSink = peer.Output
+		}
+		if firstPeer == nil {
+			firstPeer = peer
+		}
+
+		ratio := 1.0
+		if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
+			ratio = jb.driftCtrl.Ratio()
+		}
+
 		data, _, err := peer.JitterBuf.PopNonBlock()
 		if err != nil {
+			peer.totalUnderruns.Add(1)
+			consec := peer.consecutiveUnderruns.Add(1)
+			if transport.ShouldLogRateLimited(&peer.lastUnderrunLogNano, int64(time.Second)) {
+				s.mu.Lock()
+				sid := s.streamID
+				s.mu.Unlock()
+				curStreamIDHex := hex.EncodeToString(sid[:])
+				if sid == [16]byte{} && peer.StreamID != [16]byte{} {
+					curStreamIDHex = hex.EncodeToString(peer.StreamID[:])
+				}
+				log.Printf("[AUDIO:UNDERRUN] stream=%s peer=%s consecutive_underruns=%d drift_ratio=%.6f",
+					curStreamIDHex, peer.Addr, consec, ratio)
+			}
 			continue // underrun, silence
+		}
+		peer.consecutiveUnderruns.Store(0)
+
+		frames := peer.playoutFrames.Add(1)
+		if frames%50 == 0 {
+			s.mu.Lock()
+			sid := s.streamID
+			s.mu.Unlock()
+			curStreamIDHex := hex.EncodeToString(sid[:])
+			if sid == [16]byte{} && peer.StreamID != [16]byte{} {
+				curStreamIDHex = hex.EncodeToString(peer.StreamID[:])
+			}
+			metrics := dsp.AnalyzeLoudness(data, s.config.Channels)
+			log.Printf("[AUDIO:PLAY] stream=%s frame=%d RMS=%.2f dBFS Peak=%.2f dBFS underruns=%d driftRatio=%.6f peer=%s",
+				curStreamIDHex, frames, metrics.RMSdBFS, metrics.PeakdBFS, peer.totalUnderruns.Load(), ratio, peer.Addr)
 		}
 
 		playData := data
-		if peer.ASRC != nil {
-			ratio := 1.0
-			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok && jb.driftCtrl != nil {
-				ratio = jb.driftCtrl.Ratio()
+		if peer.ASRC != nil && math.Abs(ratio-1.0) > 1.0e-6 {
+			needed := len(data)*2 + 64
+			if len(peer.asrcOutBuf) < needed {
+				peer.asrcOutBuf = make([]byte, needed)
 			}
-			if math.Abs(ratio-1.0) > 1.0e-6 {
-				needed := len(data)*2 + 64
-				if len(peer.asrcOutBuf) < needed {
-					peer.asrcOutBuf = make([]byte, needed)
-				}
-				n := peer.ASRC.Process(data, peer.asrcOutBuf, ratio)
-				if n > 0 {
-					playData = peer.asrcOutBuf[:n]
-				}
+			n := peer.ASRC.Process(data, peer.asrcOutBuf, ratio)
+			if n > 0 {
+				playData = peer.asrcOutBuf[:n]
 			}
 		}
+
 		if contributors == 0 {
 			first = playData
 			contributors = 1
@@ -637,7 +781,7 @@ func (s *Streamer) playout() {
 		}
 		contributors++
 	}
-	if contributors == 0 || s.output == nil {
+	if contributors == 0 || outSink == nil {
 		return
 	}
 	if contributors > 1 {
@@ -655,19 +799,39 @@ func (s *Streamer) playout() {
 		}
 		first = s.mixPCM[:len(first)]
 	}
-	if _, err := s.output.Write(first); err != nil {
-		log.Printf("streamer: output write error: %v", err)
+	if _, err := outSink.Write(first); err != nil {
+		if firstPeer != nil && transport.ShouldLogRateLimited(&firstPeer.lastWriteErrorLogNano, int64(time.Second)) {
+			log.Printf("[AUDIO:PLAY] ERROR: output.Write failed: %v", err)
+		}
 	} else {
 		s.lastPlayoutNano.Store(time.Now().UnixNano())
+	}
+
+	s.audioTapMu.RLock()
+	tap := s.audioTap
+	s.audioTapMu.RUnlock()
+	if tap != nil {
+		tap.RecordBlock(first, s.config.Channels)
+		playMetrics := dsp.AnalyzeLoudness(first, s.config.Channels)
+		if playMetrics.RMSdBFS >= -75.0 {
+			tap.SetDTXState("Active")
+		} else {
+			tap.SetDTXState("Silence")
+		}
 	}
 }
 
 func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	hdr, payload, err := transport.Unmarshal(data)
 	if err != nil {
-		log.Printf("streamer: unmarshal error: %v", err)
+		drops := s.demuxDropsUnmarshal.Add(1)
+		if transport.ShouldLogRateLimited(&s.lastUnmarshalDropLogNano, int64(time.Second)) {
+			log.Printf("[STREAM:DROP] reason=\"unmarshal_error\" from=%s len=%d err=%v cumulative_drops=%d", addr.String(), len(data), err, drops)
+		}
 		return
 	}
+
+	peerAddr := addr.String()
 
 	var emptyID [16]byte
 	s.mu.Lock()
@@ -675,7 +839,6 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	outStream := s.output
 	s.mu.Unlock()
 
-	peerAddr := addr.String()
 	s.peersMu.Lock()
 	defer s.peersMu.Unlock()
 	peer, ok := s.peers[peerAddr]
@@ -684,6 +847,11 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	// address never overrides the session ID check. The zero ID is retained as
 	// an explicit accept-all mode for callers that intentionally request it.
 	if sid != emptyID && hdr.StreamID != sid {
+		drops := s.demuxDropsStreamID.Add(1)
+		if transport.ShouldLogRateLimited(&s.lastStreamIDDropLogNano, int64(time.Second)) {
+			log.Printf("[STREAM:DROP] reason=\"stream_id_mismatch\" got_sid=%x expected_sid=%x from=%s seq=%d cumulative_drops=%d",
+				hdr.StreamID, sid, peerAddr, hdr.Seq, drops)
+		}
 		return // not for us
 	}
 	// A sender can restart with sequence zero on the same UDP address. Start
@@ -700,6 +868,11 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		// If peer not in s.peers but output exists on the streamer,
 		// dynamically register or accept peer so that receiver nodes can receive incoming streams!
 		if outStream == nil {
+			drops := s.demuxDropsNilOutput.Add(1)
+			if transport.ShouldLogRateLimited(&s.lastNilOutputDropLogNano, int64(time.Second)) {
+				log.Printf("[STREAM:DROP] reason=\"nil_local_output\" stream_id=%x from=%s seq=%d cumulative_drops=%d",
+					hdr.StreamID, peerAddr, hdr.Seq, drops)
+			}
 			return
 		}
 		packetBytes := s.packetBytes()
@@ -743,7 +916,14 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 			}
 		}
 		s.peers[peerAddr] = peer
+		log.Printf("[STREAM:RECV] dynamic peer registered: addr=%s stream_id=%s out_device=%t",
+			peerAddr, hex.EncodeToString(hdr.StreamID[:]), outStream != nil)
 	}
+
+	s.firstRecvOnce.Do(func() {
+		log.Printf("[STREAM:RECV] first packet accepted stream=%s from=%s seq=%d (sr=%d, ch=%d)",
+			hex.EncodeToString(hdr.StreamID[:]), peerAddr, hdr.Seq, hdr.SampleRate, hdr.Channels)
+	})
 
 	s.packetsRecv.Add(1)
 	peer.packetsRecv.Add(1)
@@ -794,6 +974,18 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		return
 	}
 
+	// Separate control plane SID frames from audio media data frames per ADR 0033.
+	if (hdr.Flags & transport.FlagSID) != 0 {
+		if peer.JitterBuf != nil {
+			if dropped, err := peer.JitterBuf.PushWithFlags(hdr.Seq, int64(hdr.Timestamp), nil, hdr.Flags); err != nil {
+				log.Printf("streamer: jitter buffer push sid error: %v", err)
+			} else if dropped > 0 {
+				log.Printf("streamer: jitter buffer overrun for %s (sid)", peerAddr)
+			}
+		}
+		return
+	}
+
 	// For media packets, check if arriving packet solves a missing group
 	if peer.FECDecoder != nil {
 		reconstructed := peer.FECDecoder.ProcessMedia(hdr.Seq, payload)
@@ -814,10 +1006,6 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 		}
 	}
 
-	if len(payload) == 0 && (hdr.Flags&transport.FlagSID) != 0 {
-		payload = make([]byte, s.packetBytes())
-	}
-
 	if peer.IngressAdapter != nil {
 		normalizedPayload, err := peer.IngressAdapter.Process(payload, int(hdr.SampleRate), int(hdr.Channels))
 		if err != nil {
@@ -828,15 +1016,36 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 	}
 
 	if peer.JitterBuf != nil {
-		if dropped, err := peer.JitterBuf.PushWithFlags(hdr.Seq, int64(hdr.Timestamp), payload, hdr.Flags); err != nil {
-			log.Printf("streamer: jitter buffer push error: %v", err)
-		} else if dropped > 0 {
-			log.Printf("streamer: jitter buffer overrun for %s", peerAddr)
+		packetBytes := s.packetBytes()
+		if len(payload) == packetBytes && len(peer.normSpill) == 0 {
+			if dropped, err := peer.JitterBuf.PushWithFlags(hdr.Seq, int64(hdr.Timestamp), payload, hdr.Flags); err != nil {
+				log.Printf("streamer: jitter buffer push error: %v", err)
+			} else if dropped > 0 {
+				log.Printf("streamer: jitter buffer overrun for %s", peerAddr)
+				if peer.Direction == DirRecvOnly {
+					peer.lastPacket = time.Now()
+				}
+			} else if peer.Direction == DirRecvOnly {
+				peer.lastPacket = time.Now()
+			}
+		} else {
+			peer.normSpill = append(peer.normSpill, payload...)
+			frameDurNs := int64(s.config.PacketTime) * int64(time.Millisecond)
+			for len(peer.normSpill) >= packetBytes {
+				chunk := peer.normSpill[:packetBytes]
+				seq := peer.normSeq
+				peer.normSeq++
+				ts := int64(hdr.Timestamp) + int64(seq)*frameDurNs
+				if dropped, err := peer.JitterBuf.PushWithFlags(seq, ts, chunk, hdr.Flags); err != nil {
+					log.Printf("streamer: jitter buffer push error: %v", err)
+				} else if dropped > 0 {
+					log.Printf("streamer: jitter buffer overrun for %s", peerAddr)
+				}
+				peer.normSpill = peer.normSpill[packetBytes:]
+			}
 			if peer.Direction == DirRecvOnly {
 				peer.lastPacket = time.Now()
 			}
-		} else if peer.Direction == DirRecvOnly {
-			peer.lastPacket = time.Now()
 		}
 	}
 }
@@ -848,8 +1057,15 @@ func (s *Streamer) handlePacket(data []byte, addr *net.UDPAddr) {
 // transport. We only unregister our receive handler so we stop consuming
 // packets targeting other routes.
 func (s *Streamer) Stop() {
+	s.StopFast()
+}
+
+// StopFast commands the streamer pipeline to immediately stop audio streaming:
+// - Closes/cancels stopCh immediately if not already closed.
+// - Calls Reset() on all peer jitter buffers to flush buffered audio instantly (< 1ms).
+// - Unregisters the transport receive callback immediately so no incoming packets are queued.
+func (s *Streamer) StopFast() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.stopCh != nil {
 		s.stopOnce.Do(func() { close(s.stopCh) })
 	}
@@ -857,6 +1073,15 @@ func (s *Streamer) Stop() {
 		s.unregister()
 		s.unregister = nil
 	}
+	s.mu.Unlock()
+
+	s.peersMu.RLock()
+	for _, peer := range s.peers {
+		if peer.JitterBuf != nil {
+			peer.JitterBuf.Reset()
+		}
+	}
+	s.peersMu.RUnlock()
 }
 
 // Wait blocks until the streamer exits and returns its result.
@@ -927,6 +1152,21 @@ type StreamerStats struct {
 	FEC               FECStats                     `json:"fec"`
 	PLC               PLCStats                     `json:"plc"`
 	ASRC              ASRCStats                    `json:"asrc"`
+
+	// ADR 0034 Pass B route-level fields (additive, omitempty). PacketsLost
+	// and PlayoutGaps are filled by Stats() from peer sums; the remaining
+	// fields are filled by the stream manager, which owns the route-to-device
+	// binding and the audio.DropCounter handles.
+	PacketsLost       uint64 `json:"packets_lost,omitempty"`
+	PlayoutGaps       uint64 `json:"playout_gaps,omitempty"`
+	CaptureDropBytes  uint64 `json:"capture_drop_bytes,omitempty"`
+	CaptureDropEvents uint64 `json:"capture_drop_events,omitempty"`
+	OutputDropBytes   uint64 `json:"output_drop_bytes,omitempty"`
+	OutputDropEvents  uint64 `json:"output_drop_events,omitempty"`
+	SourceDeviceURN   string `json:"source_device_urn,omitempty"`
+	DestDeviceURN     string `json:"dest_device_urn,omitempty"`
+	SourceGhost       bool   `json:"source_ghost,omitempty"`
+	DestGhost         bool   `json:"dest_ghost,omitempty"`
 }
 
 // Stats returns statistics for this streamer and all peer connections.
@@ -969,6 +1209,8 @@ func (s *Streamer) Stats() StreamerStats {
 	}
 
 	for addr, peer := range s.peers {
+		stats.PacketsLost += peer.packetsLost.Load()
+		stats.PlayoutGaps += peer.totalUnderruns.Load()
 		if peer.FECDecoder != nil {
 			fDecStats := peer.FECDecoder.Stats()
 			stats.FEC.UnrecoverableGroupsTotal += fDecStats.UnrecoverableGroupsTotal
@@ -1000,6 +1242,52 @@ func (s *Streamer) Stats() StreamerStats {
 		}
 	}
 	return stats
+}
+
+// ArtifactSample returns a lock-free, route-scoped sample of this streamer's
+// lifetime artifact counters (ADR 0034, Pass B). All counters are read
+// atomically (no audio-thread stalls); the ArtifactAggregator windows them.
+//
+// Route identity and device-bound fields (RouteID, device URNs, ghost flags,
+// ring drops) are intentionally left zero: the streamer does not know them.
+// The stream manager augments the sample with those fields.
+func (s *Streamer) ArtifactSample() telemetry.RouteArtifactSample {
+	s.peersMu.RLock()
+	defer s.peersMu.RUnlock()
+
+	smp := telemetry.RouteArtifactSample{
+		PacketsReceived: s.packetsRecv.Load(),
+		FECRecovered:    s.fecRecovered.Load(),
+	}
+
+	for _, peer := range s.peers {
+		smp.PacketsLost += peer.packetsLost.Load()
+		smp.PlayoutGaps += peer.totalUnderruns.Load()
+		if peer.FECDecoder != nil {
+			smp.FECUnrecoverable += peer.FECDecoder.Stats().UnrecoverableGroupsTotal
+		}
+
+		var und, over, late, plc uint64
+		if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
+			_, _, und, over, plc, late = jb.AtomicLinkStats()
+		} else if peer.JitterBuf != nil {
+			st := peer.JitterBuf.Stats()
+			und, over, late, plc = st.Underruns, st.Overruns, st.LatePackets, st.PLC.ConcealedFramesTotal
+		}
+		smp.JitterUnderruns += und
+		smp.JitterOverruns += over
+		smp.LatePackets += late
+		smp.PLCConcealed += plc
+
+		smp.Peers = append(smp.Peers, telemetry.PeerArtifactSample{
+			Addr:        peer.Addr,
+			Underruns:   und,
+			Overruns:    over,
+			LatePackets: late,
+		})
+	}
+
+	return smp
 }
 
 // SetPeerID associates a peer address with an authoritative peer node ID.
@@ -1224,17 +1512,18 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 
 		var jbDepth int
 		var targetDelayMS float64
-		var underruns, overruns, plcConcealed uint64
+		var underruns, overruns, plcConcealed, latePackets uint64
 
 		if peer.JitterBuf != nil {
 			if jb, ok := peer.JitterBuf.(*JitterBuffer); ok {
-				jbDepth, targetDelayMS, underruns, overruns, plcConcealed = jb.AtomicLinkStats()
+				jbDepth, targetDelayMS, underruns, overruns, plcConcealed, latePackets = jb.AtomicLinkStats()
 			} else {
 				st := peer.JitterBuf.Stats()
 				jbDepth = st.BufferedFrames
 				targetDelayMS = float64(st.TargetDelay.Milliseconds())
 				underruns = st.Underruns
 				overruns = st.Overruns
+				latePackets = st.LatePackets
 				plcConcealed = st.PLC.ConcealedFramesTotal
 			}
 		}
@@ -1256,6 +1545,7 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 			JitterTargetDelayMS: targetDelayMS,
 			Underruns:           underruns,
 			Overruns:            overruns,
+			LatePackets:         latePackets,
 			FECRecovered:        fecRec,
 			PLCConcealed:        plcConcealed,
 		})
@@ -1266,11 +1556,14 @@ func (s *Streamer) StreamLinkStats() []telemetry.StreamLinkStats {
 
 // isLocalDest reports whether hostport resolves to a local IP.
 func (s *Streamer) isLocalDest(hostport string) bool {
+	if hostport == "local" || hostport == "localhost" {
+		return true
+	}
 	// A peer on the same host but a different UDP port is a distinct node,
 	// not a local audio bypass. This matters for multi-daemon setups and
 	// loopback integration tests.
+	host, port, err := net.SplitHostPort(hostport)
 	if s.transport != nil {
-		_, port, err := net.SplitHostPort(hostport)
 		if err != nil {
 			return false
 		}
@@ -1279,9 +1572,19 @@ func (s *Streamer) isLocalDest(hostport string) bool {
 			return false
 		}
 	}
-	ip, err := parseIP(hostport)
 	if err != nil {
-		return false
+		host = hostport
+	}
+	if host == "local" || host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		var parseErr error
+		ip, parseErr = parseIP(hostport)
+		if parseErr != nil {
+			return false
+		}
 	}
 	for _, l := range s.localIPs {
 		if l.Equal(ip) {

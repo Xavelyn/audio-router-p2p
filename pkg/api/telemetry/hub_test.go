@@ -266,3 +266,241 @@ func TestTelemetryHub_Concurrency(t *testing.T) {
 		t.Log("Note: 0 frames received during brief concurrent burst (acceptable if ticker interval didn't align)")
 	}
 }
+
+func TestTelemetryHub_UnregisterTap_Tombstone(t *testing.T) {
+	hub := NewTelemetryHub(30)
+	sub1 := hub.Subscribe(4)
+	sub2 := hub.Subscribe(4)
+	defer hub.Unsubscribe(sub1)
+	defer hub.Unsubscribe(sub2)
+
+	streamID := "stream-to-close-123"
+	hub.RegisterTap(streamID, 2)
+
+	if _, ok := hub.GetTap(streamID); !ok {
+		t.Fatalf("expected tap %q to be registered", streamID)
+	}
+
+	before := time.Now().UnixMilli()
+	hub.UnregisterTap(streamID)
+	after := time.Now().UnixMilli()
+
+	// Tap should be deleted
+	if _, ok := hub.GetTap(streamID); ok {
+		t.Fatalf("expected tap %q to be removed after UnregisterTap", streamID)
+	}
+
+	// Verify subscriber 1 receives tombstone frame
+	select {
+	case msg := <-sub1.Ch:
+		var raw map[string]any
+		if err := json.Unmarshal(msg, &raw); err != nil {
+			t.Fatalf("failed to unmarshal tombstone payload: %v, raw=%s", err, string(msg))
+		}
+		if raw["stream_id"] != streamID {
+			t.Errorf("expected stream_id %q, got %v", streamID, raw["stream_id"])
+		}
+		if raw["closed"] != true {
+			t.Errorf("expected closed=true, got %v", raw["closed"])
+		}
+		channels, ok := raw["channels"].([]any)
+		if !ok || len(channels) != 0 {
+			t.Errorf("expected empty channels array, got %v", raw["channels"])
+		}
+		tsVal, ok := raw["timestamp"].(float64)
+		if !ok {
+			t.Fatalf("expected numeric timestamp, got %v", raw["timestamp"])
+		}
+		ts := int64(tsVal)
+		if ts < before || ts > after {
+			t.Errorf("timestamp %d out of expected range [%d, %d]", ts, before, after)
+		}
+
+		// Also verify unmarshaling into TombstoneFrame
+		var tf TombstoneFrame
+		if err := json.Unmarshal(msg, &tf); err != nil {
+			t.Fatalf("failed to unmarshal TombstoneFrame: %v", err)
+		}
+		if tf.StreamID != streamID || !tf.Closed || len(tf.Channels) != 0 || tf.Timestamp != ts {
+			t.Errorf("TombstoneFrame struct mismatch: %+v", tf)
+		}
+
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sub1 timed out waiting for tombstone frame")
+	}
+
+	// Verify subscriber 2 receives identical tombstone frame
+	select {
+	case msg := <-sub2.Ch:
+		var tf TombstoneFrame
+		if err := json.Unmarshal(msg, &tf); err != nil {
+			t.Fatalf("failed to unmarshal TombstoneFrame on sub2: %v", err)
+		}
+		if tf.StreamID != streamID || !tf.Closed {
+			t.Errorf("sub2 received unexpected frame: %+v", tf)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("sub2 timed out waiting for tombstone frame")
+	}
+}
+
+func TestTelemetryHub_UnregisterTap_SlowConsumer(t *testing.T) {
+	hub := NewTelemetryHub(30)
+	// Full subscriber buffer cap 1
+	slow := hub.Subscribe(1)
+	defer hub.Unsubscribe(slow)
+
+	// Fill slow subscriber buffer
+	slow.Ch <- []byte(`{"fill":true}`)
+
+	// UnregisterTap should not block or deadlock when channel is full
+	done := make(chan struct{})
+	go func() {
+		hub.UnregisterTap("stream-slow-consumer")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success: non-blocking drop executed
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("UnregisterTap blocked on slow consumer")
+	}
+
+	if slow.DroppedFrames.Load() != 1 {
+		t.Errorf("expected 1 dropped frame, got %d", slow.DroppedFrames.Load())
+	}
+}
+
+func TestTelemetryHub_AppendTombstoneJSON(t *testing.T) {
+	streamID := "test-stream-alloc"
+	timestamp := time.Now().UnixMilli()
+
+	buf := make([]byte, 0, 128)
+	allocs := testing.AllocsPerRun(1000, func() {
+		b := AppendTombstoneJSON(buf[:0], streamID, timestamp)
+		_ = b
+	})
+	if allocs != 0 {
+		t.Errorf("AppendTombstoneJSON expected 0 allocs/op, got %f", allocs)
+	}
+
+	jsonBytes := AppendTombstoneJSON(nil, streamID, timestamp)
+	var tf TombstoneFrame
+	if err := json.Unmarshal(jsonBytes, &tf); err != nil {
+		t.Fatalf("json unmarshal failed: %v", err)
+	}
+	if tf.StreamID != streamID || !tf.Closed || tf.Timestamp != timestamp || len(tf.Channels) != 0 {
+		t.Errorf("unexpected decoded tombstone: %+v", tf)
+	}
+}
+
+func TestTelemetryHub_FormatTombstoneJSON_Allocations(t *testing.T) {
+	streamID := "test-stream-route-123"
+	timestamp := time.Now().UnixMilli()
+
+	// Verify FormatTombstoneJSON only performs 1 allocation (the slice itself),
+	// proving it does not trigger runtime.growslice.
+	allocs := testing.AllocsPerRun(1000, func() {
+		b := FormatTombstoneJSON(streamID, timestamp)
+		_ = b
+	})
+	if allocs != 1.0 {
+		t.Errorf("FormatTombstoneJSON expected exactly 1 alloc/op, got %f", allocs)
+	}
+}
+
+func TestTelemetryHub_UnregisterTap_NoMeterFrameAfterTombstone(t *testing.T) {
+	hub := NewTelemetryHub(50)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	streamID := "stream-race-test"
+	hub.RegisterTap(streamID, 2)
+	sub := hub.Subscribe(64)
+	defer hub.Unsubscribe(sub)
+
+	hub.Start(ctx)
+	defer hub.Stop()
+
+	// Unregister tap after ticker has run
+	time.Sleep(25 * time.Millisecond)
+	hub.UnregisterTap(streamID)
+
+	var tombstoneReceived bool
+	// Drain received messages
+	for {
+		select {
+		case msg := <-sub.Ch:
+			var frame MeterFrame
+			if err := json.Unmarshal(msg, &frame); err != nil {
+				t.Fatalf("invalid json: %v", err)
+			}
+			if frame.StreamID == streamID {
+				if tombstoneReceived && !frame.Closed {
+					t.Fatalf("CRITICAL RACE: received active meter frame for %q AFTER tombstone frame", streamID)
+				}
+				if frame.Closed {
+					tombstoneReceived = true
+				}
+			}
+		case <-time.After(100 * time.Millisecond):
+			if !tombstoneReceived {
+				t.Fatal("never received tombstone frame")
+			}
+			return
+		}
+	}
+}
+
+func TestTelemetryHub_SubscribeLocalOnly_AntiEcho(t *testing.T) {
+	hub := NewTelemetryHub(30)
+	normalSub := hub.Subscribe(8)
+	defer hub.Unsubscribe(normalSub)
+
+	localOnlySub := hub.SubscribeLocalOnly(8)
+	defer hub.Unsubscribe(localOnlySub)
+
+	relayedMsg := []byte(`{"stream_id":"relayed-peer-stream","dtx_state":"Active"}`)
+	hub.BroadcastRelayed(relayedMsg)
+
+	// normalSub must receive relayed message
+	select {
+	case msg := <-normalSub.Ch:
+		if string(msg) != string(relayedMsg) {
+			t.Fatalf("normalSub expected %s, got %s", string(relayedMsg), string(msg))
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("normalSub timed out waiting for relayed message")
+	}
+
+	// localOnlySub must NOT receive relayed message
+	select {
+	case msg := <-localOnlySub.Ch:
+		t.Fatalf("localOnlySub unexpectedly received relayed message: %s", string(msg))
+	case <-time.After(50 * time.Millisecond):
+		// Expected: localOnly suppressed the message
+	}
+
+	// Direct broadcast (local) must reach both
+	localMsg := []byte(`{"stream_id":"local-stream","dtx_state":"Active"}`)
+	hub.Broadcast(localMsg)
+
+	select {
+	case msg := <-normalSub.Ch:
+		if string(msg) != string(localMsg) {
+			t.Fatalf("normalSub expected %s, got %s", string(localMsg), string(msg))
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("normalSub timed out waiting for local message")
+	}
+
+	select {
+	case msg := <-localOnlySub.Ch:
+		if string(msg) != string(localMsg) {
+			t.Fatalf("localOnlySub expected %s, got %s", string(localMsg), string(msg))
+		}
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("localOnlySub timed out waiting for local message")
+	}
+}

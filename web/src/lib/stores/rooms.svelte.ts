@@ -3,66 +3,40 @@ import { apiClient } from '$lib/api/client';
 
 class RoomStore {
   rooms = $state<RoomInfo[]>([]);
-  activeJoinedRoomId = $state<string | null>(null);
   isLoading = $state<boolean>(false);
   error = $state<string | null>(null);
   lastError = $state<string | null>(null);
 
   clearLastError() {
     this.lastError = null;
+    this.error = null;
   }
 
-  async loadRooms() {
-    this.isLoading = true;
-    this.error = null;
+  async loadRooms(silent = false) {
+    if (!silent) this.isLoading = true;
     try {
       const list = await apiClient.listRooms();
       // Ensure inputs, outputs, synced exist even if older API returned partial data
-      this.rooms = list.map((r) => ({
+      const normalized = list.map((r) => ({
         ...r,
         inputs: r.inputs || [],
         outputs: r.outputs || [],
         synced: r.synced ?? false,
       }));
+      if (JSON.stringify(normalized) !== JSON.stringify(this.rooms)) {
+        this.rooms = normalized;
+      }
+      this.error = null;
+      this.lastError = null;
     } catch (err: any) {
-      this.error = err.message || 'Failed to enumerate audio conference rooms';
-      if (this.rooms.length === 0) {
-        this.rooms = [
-          {
-            id: 'room-main-broadcast',
-            name: 'Main Stage Broadcast',
-            leader: 'node-studio-ctrl-01',
-            state: 'active',
-            members: ['node-studio-ctrl-01', 'node-stage-box-02', 'local'],
-            inputs: ['hw:0', 'virt:loop-main'],
-            outputs: ['hw:0', 'hw:1'],
-            synced: true,
-          },
-          {
-            id: 'room-in-ear-monitors',
-            name: 'IEM Low-Latency Mix (Musicians)',
-            leader: 'node-stage-box-02',
-            state: 'active',
-            members: ['node-stage-box-02', 'local'],
-            inputs: ['hw:1'],
-            outputs: ['hw:1'],
-            synced: true,
-          },
-          {
-            id: 'room-control-booth',
-            name: 'Production Talkback & Intercom',
-            leader: 'local',
-            state: 'idle',
-            members: ['local'],
-            inputs: ['virt:loop-main'],
-            outputs: ['hw:0'],
-            synced: false,
-          },
-        ];
-        this.activeJoinedRoomId = 'room-main-broadcast';
+      const msg = err.message || 'Failed to enumerate audio conference rooms';
+      this.error = msg;
+      this.lastError = msg;
+      if (!silent) {
+        this.rooms = [];
       }
     } finally {
-      this.isLoading = false;
+      if (!silent) this.isLoading = false;
     }
   }
 
@@ -83,19 +57,7 @@ class RoomStore {
       const msg = err.message || 'Failed to create audio conference room';
       this.lastError = msg;
       this.error = msg;
-      // Optimistic local add if daemon unavailable
-      const fallback: RoomInfo = {
-        id: req.id,
-        name: req.name,
-        leader: 'local',
-        state: 'active',
-        members: ['local'],
-        inputs: [],
-        outputs: [],
-        synced: true,
-      };
-      this.rooms = [...this.rooms, fallback];
-      return fallback;
+      throw err;
     } finally {
       this.isLoading = false;
     }
@@ -104,86 +66,15 @@ class RoomStore {
   async deleteRoom(roomId: string) {
     this.isLoading = true;
     this.lastError = null;
+    // Optimistic local removal
+    this.rooms = this.rooms.filter((r) => r.id !== roomId);
     try {
       await apiClient.deleteRoom(roomId);
-      this.rooms = this.rooms.filter((r) => r.id !== roomId);
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
     } catch (err: any) {
       const msg = err.message || 'Failed to delete room';
       this.lastError = msg;
       this.error = msg;
-      // Optimistic local removal
-      this.rooms = this.rooms.filter((r) => r.id !== roomId);
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
-    } finally {
-      this.isLoading = false;
-    }
-  }
-
-  async joinRoom(roomId: string) {
-    this.isLoading = true;
-    this.lastError = null;
-    try {
-      const updated = await apiClient.joinRoom(roomId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || this.rooms[idx].inputs || [],
-          outputs: updated.outputs || this.rooms[idx].outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
-      }
-      this.activeJoinedRoomId = roomId;
-    } catch (err: any) {
-      const msg = err.message || 'Failed to join room';
-      this.lastError = msg;
-      this.error = msg;
-      // Local fallback for UI preview
-      this.activeJoinedRoomId = roomId;
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && target.members && !target.members.includes('local')) {
-        target.members.push('local');
-      }
-    } finally {
-      this.isLoading = false;
-    }
-  }
-
-  async leaveRoom(roomId: string) {
-    this.isLoading = true;
-    this.lastError = null;
-    try {
-      const updated = await apiClient.leaveRoom(roomId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || this.rooms[idx].inputs || [],
-          outputs: updated.outputs || this.rooms[idx].outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
-      }
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
-    } catch (err: any) {
-      const msg = err.message || 'Failed to leave room';
-      this.lastError = msg;
-      this.error = msg;
-      if (this.activeJoinedRoomId === roomId) {
-        this.activeJoinedRoomId = null;
-      }
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && target.members) {
-        target.members = target.members.filter((m) => m !== 'local');
-      }
+      throw err;
     } finally {
       this.isLoading = false;
     }
@@ -208,121 +99,148 @@ class RoomStore {
       const msg = err.message || 'Failed to update room bindings';
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic update
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.inputs = [...req.inputs];
-        target.outputs = [...req.outputs];
-        if (req.synced !== undefined) {
-          target.synced = req.synced;
-        }
-      }
     } finally {
       this.isLoading = false;
     }
   }
 
-  async addRoomInput(roomId: string, devId: string) {
+  async addRoomInput(roomId: string, devId: string, nodeId?: string) {
     this.lastError = null;
     try {
-      const updated = await apiClient.addRoomInput(roomId, devId);
+      const updated = await apiClient.addRoomInput(roomId, devId, undefined, nodeId);
       const idx = this.rooms.findIndex((r) => r.id === roomId);
       if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+        this.rooms = this.rooms.map((r, i) =>
+          i === idx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to assign input ${devId} to room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && !target.inputs.includes(devId)) {
-        target.inputs.push(devId);
-      }
     }
   }
 
   async removeRoomInput(roomId: string, devId: string) {
     this.lastError = null;
+    const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+    // Optimistic local unbinding (ADR 0028 strict canonical isolation)
+    const idx = this.rooms.findIndex((r) => r.id === roomId);
+    if (idx !== -1) {
+      this.rooms = this.rooms.map((r, i) =>
+        i === idx
+          ? {
+              ...r,
+              inputs: (r.inputs || []).filter((id) => {
+                if (id === devId) return false;
+                if (devId.includes('/')) {
+                  // devId is qualified (e.g. nodeA/mic-1): never unbind nodeB/mic-1
+                  return true;
+                }
+                return id !== clean && !id.endsWith(`/${clean}`);
+              }),
+            }
+          : r
+      );
+    }
     try {
       const updated = await apiClient.removeRoomInput(roomId, devId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+      const updatedIdx = this.rooms.findIndex((r) => r.id === roomId);
+      if (updatedIdx !== -1) {
+        this.rooms = this.rooms.map((r, i) =>
+          i === updatedIdx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to remove input ${devId} from room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.inputs = target.inputs.filter((id) => id !== devId);
-      }
     }
   }
 
-  async addRoomOutput(roomId: string, devId: string) {
+  async addRoomOutput(roomId: string, devId: string, nodeId?: string) {
     this.lastError = null;
     try {
-      const updated = await apiClient.addRoomOutput(roomId, devId);
+      const updated = await apiClient.addRoomOutput(roomId, devId, undefined, nodeId);
       const idx = this.rooms.findIndex((r) => r.id === roomId);
       if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+        this.rooms = this.rooms.map((r, i) =>
+          i === idx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to assign output ${devId} to room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target && !target.outputs.includes(devId)) {
-        target.outputs.push(devId);
-      }
     }
   }
 
   async removeRoomOutput(roomId: string, devId: string) {
     this.lastError = null;
+    const clean = devId.includes('/') ? devId.slice(devId.indexOf('/') + 1) : devId;
+    // Optimistic local unbinding (ADR 0028 strict canonical isolation)
+    const idx = this.rooms.findIndex((r) => r.id === roomId);
+    if (idx !== -1) {
+      this.rooms = this.rooms.map((r, i) =>
+        i === idx
+          ? {
+              ...r,
+              outputs: (r.outputs || []).filter((id) => {
+                if (id === devId) return false;
+                if (devId.includes('/')) {
+                  // devId is qualified (e.g. nodeA/mic-1): never unbind nodeB/mic-1
+                  return true;
+                }
+                return id !== clean && !id.endsWith(`/${clean}`);
+              }),
+            }
+          : r
+      );
+    }
     try {
       const updated = await apiClient.removeRoomOutput(roomId, devId);
-      const idx = this.rooms.findIndex((r) => r.id === roomId);
-      if (idx !== -1) {
-        this.rooms[idx] = {
-          ...this.rooms[idx],
-          ...updated,
-          inputs: updated.inputs || [],
-          outputs: updated.outputs || [],
-          synced: updated.synced ?? this.rooms[idx].synced,
-        };
+      const updatedIdx = this.rooms.findIndex((r) => r.id === roomId);
+      if (updatedIdx !== -1) {
+        this.rooms = this.rooms.map((r, i) =>
+          i === updatedIdx
+            ? {
+                ...r,
+                ...updated,
+                inputs: updated.inputs || [],
+                outputs: updated.outputs || [],
+                synced: updated.synced ?? r.synced,
+              }
+            : r
+        );
       }
     } catch (err: any) {
       const msg = err.message || `Failed to remove output ${devId} from room ${roomId}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.outputs = target.outputs.filter((id) => id !== devId);
-      }
     }
   }
 
@@ -344,11 +262,6 @@ class RoomStore {
       const msg = err.message || `Failed to set room sync to ${synced}`;
       this.lastError = msg;
       this.error = msg;
-      // Local optimistic fallback
-      const target = this.rooms.find((r) => r.id === roomId);
-      if (target) {
-        target.synced = synced;
-      }
     }
   }
 

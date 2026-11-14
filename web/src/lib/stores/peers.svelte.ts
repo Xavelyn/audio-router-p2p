@@ -22,31 +22,7 @@ class PeerStore {
       this.peers = list;
     } catch (err: any) {
       this.error = err.message || 'Failed to enumerate mesh peers';
-      if (this.peers.length === 0) {
-        this.peers = [
-          {
-            id: 'node-studio-ctrl-01',
-            addr: '192.168.1.101:7001',
-            status: 'connected',
-            rtt_ms: 1.8,
-            last_seen: new Date().toISOString(),
-          },
-          {
-            id: 'node-stage-box-02',
-            addr: '192.168.1.102:7001',
-            status: 'connected',
-            rtt_ms: 2.4,
-            last_seen: new Date().toISOString(),
-          },
-          {
-            id: 'node-remote-broadcast',
-            addr: '10.8.0.45:7001',
-            status: 'negotiating',
-            rtt_ms: 18.6,
-            last_seen: new Date().toISOString(),
-          },
-        ];
-      }
+      this.peers = [];
     } finally {
       this.isLoading = false;
     }

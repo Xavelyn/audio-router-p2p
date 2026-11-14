@@ -11,6 +11,7 @@ import (
 
 	"github.com/audio-router-p2p/internal/config"
 	"github.com/audio-router-p2p/pkg/api/telemetry"
+	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
@@ -31,6 +32,7 @@ type StreamManager interface {
 type RoomManager interface {
 	ListRooms() []RoomInfo
 	CreateRoom(id, name string) (RoomInfo, error)
+	DeleteRoom(id string) error
 	JoinRoom(id string) error
 	LeaveRoom(id string) error
 	AddInput(roomID, deviceID string) error
@@ -54,8 +56,9 @@ type V1Server struct {
 	devReg    *DeviceRegistry
 	startTime time.Time
 
-	aggregator *netTelemetry.Aggregator
-	clusterMgr *cluster.Manager
+	aggregator         *netTelemetry.Aggregator
+	artifactAggregator *netTelemetry.ArtifactAggregator
+	clusterMgr         *cluster.Manager
 
 	// sim is the network-condition simulator, set when the daemon runs the
 	// UDP transport. Nil in read-only servers and DTLS (encrypt) mode.
@@ -73,6 +76,13 @@ func (s *V1Server) SetSimulator(sim *transport.NetworkSimulator) {
 // SetAggregator configures the central network telemetry aggregator.
 func (s *V1Server) SetAggregator(agg *netTelemetry.Aggregator) {
 	s.aggregator = agg
+}
+
+// SetArtifactAggregator configures the audio artifact telemetry aggregator
+// (ADR 0034). When unset, stream-stats omits health/devices (byte-compatible)
+// and device-artifacts returns an empty object.
+func (s *V1Server) SetArtifactAggregator(agg *netTelemetry.ArtifactAggregator) {
+	s.artifactAggregator = agg
 }
 
 // SetClusterManager configures the cluster manager.
@@ -113,6 +123,11 @@ func NewV1Server(
 		hub:       hub,
 		devReg:    NewDeviceRegistry(),
 		startTime: time.Now(),
+	}
+	if roomMgr != nil {
+		if l, ok := roomMgr.(audio.DeviceLifecycleListener); ok {
+			s.devReg.RegisterListener(l)
+		}
 	}
 	return s
 }
@@ -203,6 +218,7 @@ func (s *V1Server) WriteError(w http.ResponseWriter, statusCode int, code, msg s
 func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	// System & Node Management
 	mux.HandleFunc("/api/v1/system/status", s.AuthMiddleware(s.handleSystemStatus))
+	mux.HandleFunc("/api/v1/status", s.AuthMiddleware(s.handleSystemStatus))
 	mux.HandleFunc("/api/v1/system/peers", s.AuthMiddleware(s.handleSystemPeers))
 	mux.HandleFunc("/api/v1/system/clock-sync", s.AuthMiddleware(s.handleSystemClockSync))
 
@@ -218,15 +234,17 @@ func (s *V1Server) MountRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/rooms", s.AuthMiddleware(s.handleRooms))
 	mux.HandleFunc("/api/v1/rooms/", s.AuthMiddleware(s.handleRoomsSubpath))
 
-	// Cluster Management & Observability (ADR 0011)
+	// Cluster Management & Observability (ADR 0011 & ADR 0017)
 	mux.HandleFunc("/api/v1/cluster/nodes", s.AuthMiddleware(s.handleClusterNodes))
 	mux.HandleFunc("/api/v1/cluster/nodes/", s.AuthMiddleware(s.handleClusterNodesSubpath))
 	mux.HandleFunc("/api/v1/cluster/devices", s.AuthMiddleware(s.handleClusterDevices))
+	mux.HandleFunc("/api/v1/cluster/rooms", s.AuthMiddleware(s.handleClusterRooms))
 
 	// Telemetry & Diagnostics
 	mux.HandleFunc("/api/v1/network/health", s.AuthMiddleware(s.handleNetworkHealth))
 	mux.HandleFunc("/api/v1/network/sim", s.AuthMiddleware(s.handleNetworkSim))
 	mux.HandleFunc("/api/v1/telemetry/stream-stats", s.AuthMiddleware(s.handleTelemetryStreamStats))
+	mux.HandleFunc("/api/v1/telemetry/device-artifacts", s.AuthMiddleware(s.handleTelemetryDeviceArtifacts))
 	mux.HandleFunc("/api/v1/telemetry/meters", s.AuthMiddleware(s.handleTelemetryMetersSSE))
 	mux.HandleFunc("/api/v1/telemetry/ws", s.handleTelemetryWebSocket)
 }

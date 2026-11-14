@@ -6,8 +6,14 @@
   import Zap from '@lucide/svelte/icons/zap';
   import Volume2 from '@lucide/svelte/icons/volume-2';
 
-  let canvasElements: Record<number, HTMLCanvasElement> = {};
+  let canvasElements: Record<string, HTMLCanvasElement> = {};
   let animId: number | null = null;
+
+  const activeStreams = $derived(
+    Object.values(meterStore.streams).filter(
+      (s) => s.streamId === 'demo-multitrack-bus' || Date.now() - s.lastUpdated < 1500
+    )
+  );
 
   onMount(() => {
     meterStore.init();
@@ -25,60 +31,66 @@
     return (db + 60) / 60;
   }
 
+  function drawMeterCanvas(canvas: HTMLCanvasElement, ch: ChannelState) {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const w = canvas.width;
+    const h = canvas.height;
+
+    // Background
+    ctx.fillStyle = '#09090b';
+    ctx.fillRect(0, 0, w, h);
+
+    // Grid / tick marks background
+    const ticks = [0, -3, -6, -12, -18, -24, -36, -48];
+    ctx.fillStyle = '#1e1e24';
+    for (const t of ticks) {
+      const y = h - dbToCanvasRatio(t) * h;
+      ctx.fillRect(0, y, w, 1);
+    }
+
+    // Draw RMS Bar
+    const rmsRatio = dbToCanvasRatio(ch.rmsDb);
+    const barHeight = rmsRatio * h;
+    const barY = h - barHeight;
+
+    // Gradient for RMS bar (green -> amber -> red)
+    const grad = ctx.createLinearGradient(0, h, 0, 0);
+    grad.addColorStop(0, '#10b981'); // Emerald green
+    grad.addColorStop(0.7, '#22c55e'); // Signal green
+    grad.addColorStop(0.85, '#eab308'); // Amber warning
+    grad.addColorStop(0.98, '#ef4444'); // Clip red
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(4, barY, w - 8, barHeight);
+
+    // Peak Level marker (solid bar line)
+    const peakRatio = dbToCanvasRatio(ch.peakDb);
+    const peakY = h - peakRatio * h;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(2, peakY, w - 4, 2);
+
+    // Peak Hold Needle (cyan neon line)
+    const holdRatio = dbToCanvasRatio(ch.peakHoldDb);
+    const holdY = h - holdRatio * h;
+    ctx.fillStyle = '#06b6d4';
+    ctx.shadowColor = '#06b6d4';
+    ctx.shadowBlur = 6;
+    ctx.fillRect(2, holdY - 1, w - 4, 3);
+    ctx.shadowBlur = 0; // Reset shadow
+  }
+
   function startCanvasRenderLoop() {
     const render = () => {
-      const channels = meterStore.activeChannelMeters;
-
-      for (const ch of channels) {
-        const canvas = canvasElements[ch.channel];
-        if (!canvas) continue;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) continue;
-
-        const w = canvas.width;
-        const h = canvas.height;
-
-        // Background
-        ctx.fillStyle = '#09090b';
-        ctx.fillRect(0, 0, w, h);
-
-        // Grid / tick marks background
-        const ticks = [0, -3, -6, -12, -18, -24, -36, -48];
-        ctx.fillStyle = '#1e1e24';
-        for (const t of ticks) {
-          const y = h - dbToCanvasRatio(t) * h;
-          ctx.fillRect(0, y, w, 1);
+      for (const stream of Object.values(meterStore.streams)) {
+        for (const ch of stream.channels) {
+          const key = `${stream.streamId}-${ch.channel}`;
+          const canvas = canvasElements[key];
+          if (canvas) {
+            drawMeterCanvas(canvas, ch);
+          }
         }
-
-        // Draw RMS Bar
-        const rmsRatio = dbToCanvasRatio(ch.rmsDb);
-        const barHeight = rmsRatio * h;
-        const barY = h - barHeight;
-
-        // Gradient for RMS bar (green -> amber -> red)
-        const grad = ctx.createLinearGradient(0, h, 0, 0);
-        grad.addColorStop(0, '#10b981'); // Emerald green
-        grad.addColorStop(0.7, '#22c55e'); // Signal green
-        grad.addColorStop(0.85, '#eab308'); // Amber warning
-        grad.addColorStop(0.98, '#ef4444'); // Clip red
-
-        ctx.fillStyle = grad;
-        ctx.fillRect(4, barY, w - 8, barHeight);
-
-        // Peak Level marker (solid bar line)
-        const peakRatio = dbToCanvasRatio(ch.peakDb);
-        const peakY = h - peakRatio * h;
-        ctx.fillStyle = '#ffffff';
-        ctx.fillRect(2, peakY, w - 4, 2);
-
-        // Peak Hold Needle (cyan neon line)
-        const holdRatio = dbToCanvasRatio(ch.peakHoldDb);
-        const holdY = h - holdRatio * h;
-        ctx.fillStyle = '#06b6d4';
-        ctx.shadowColor = '#06b6d4';
-        ctx.shadowBlur = 6;
-        ctx.fillRect(2, holdY - 1, w - 4, 3);
-        ctx.shadowBlur = 0; // Reset shadow
       }
 
       animId = requestAnimationFrame(render);
@@ -141,7 +153,7 @@
   <div class="flex-1 overflow-y-auto p-6 flex flex-col items-center justify-center bg-zinc-950">
     <div class="flex flex-col gap-6 w-full max-w-5xl">
       <!-- Streams Loop or Multi-channel Rack -->
-      {#if Object.keys(meterStore.streams).length === 0 && !meterStore.useSimulation}
+      {#if activeStreams.length === 0 && !meterStore.useSimulation}
         <div class="flex flex-col items-center justify-center p-12 rounded-xl border border-dashed border-zinc-800 text-center">
           <Activity class="w-8 h-8 text-zinc-600 mb-2" />
           <h3 class="text-sm font-semibold text-zinc-300">No active audio stream telemetry frames</h3>
@@ -157,22 +169,22 @@
           </button>
         </div>
       {:else}
-        {#each Object.values(meterStore.streams) as stream}
+        {#each activeStreams as stream (stream.streamId)}
           {@const dtxBadge = getDtxBadge(stream.dtxState)}
-          <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-xl">
+          <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-xl min-w-0">
             <!-- Stream Header -->
-            <div class="flex items-center justify-between border-b border-zinc-800/80 pb-3 mb-4">
-              <div class="flex items-center gap-2.5">
-                <Radio class="w-4 h-4 text-cyan-400" />
-                <span class="font-mono text-xs font-bold text-zinc-200 uppercase">
+            <div class="flex items-center justify-between border-b border-zinc-800/80 pb-3 mb-4 gap-2">
+              <div class="flex items-center gap-2.5 min-w-0 flex-1">
+                <Radio class="w-4 h-4 text-cyan-400 shrink-0" />
+                <span class="font-mono text-xs font-bold text-zinc-200 uppercase truncate" title={stream.streamId}>
                   Stream ID: {stream.streamId}
                 </span>
               </div>
-              <div class="flex items-center gap-3">
-                <span class="border rounded-md px-2 py-0.5 text-[10px] font-mono font-bold {dtxBadge.color}">
+              <div class="flex items-center gap-2 shrink-0">
+                <span class="border rounded-md px-2 py-0.5 text-[10px] font-mono font-bold shrink-0 {dtxBadge.color}">
                   {dtxBadge.label}
                 </span>
-                <span class="text-[10px] font-mono text-zinc-400">
+                <span class="text-[10px] font-mono text-zinc-400 shrink-0">
                   {stream.channels.length} CHANNELS
                 </span>
               </div>
@@ -181,7 +193,7 @@
             <!-- Meter Channel Strips Horizontal Rack -->
             <div class="flex items-center justify-center gap-6 py-2 overflow-x-auto">
               <!-- Scale Column -->
-              <div class="flex flex-col justify-between h-64 text-[10px] font-mono text-zinc-400 py-1 pr-1 select-none text-right">
+              <div class="flex flex-col justify-between h-64 text-[10px] font-mono text-zinc-400 py-1 pr-1 select-none text-right shrink-0">
                 <span class="text-red-400 font-bold">CLIP (0)</span>
                 <span class="text-amber-400">-3 dB</span>
                 <span class="text-amber-400">-6 dB</span>
@@ -194,8 +206,8 @@
               </div>
 
               <!-- Channel Meters -->
-              {#each stream.channels as ch}
-                <div class="flex flex-col items-center gap-2">
+              {#each stream.channels as ch (ch.channel)}
+                <div class="flex flex-col items-center gap-2 shrink-0">
                   <!-- Clip LED Lamp -->
                   <div
                     class="h-3 w-8 rounded-sm border transition-all flex items-center justify-center {ch.clipped
@@ -211,7 +223,7 @@
                   <!-- Canvas Vertical VU Tube -->
                   <div class="relative rounded-md border border-zinc-800 bg-zinc-950 p-1 shadow-inner">
                     <canvas
-                      bind:this={canvasElements[ch.channel]}
+                      bind:this={canvasElements[`${stream.streamId}-${ch.channel}`]}
                       width="36"
                       height="240"
                       class="rounded bg-zinc-950"

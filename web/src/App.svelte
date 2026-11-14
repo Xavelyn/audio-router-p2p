@@ -1,14 +1,14 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import Header, { type TabId } from '$lib/components/layout/Header.svelte';
   import RoomCanvas from '$lib/components/rooms/RoomCanvas.svelte';
   import MeterRack from '$lib/components/meters/MeterRack.svelte';
   import DeviceManager from '$lib/components/devices/DeviceManager.svelte';
-  import RoomCoordinator from '$lib/components/rooms/RoomCoordinator.svelte';
   import TelemetryDashboard from '$lib/components/telemetry/TelemetryDashboard.svelte';
   import { authStore } from '$lib/stores/auth.svelte';
   import { meterStore } from '$lib/stores/meters.svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
+  import { peerStore } from '$lib/stores/peers.svelte';
   import { SvelteFlowProvider } from '@xyflow/svelte';
   import AlertCircle from '@lucide/svelte/icons/alert-circle';
   import X from '@lucide/svelte/icons/x';
@@ -17,10 +17,22 @@
   let activeTab = $state<TabId>('flow');
   let dismissBanner = $state(false);
 
+  $effect(() => {
+    if (authStore.connectionStatus === 'connected') {
+      dismissBanner = false;
+    }
+  });
+
   onMount(() => {
     authStore.checkConnection();
     meterStore.init();
     clusterStore.startPolling(2500);
+    peerStore.loadPeers();
+    peerStore.loadClockSync();
+  });
+
+  onDestroy(() => {
+    clusterStore.stopPolling();
   });
 </script>
 
@@ -37,7 +49,7 @@
           {#if authStore.connectionStatus === 'unauthorized'}
             Authentication required to modify audio crossbar and provision devices.
           {:else}
-            {authStore.lastError || 'Unable to connect to audio router daemon at ' + authStore.activeDaemonUrl}. Running in local simulation mode.
+            {authStore.lastError || 'Unable to connect to audio router daemon at ' + authStore.activeDaemonUrl}.
           {/if}
         </span>
       </div>
@@ -63,8 +75,6 @@
       <MeterRack />
     {:else if activeTab === 'devices'}
       <DeviceManager />
-    {:else if activeTab === 'rooms'}
-      <RoomCoordinator />
     {:else if activeTab === 'diagnostics'}
       <TelemetryDashboard />
     {/if}

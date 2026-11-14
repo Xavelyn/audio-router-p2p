@@ -22,6 +22,7 @@ type Config struct {
 	DTLSRole    string // server or client; a pair must use opposite roles
 	PSK         string // Pre-shared key for DTLS (base64 encoded)
 	RoutesFile  string // Path to the JSON routes file
+	RoomsFile   string // Path to the JSON rooms file
 
 	MulticastGroup   string
 	MulticastPort    int
@@ -43,6 +44,10 @@ type Config struct {
 	SimReorder   float64 // egress reorder fraction, 0-100 percent
 	SimDuplicate float64 // egress duplicate fraction, 0-100 percent
 	SimBandwidth float64 // egress bandwidth cap, kilobits/sec; 0 = unlimited
+
+	// Node identity flags
+	NodeID     string // Explicit persistent node identifier override
+	NodeIDFile string // Path to persistent node ID file
 
 	// Room orchestration flags
 	RoomID       string // Room ID to create/join
@@ -80,6 +85,7 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.StringVar(&cfg.DTLSRole, "dtls-role", "server", "DTLS role: server or client (peers must use opposite roles)")
 	fs.StringVar(&cfg.PSK, "psk", "", "Pre-shared key for DTLS encryption (base64 encoded)")
 	fs.StringVar(&cfg.RoutesFile, "routes", "routes.json", "Path to the JSON routes file")
+	fs.StringVar(&cfg.RoomsFile, "rooms", "rooms.json", "Path to the JSON rooms file")
 
 	fs.StringVar(&cfg.MulticastGroup, "multicast-group", "239.255.0.1", "Multicast group for peer discovery")
 	fs.IntVar(&cfg.MulticastPort, "multicast-port", 45400, "Multicast port for peer announcements")
@@ -103,6 +109,9 @@ func LoadFromArgs(args []string) (*Config, error) {
 	fs.StringVar(&cfg.RoomID, "room-id", "", "Room ID to create/join")
 	fs.StringVar(&cfg.RoomName, "room-name", "", "Human-readable name of the room")
 	fs.BoolVar(&cfg.RoomAutoJoin, "room-auto-join", false, "Auto-join room on daemon startup")
+
+	fs.StringVar(&cfg.NodeID, "node-id", "", "Explicit persistent node identifier")
+	fs.StringVar(&cfg.NodeIDFile, "node-id-file", "node.id", "Path to node ID persistence file")
 
 	// Static peers (comma-separated JSON array or comma-separated addresses)
 	staticPeersJSON := fs.String("static-peers", "", "Static peers JSON array (for cross-broadcast domains)")

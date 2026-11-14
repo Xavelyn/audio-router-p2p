@@ -25,6 +25,14 @@ type DiscoveredDevice struct {
 	BusPath     string   `json:"bus_path,omitempty"`
 	URN         string   `json:"urn"`
 	Tier        urn.Tier `json:"tier"`
+	CanPlayback bool     `json:"can_playback"`
+	CanCapture  bool     `json:"can_capture"`
+}
+
+// PCMCapability records whether a PCM subdevice supports playback, capture, or duplex.
+type PCMCapability struct {
+	Playback bool
+	Capture  bool
 }
 
 // CardMeta holds intermediate card properties from /proc/asound/cards and /proc/asound/cardN/id.
@@ -32,7 +40,7 @@ type CardMeta struct {
 	Index    int
 	ID       string
 	Name     string
-	PCMSlots map[int]bool
+	PCMSlots map[int]*PCMCapability
 }
 
 var procCardsRegex = regexp.MustCompile(`^\s*(\d+)\s+\[([^\]]+)\]:\s+(.*)$`)
@@ -53,7 +61,7 @@ func ParseProcCards(content string) map[int]*CardMeta {
 					Index:    idx,
 					ID:       strings.TrimSpace(matches[2]),
 					Name:     strings.TrimSpace(matches[3]),
-					PCMSlots: make(map[int]bool),
+					PCMSlots: make(map[int]*PCMCapability),
 				}
 				cards[idx] = currentCard
 			}
@@ -88,19 +96,29 @@ func DiscoverWithRoots(sysRoot, procRoot string) ([]DiscoveredDevice, error) {
 	}
 
 	// Track discovered PCM devices per card from sysfs (e.g., pcmC0D0p, pcmC0D1c)
-	pcmRegex := regexp.MustCompile(`^pcmC(\d+)D(\d+)[cp]$`)
+	pcmRegex := regexp.MustCompile(`^pcmC(\d+)D(\d+)([cp])$`)
 	cardDirRegex := regexp.MustCompile(`^card(\d+)$`)
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if pcmMatches := pcmRegex.FindStringSubmatch(name); len(pcmMatches) == 3 {
+		if pcmMatches := pcmRegex.FindStringSubmatch(name); len(pcmMatches) == 4 {
 			cIdx, err1 := strconv.Atoi(pcmMatches[1])
 			dIdx, err2 := strconv.Atoi(pcmMatches[2])
+			dir := pcmMatches[3]
 			if err1 == nil && err2 == nil {
 				if _, ok := cardMap[cIdx]; !ok {
-					cardMap[cIdx] = &CardMeta{Index: cIdx, PCMSlots: make(map[int]bool)}
+					cardMap[cIdx] = &CardMeta{Index: cIdx, PCMSlots: make(map[int]*PCMCapability)}
 				}
-				cardMap[cIdx].PCMSlots[dIdx] = true
+				cap, ok := cardMap[cIdx].PCMSlots[dIdx]
+				if !ok {
+					cap = &PCMCapability{}
+					cardMap[cIdx].PCMSlots[dIdx] = cap
+				}
+				if dir == "p" {
+					cap.Playback = true
+				} else if dir == "c" {
+					cap.Capture = true
+				}
 			}
 		}
 	}
@@ -123,7 +141,7 @@ func DiscoverWithRoots(sysRoot, procRoot string) ([]DiscoveredDevice, error) {
 
 		meta, hasMeta := cardMap[cardIdx]
 		if !hasMeta {
-			meta = &CardMeta{Index: cardIdx, PCMSlots: make(map[int]bool)}
+			meta = &CardMeta{Index: cardIdx, PCMSlots: make(map[int]*PCMCapability)}
 			cardMap[cardIdx] = meta
 		}
 
@@ -155,6 +173,12 @@ func DiscoverWithRoots(sysRoot, procRoot string) ([]DiscoveredDevice, error) {
 		sort.Ints(devIndices)
 
 		for _, dIdx := range devIndices {
+			canPlay := true
+			canCap := true
+			if cap, ok := meta.PCMSlots[dIdx]; ok {
+				canPlay = cap.Playback
+				canCap = cap.Capture
+			}
 			dev := DiscoveredDevice{
 				CardIndex:   cardIdx,
 				DeviceIndex: dIdx,
@@ -164,6 +188,8 @@ func DiscoverWithRoots(sysRoot, procRoot string) ([]DiscoveredDevice, error) {
 				ProductID:   pid,
 				Serial:      serial,
 				BusPath:     busPath,
+				CanPlayback: canPlay,
+				CanCapture:  canCap,
 			}
 
 			canonicalURN, tier := GenerateURN(dev)
@@ -181,6 +207,8 @@ func DiscoverWithRoots(sysRoot, procRoot string) ([]DiscoveredDevice, error) {
 				DeviceIndex: 0,
 				CardID:      meta.ID,
 				CardName:    meta.Name,
+				CanPlayback: true,
+				CanCapture:  true,
 			}
 			canonicalURN, tier := GenerateURN(dev)
 			dev.URN = canonicalURN

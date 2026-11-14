@@ -2,6 +2,7 @@ package dsp
 
 import (
 	"encoding/binary"
+	"sync"
 	"testing"
 	"time"
 )
@@ -116,5 +117,182 @@ func TestDTX_Disabled(t *testing.T) {
 	}
 	if dtx.SuppressedPackets() != 0 {
 		t.Fatalf("expected 0 suppressed packets when disabled, got %d", dtx.SuppressedPackets())
+	}
+}
+
+func TestDTX_DefaultConfigAndExtendedHangover(t *testing.T) {
+	// 1. Assert default configuration values
+	cfg := DefaultDTXConfig()
+	if cfg.HangoverDuration != 5*time.Second {
+		t.Fatalf("expected DefaultDTXConfig.HangoverDuration == 5s, got %v", cfg.HangoverDuration)
+	}
+	if cfg.FrameDuration != 20*time.Millisecond {
+		t.Fatalf("expected DefaultDTXConfig.FrameDuration == 20ms, got %v", cfg.FrameDuration)
+	}
+
+	dtx := NewDTXController(cfg)
+	if dtx.hangoverFrames != 250 {
+		t.Fatalf("expected dtx.hangoverFrames == 250, got %d", dtx.hangoverFrames)
+	}
+
+	// 2. Test fallback behavior when HangoverDuration <= 0
+	fallbackCases := []struct {
+		name string
+		cfg  DTXConfig
+	}{
+		{
+			name: "ZeroHangoverDuration",
+			cfg: DTXConfig{
+				Enabled:          true,
+				SilenceThreshold: -50.0,
+				HangoverDuration: 0,
+				FrameDuration:    20 * time.Millisecond,
+			},
+		},
+		{
+			name: "NegativeHangoverDuration",
+			cfg: DTXConfig{
+				Enabled:          true,
+				SilenceThreshold: -50.0,
+				HangoverDuration: -1 * time.Second,
+				FrameDuration:    20 * time.Millisecond,
+			},
+		},
+		{
+			name: "EmptyConfig",
+			cfg: DTXConfig{
+				Enabled: true,
+			},
+		},
+	}
+
+	for _, tc := range fallbackCases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctrl := NewDTXController(tc.cfg)
+			if ctrl.config.HangoverDuration != 5*time.Second {
+				t.Fatalf("%s: expected config.HangoverDuration fallback to 5s, got %v", tc.name, ctrl.config.HangoverDuration)
+			}
+			if ctrl.hangoverFrames != 250 {
+				t.Fatalf("%s: expected hangoverFrames == 250, got %d", tc.name, ctrl.hangoverFrames)
+			}
+		})
+	}
+
+	// 3. Assert state transitions with 250 hangover frames:
+	// Feeding 249 frames of silence after active audio stays in Hangover state,
+	// and the 250th frame enters Silence state and triggers SID.
+	samplesPerFrame := 960 // 20ms at 48kHz mono
+	activeFrame := makeFrame(samplesPerFrame, 10000)
+	silentFrame := makeFrame(samplesPerFrame, 0)
+
+	// Step into Active state
+	send, isSID, _ := dtx.ProcessFrame(activeFrame, 1)
+	if !send || isSID {
+		t.Fatalf("active frame: expected send=true, isSID=false, got send=%v, isSID=%v", send, isSID)
+	}
+	if dtx.State() != DTXStateActive {
+		t.Fatalf("expected state Active, got %v", dtx.State())
+	}
+
+	// Feed 249 frames of silence -> must remain in Hangover state, send=true, isSID=false
+	for i := 1; i <= 249; i++ {
+		send, isSID, _ = dtx.ProcessFrame(silentFrame, 1)
+		if !send || isSID {
+			t.Fatalf("silence frame %d: expected send=true, isSID=false, got send=%v, isSID=%v", i, send, isSID)
+		}
+		if dtx.State() != DTXStateHangover {
+			t.Fatalf("silence frame %d: expected state Hangover, got %v", i, dtx.State())
+		}
+	}
+
+	// 250th frame of silence -> enters Silence state and triggers SID descriptor
+	send, isSID, _ = dtx.ProcessFrame(silentFrame, 1)
+	if !send || !isSID {
+		t.Fatalf("250th silence frame: expected send=true, isSID=true (SID trigger), got send=%v, isSID=%v", send, isSID)
+	}
+	if dtx.State() != DTXStateSilence {
+		t.Fatalf("expected state Silence on 250th frame, got %v", dtx.State())
+	}
+}
+
+func TestDTX_ConcurrentAccess(t *testing.T) {
+	cfg := DefaultDTXConfig()
+	dtx := NewDTXController(cfg)
+	silentFrame := makeFrame(960, 0)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Reader goroutines querying telemetry
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = dtx.State()
+					_ = dtx.LastMetrics()
+					_ = dtx.SuppressedPackets()
+				}
+			}
+		}()
+	}
+
+	// Worker stepping the frame processing hot path
+	for i := 0; i < 500; i++ {
+		dtx.ProcessFrame(silentFrame, 1)
+	}
+
+	close(stop)
+	wg.Wait()
+}
+
+func TestDTX_SilenceThresholdAndHysteresis(t *testing.T) {
+	cfg := DefaultDTXConfig()
+	if cfg.SilenceThreshold != -75.0 {
+		t.Fatalf("expected DefaultDTXConfig.SilenceThreshold == -75.0, got %v", cfg.SilenceThreshold)
+	}
+
+	ctrl := NewDTXController(DTXConfig{Enabled: true})
+	if ctrl.config.SilenceThreshold != -75.0 {
+		t.Fatalf("expected NewDTXController fallback SilenceThreshold == -75.0, got %v", ctrl.config.SilenceThreshold)
+	}
+
+	// 960 samples mono
+	samplesPerFrame := 960
+	// amp 7 gives ~ -73.4 dBFS (above -75 dBFS activation threshold)
+	activeFrame := makeFrame(samplesPerFrame, 7)
+	// amp 5 gives ~ -76.3 dBFS (between -75 dBFS and -78 dBFS hysteresis threshold)
+	hysteresisFrame := makeFrame(samplesPerFrame, 5)
+	// amp 2 gives ~ -84.3 dBFS (below -78 dBFS deactivation threshold)
+	quietFrame := makeFrame(samplesPerFrame, 2)
+
+	// 1. Initial quiet frame should not activate
+	ctrl.ProcessFrame(quietFrame, 1)
+	if ctrl.State() == DTXStateActive {
+		t.Fatalf("quiet frame should not activate DTX controller")
+	}
+
+	// 2. Active frame (> -75 dBFS) activates
+	ctrl.ProcessFrame(activeFrame, 1)
+	if ctrl.State() != DTXStateActive {
+		t.Fatalf("activeFrame (~-73.4 dBFS) should transition to Active, got %v", ctrl.State())
+	}
+
+	// 3. Fluctuation into hysteresis zone (~-76.3 dBFS) should REMAIN Active (not chatter to Hangover)
+	for i := 0; i < 10; i++ {
+		ctrl.ProcessFrame(hysteresisFrame, 1)
+		if ctrl.State() != DTXStateActive {
+			t.Fatalf("frame %d: hysteresisFrame (~-76.3 dBFS) should stay Active via hysteresis, got %v", i, ctrl.State())
+		}
+	}
+
+	// 4. True drop below hysteresis threshold (~-84.3 dBFS) transitions to Hangover
+	ctrl.ProcessFrame(quietFrame, 1)
+	if ctrl.State() != DTXStateHangover {
+		t.Fatalf("quietFrame (~-84.3 dBFS) should transition to Hangover, got %v", ctrl.State())
 	}
 }

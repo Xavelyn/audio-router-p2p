@@ -121,7 +121,7 @@ func TestStreamManager(t *testing.T) {
 	if _, ok := stats["test-route-1"]; !ok {
 		t.Errorf("expected stats for test-route-1")
 	}
-	wantID := streamer.DeriveStreamID(cfg.AuthToken, "route:"+route.ID)
+	wantID := streamer.DeriveStreamID(cfg.AuthToken, route.ID)
 	if got := sm.routes[route.ID].st.StreamID(); got != wantID {
 		t.Fatalf("route stream ID = %x, want %x", got, wantID)
 	}

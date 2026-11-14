@@ -50,6 +50,8 @@ type StreamLinkStats struct {
 	JitterTargetDelayMS float64 `json:"jitter_target_delay_ms"`
 	Underruns           uint64  `json:"underruns"`
 	Overruns            uint64  `json:"overruns"`
+	LatePackets         uint64  `json:"late_packets"`
+	EarlyPackets        uint64  `json:"early_packets"` // dead counter, retained for backward compatibility
 	FECRecovered        uint64  `json:"fec_recovered"`
 	PLCConcealed        uint64  `json:"plc_concealed"`
 }
@@ -72,16 +74,16 @@ type PeerLinkHealth struct {
 
 // NetworkHealthSnapshot provides an atomic point-in-time view of network health.
 type NetworkHealthSnapshot struct {
-	NodeID          string                    `json:"node_id"`
-	Timestamp       time.Time                 `json:"timestamp"`
-	HealthScore     float64                   `json:"health_score"`
-	HealthGrade     NodeHealthGrade           `json:"health_grade"`
-	Cluster         DiscoveryHealth           `json:"cluster"`
-	Sync            ClockSyncHealth           `json:"sync"`
-	LatencyMatrix   map[string]float64        `json:"latency_matrix"` // peer_id -> RTT in ms
-	Peers           map[string]PeerLinkHealth `json:"peers"`
-	Streams         map[string]StreamLinkStats`json:"streams,omitempty"`
-	LocalUnderruns  uint64                    `json:"local_underruns"`
+	NodeID         string                     `json:"node_id"`
+	Timestamp      time.Time                  `json:"timestamp"`
+	HealthScore    float64                    `json:"health_score"`
+	HealthGrade    NodeHealthGrade            `json:"health_grade"`
+	Cluster        DiscoveryHealth            `json:"cluster"`
+	Sync           ClockSyncHealth            `json:"sync"`
+	LatencyMatrix  map[string]float64         `json:"latency_matrix"` // peer_id -> RTT in ms
+	Peers          map[string]PeerLinkHealth  `json:"peers"`
+	Streams        map[string]StreamLinkStats `json:"streams,omitempty"`
+	LocalUnderruns uint64                     `json:"local_underruns"`
 }
 
 // NetworkHealthFrame represents a compact frame emitted over SSE / WebSocket channels.

@@ -25,9 +25,19 @@ type ChannelMeter struct {
 // StreamMeterFrame captures real-time meter telemetry for a stream across all channels.
 type StreamMeterFrame struct {
 	StreamID    string         `json:"stream_id"`
-	TimestampNS int64          `json:"timestamp_ns"`
-	DTXState    string         `json:"dtx_state"`
+	TimestampNS int64          `json:"timestamp_ns,omitempty"`
+	DTXState    string         `json:"dtx_state,omitempty"`
 	Channels    []ChannelMeter `json:"channels"`
+	Closed      bool           `json:"closed,omitempty"`
+	Timestamp   int64          `json:"timestamp,omitempty"`
+}
+
+// TombstoneFrame captures a stream teardown event signaling stream closure to subscribers.
+type TombstoneFrame struct {
+	StreamID  string         `json:"stream_id"`
+	Channels  []ChannelMeter `json:"channels"`
+	Closed    bool           `json:"closed"`
+	Timestamp int64          `json:"timestamp"`
 }
 
 // MeterFrame is an alias for StreamMeterFrame.
@@ -104,6 +114,7 @@ type StreamTap struct {
 	streamID string
 	channels []*AtomicChannelTap
 	dtxState atomic.Pointer[string]
+	closed   atomic.Bool
 }
 
 // NewStreamTap creates a tap with a designated number of audio channels.
@@ -132,6 +143,9 @@ func (st *StreamTap) StreamID() string {
 // RecordBlock updates all channel taps from interleaved 16-bit LE PCM data.
 // Executes with zero allocations and zero mutex locks.
 func (st *StreamTap) RecordBlock(pcm []byte, channels int) {
+	if st.closed.Load() {
+		return
+	}
 	numSamples := len(pcm) / 2
 	for i := 0; i < numSamples; i++ {
 		ch := i % channels
@@ -177,6 +191,7 @@ type Subscriber struct {
 	Ch            chan []byte
 	DroppedFrames atomic.Uint64
 	closed        atomic.Bool
+	LocalOnly     bool
 }
 
 // Client is an alias for Subscriber.
@@ -233,10 +248,23 @@ func (h *TelemetryHub) RegisterTap(streamID string, channels int) *StreamTap {
 	return tap
 }
 
-// UnregisterTap removes a stream tap.
+// UnregisterTap removes a stream tap and broadcasts a tombstone frame to all active subscribers.
 func (h *TelemetryHub) UnregisterTap(streamID string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	tap, exists := h.taps[streamID]
+	if exists && tap != nil {
+		tap.closed.Store(true)
+	}
+
+	// Generate and broadcast tombstone frame before deleting the tap
+	if len(h.subscribers) > 0 {
+		now := time.Now().UnixMilli()
+		msg := FormatTombstoneJSON(streamID, now)
+		h.broadcastLocked(msg)
+	}
+
 	delete(h.taps, streamID)
 }
 
@@ -250,14 +278,25 @@ func (h *TelemetryHub) GetTap(streamID string) (*StreamTap, bool) {
 
 // Subscribe registers a new subscriber with a bounded channel (default capacity 4).
 func (h *TelemetryHub) Subscribe(bufCap ...int) *Subscriber {
+	return h.subscribeWithOpts(false, bufCap...)
+}
+
+// SubscribeLocalOnly registers a new subscriber that only receives frames generated from local taps.
+// Relayed frames from remote cluster peers are skipped to prevent network echo loops.
+func (h *TelemetryHub) SubscribeLocalOnly(bufCap ...int) *Subscriber {
+	return h.subscribeWithOpts(true, bufCap...)
+}
+
+func (h *TelemetryHub) subscribeWithOpts(localOnly bool, bufCap ...int) *Subscriber {
 	capSize := 4
 	if len(bufCap) > 0 && bufCap[0] > 0 {
 		capSize = bufCap[0]
 	}
 	subID := fmt.Sprintf("sub-%d", h.nextSubID.Add(1))
 	sub := &Subscriber{
-		ID: subID,
-		Ch: make(chan []byte, capSize),
+		ID:        subID,
+		Ch:        make(chan []byte, capSize),
+		LocalOnly: localOnly,
 	}
 
 	h.mu.Lock()
@@ -288,12 +327,40 @@ func (h *TelemetryHub) SubscriberCount() int {
 	return len(h.subscribers)
 }
 
+// broadcastLocked dispatches a payload to all subscribers using non-blocking drop-on-lag fan-out.
+// Caller must hold h.mu for reading or writing.
+func (h *TelemetryHub) broadcastLocked(msg []byte) {
+	for _, client := range h.subscribers {
+		select {
+		case client.Ch <- msg:
+			// Frame delivered
+		default:
+			// Slow consumer: drop frame to prevent backpressure
+			client.DroppedFrames.Add(1)
+		}
+	}
+}
+
 // Broadcast dispatches a meter message to all subscribers using non-blocking drop-on-lag fan-out.
 func (h *TelemetryHub) Broadcast(msg []byte) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	h.broadcastLocked(msg)
+}
 
+// BroadcastRelayed dispatches a relayed meter message originating from a remote cluster peer
+// to regular frontend subscribers, suppressing delivery to LocalOnly relay connections.
+func (h *TelemetryHub) BroadcastRelayed(msg []byte) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.broadcastRelayedLocked(msg)
+}
+
+func (h *TelemetryHub) broadcastRelayedLocked(msg []byte) {
 	for _, client := range h.subscribers {
+		if client.LocalOnly {
+			continue
+		}
 		select {
 		case client.Ch <- msg:
 			// Frame delivered
@@ -353,6 +420,10 @@ func (h *TelemetryHub) tick() {
 
 	now := time.Now().UnixNano()
 	for _, tap := range taps {
+		if tap.closed.Load() {
+			continue
+		}
+
 		frame := tap.Snapshot(now)
 		bufPtr := h.pool.Get().(*[]byte)
 		*bufPtr = (*bufPtr)[:0]
@@ -363,7 +434,13 @@ func (h *TelemetryHub) tick() {
 		copy(msg, *bufPtr)
 		h.pool.Put(bufPtr)
 
-		h.Broadcast(msg)
+		// Synchronize with UnregisterTap under RLock: if tap was unregistered while
+		// serializing, drop the frame to guarantee no meter frame arrives after a tombstone.
+		h.mu.RLock()
+		if _, exists := h.taps[tap.streamID]; exists && !tap.closed.Load() {
+			h.broadcastLocked(msg)
+		}
+		h.mu.RUnlock()
 	}
 }
 
@@ -413,4 +490,22 @@ func AppendMeterFrameJSON(dst []byte, frame *StreamMeterFrame) []byte {
 	}
 	dst = append(dst, `]}`...)
 	return dst
+}
+
+// AppendTombstoneJSON encodes a tombstone frame directly into dst without heap allocations.
+func AppendTombstoneJSON(dst []byte, streamID string, timestamp int64) []byte {
+	dst = append(dst, `{"stream_id":"`...)
+	dst = append(dst, streamID...)
+	dst = append(dst, `","channels":[],"closed":true,"timestamp":`...)
+	dst = strconv.AppendInt(dst, timestamp, 10)
+	dst = append(dst, '}')
+	return dst
+}
+
+// FormatTombstoneJSON formats a tombstone frame JSON payload for stream unregistration.
+// Preallocates 80 + len(streamID) bytes: 57 bytes boilerplate + max 20 digits for int64.
+// Guarantees zero internal slice reallocations.
+func FormatTombstoneJSON(streamID string, timestamp int64) []byte {
+	b := make([]byte, 0, 80+len(streamID))
+	return AppendTombstoneJSON(b, streamID, timestamp)
 }

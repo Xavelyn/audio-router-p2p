@@ -16,7 +16,9 @@ import (
 	"time"
 
 	"github.com/audio-router-p2p/internal/config"
+	"github.com/audio-router-p2p/pkg/audio"
 	"github.com/audio-router-p2p/pkg/audio/urn"
+	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/discovery"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/streamer"
@@ -82,11 +84,14 @@ type Room struct {
 	members   map[string]*RoomMember // keyed by peer ID
 	localID   string
 	cfg       *config.Config
-	disc      *discovery.Discovery
+	disc      DiscoveryProvider
 	syncMgr   *syncmgr.Manager
 	transport streamer.Transport
 	router    *router.Router
 	streamMgr StreamManager
+
+	clusterMgr  ClusterDeviceProvider
+	devResolver LocalDeviceResolver
 
 	inputs         []string
 	outputs        []string
@@ -110,17 +115,36 @@ type Room struct {
 	onStateChange  func(RoomState)
 }
 
+// ClusterDeviceProvider enables room route resolution across cluster nodes.
+type ClusterDeviceProvider interface {
+	GetSnapshot() *cluster.ClusterSnapshot
+}
+
+// LocalDeviceResolver resolves local hardware or virtual audio devices.
+type LocalDeviceResolver interface {
+	Resolve(ref string) (audio.Device, bool)
+}
+
+// DiscoveryProvider provides peer topology and live peer membership.
+type DiscoveryProvider interface {
+	Peers() []discovery.Peer
+	LivePeers() []discovery.Peer
+	NodeID() string
+}
+
 // RoomConfig holds the configuration for creating a room
 type RoomConfig struct {
-	ID            RoomID
-	Name          string
-	LocalPeerID   string
-	Config        *config.Config
-	Discovery     *discovery.Discovery
-	SyncManager   *syncmgr.Manager
-	Transport     streamer.Transport
-	Router        *router.Router
-	StreamManager StreamManager
+	ID             RoomID
+	Name           string
+	LocalPeerID    string
+	Config         *config.Config
+	Discovery      DiscoveryProvider
+	SyncManager    *syncmgr.Manager
+	Transport      streamer.Transport
+	Router         *router.Router
+	StreamManager  StreamManager
+	ClusterManager ClusterDeviceProvider
+	DeviceResolver LocalDeviceResolver
 }
 
 // NewRoom creates a new room
@@ -143,6 +167,8 @@ func NewRoom(cfg RoomConfig) *Room {
 		transport:      cfg.Transport,
 		router:         cfg.Router,
 		streamMgr:      cfg.StreamManager,
+		clusterMgr:     cfg.ClusterManager,
+		devResolver:    cfg.DeviceResolver,
 		inputs:         make([]string, 0),
 		outputs:        make([]string, 0),
 		latencyPreset:  string(streamer.LatencyPresetBalanced),
@@ -156,6 +182,27 @@ func NewRoom(cfg RoomConfig) *Room {
 	return r
 }
 
+// SetClusterManager updates the cluster manager and re-synthesizes routes.
+func (r *Room) SetClusterManager(cm ClusterDeviceProvider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.clusterMgr = cm
+	r.recompileRoutesLocked()
+}
+
+// SetDeviceResolver updates the local device resolver and re-synthesizes routes.
+func (r *Room) SetDeviceResolver(res LocalDeviceResolver) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.devResolver = res
+	r.recompileRoutesLocked()
+}
+
+// SetLeader updates the current room leader peer ID.
+func (r *Room) SetLeader(leader string) {
+	r.leader.Store(leader)
+}
+
 func generateRoomID() string {
 	b := make([]byte, 8)
 	rand.Read(b)
@@ -166,7 +213,18 @@ func generateRoomID() string {
 func (r *Room) ID() RoomID { return r.id }
 
 // Name returns the room name
-func (r *Room) Name() string { return r.name }
+func (r *Room) Name() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.name
+}
+
+// SetName safely updates the room display name.
+func (r *Room) SetName(name string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.name = name
+}
 
 // State returns the current room state
 func (r *Room) State() RoomState { return r.state.Load().(RoomState) }
@@ -176,6 +234,61 @@ func (r *Room) Leader() string { return r.leader.Load().(string) }
 
 // IsLeader returns true if we are the leader
 func (r *Room) IsLeader() bool { return r.Leader() == r.localID }
+
+// IsLocalOnly reports whether the room is strictly local-only (all assigned inputs and outputs are local endpoints).
+func (r *Room) IsLocalOnly() bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.isLocalOnlyLocked()
+}
+
+// canonicalNodeIDLocked returns the effective node identifier, normalizing "local" or empty
+// strings to r.localID when available, or "local" as a fallback sentinel.
+func (r *Room) canonicalNodeIDLocked(nodeID string) string {
+	if nodeID == "" || nodeID == "local" {
+		if r.localID != "" {
+			return r.localID
+		}
+		return "local"
+	}
+	return nodeID
+}
+
+// isLocalNodeLocked reports whether nodeID represents the local node.
+func (r *Room) isLocalNodeLocked(nodeID string) bool {
+	return nodeID == "local" || (r.localID != "" && nodeID == r.localID)
+}
+
+func (r *Room) singleOwningNodeLocked() (string, bool) {
+	if len(r.inputs) == 0 && len(r.outputs) == 0 {
+		return "", false
+	}
+	var owner string
+	for _, dev := range r.inputs {
+		rawNode, _ := r.resolveDeviceEndpointLocked(dev)
+		nodeID := r.canonicalNodeIDLocked(rawNode)
+		if owner == "" {
+			owner = nodeID
+		} else if nodeID != owner {
+			return "", false
+		}
+	}
+	for _, dev := range r.outputs {
+		rawNode, _ := r.resolveDeviceEndpointLocked(dev)
+		nodeID := r.canonicalNodeIDLocked(rawNode)
+		if owner == "" {
+			owner = nodeID
+		} else if nodeID != owner {
+			return "", false
+		}
+	}
+	return owner, true
+}
+
+func (r *Room) isLocalOnlyLocked() bool {
+	owner, ok := r.singleOwningNodeLocked()
+	return ok && r.isLocalNodeLocked(owner)
+}
 
 // Transport returns the streamer transport configured for this room.
 func (r *Room) Transport() streamer.Transport {
@@ -345,26 +458,34 @@ func (r *Room) SetOutputGain(deviceID string, gain float64) {
 // Supports both AddInput(deviceID) and AddInput(roomID, deviceID).
 func (r *Room) AddInput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
+	log.Printf("[ROOM:ROUTE] AddInput called: room=%s devID=%q", r.id, devID)
 	for _, id := range r.inputs {
 		if id == devID {
+			log.Printf("[ROOM:ROUTE] devID=%q already bound to room=%s", devID, r.id)
+			r.mu.Unlock()
 			return nil
 		}
 	}
 	r.inputs = append(r.inputs, devID)
 	r.recompileRoutesLocked()
+	log.Printf("[ROOM:ROUTE] AddInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+	r.mu.Unlock()
+	r.recomputeLeader()
 	return nil
 }
 
@@ -372,31 +493,48 @@ func (r *Room) AddInput(args ...string) error {
 // Supports both RemoveInput(deviceID) and RemoveInput(roomID, deviceID).
 func (r *Room) RemoveInput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
-	idx := -1
-	for i, id := range r.inputs {
-		if id == devID {
-			idx = i
-			break
+	log.Printf("[ROOM:ROUTE] RemoveInput called: room=%s devID=%q", r.id, devID)
+	localNodeID := r.localID
+	var remaining []string
+	removedAny := false
+	for _, id := range r.inputs {
+		if EndpointMatches(localNodeID, id, devID) {
+			removedAny = true
+			delete(r.inputGains, id)
+			delete(r.inputGains, devID)
+		} else {
+			remaining = append(remaining, id)
 		}
 	}
-	if idx >= 0 {
-		r.inputs = append(r.inputs[:idx], r.inputs[idx+1:]...)
-		delete(r.inputGains, devID)
-		r.recompileRoutesLocked()
+	for gKey := range r.inputGains {
+		if EndpointMatches(localNodeID, gKey, devID) {
+			delete(r.inputGains, gKey)
+		}
 	}
+	if removedAny {
+		r.inputs = remaining
+		r.recompileRoutesLocked()
+		log.Printf("[ROOM:ROUTE] RemoveInput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+		r.mu.Unlock()
+		r.recomputeLeader()
+		return nil
+	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -404,26 +542,34 @@ func (r *Room) RemoveInput(args ...string) error {
 // Supports both AddOutput(deviceID) and AddOutput(roomID, deviceID).
 func (r *Room) AddOutput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
+	log.Printf("[ROOM:ROUTE] AddOutput called: room=%s devID=%q", r.id, devID)
 	for _, id := range r.outputs {
 		if id == devID {
+			log.Printf("[ROOM:ROUTE] devID=%q already bound to room=%s", devID, r.id)
+			r.mu.Unlock()
 			return nil
 		}
 	}
 	r.outputs = append(r.outputs, devID)
 	r.recompileRoutesLocked()
+	log.Printf("[ROOM:ROUTE] AddOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+	r.mu.Unlock()
+	r.recomputeLeader()
 	return nil
 }
 
@@ -431,31 +577,48 @@ func (r *Room) AddOutput(args ...string) error {
 // Supports both RemoveOutput(deviceID) and RemoveOutput(roomID, deviceID).
 func (r *Room) RemoveOutput(args ...string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	if len(args) == 0 {
+		r.mu.Unlock()
 		return errors.New("device ID required")
 	}
 	devID := args[len(args)-1]
 	if devID == "" {
+		r.mu.Unlock()
 		return errors.New("device ID cannot be empty")
 	}
 	if len(args) >= 2 && args[0] != "" && args[0] != string(r.id) {
+		r.mu.Unlock()
 		return fmt.Errorf("room ID mismatch: %s != %s", args[0], r.id)
 	}
 
-	idx := -1
-	for i, id := range r.outputs {
-		if id == devID {
-			idx = i
-			break
+	log.Printf("[ROOM:ROUTE] RemoveOutput called: room=%s devID=%q", r.id, devID)
+	localNodeID := r.localID
+	var remaining []string
+	removedAny := false
+	for _, id := range r.outputs {
+		if EndpointMatches(localNodeID, id, devID) {
+			removedAny = true
+			delete(r.outputGains, id)
+			delete(r.outputGains, devID)
+		} else {
+			remaining = append(remaining, id)
 		}
 	}
-	if idx >= 0 {
-		r.outputs = append(r.outputs[:idx], r.outputs[idx+1:]...)
-		delete(r.outputGains, devID)
-		r.recompileRoutesLocked()
+	for gKey := range r.outputGains {
+		if EndpointMatches(localNodeID, gKey, devID) {
+			delete(r.outputGains, gKey)
+		}
 	}
+	if removedAny {
+		r.outputs = remaining
+		r.recompileRoutesLocked()
+		log.Printf("[ROOM:ROUTE] RemoveOutput completed: room=%s devID=%q (inputs=%v, outputs=%v)", r.id, devID, r.inputs, r.outputs)
+		r.mu.Unlock()
+		r.recomputeLeader()
+		return nil
+	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -485,7 +648,10 @@ func (r *Room) SetLatencyPreset(preset string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.latencyPreset = string(p)
+	if r.latencyPreset != string(p) {
+		r.latencyPreset = string(p)
+		r.clearCompiledRoutesLocked()
+	}
 	r.recompileRoutesLocked()
 	return nil
 }
@@ -522,19 +688,18 @@ func (r *Room) SetRoomSync(args ...any) error {
 // SetBindings replaces inputs, outputs, and sync state atomically.
 func (r *Room) SetBindings(inputs, outputs []string, synced bool) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-
 	r.inputs = cleanDeviceList(inputs)
 	r.outputs = cleanDeviceList(outputs)
 	r.synced = synced
 	r.recompileRoutesLocked()
+	r.mu.Unlock()
+	r.recomputeLeader()
 }
 
 // SetRoomBindings updates inputs, outputs, and sync state.
 // Accepts (inputs, outputs []string, synced bool) or (roomID string, inputs, outputs []string, synced bool).
 func (r *Room) SetRoomBindings(args ...any) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
 	var inputs, outputs []string
 	var synced bool
@@ -542,29 +707,37 @@ func (r *Room) SetRoomBindings(args ...any) error {
 	if len(args) == 3 {
 		var ok bool
 		if inputs, ok = args[0].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("inputs must be []string")
 		}
 		if outputs, ok = args[1].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("outputs must be []string")
 		}
 		if synced, ok = args[2].(bool); !ok {
+			r.mu.Unlock()
 			return errors.New("synced must be bool")
 		}
 	} else if len(args) == 4 {
 		if roomID, ok := args[0].(string); ok && roomID != "" && roomID != string(r.id) {
+			r.mu.Unlock()
 			return fmt.Errorf("room ID mismatch: %s != %s", roomID, r.id)
 		}
 		var ok bool
 		if inputs, ok = args[1].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("inputs must be []string")
 		}
 		if outputs, ok = args[2].([]string); !ok {
+			r.mu.Unlock()
 			return errors.New("outputs must be []string")
 		}
 		if synced, ok = args[3].(bool); !ok {
+			r.mu.Unlock()
 			return errors.New("synced must be bool")
 		}
 	} else {
+		r.mu.Unlock()
 		return errors.New("invalid arguments for SetRoomBindings")
 	}
 
@@ -572,6 +745,8 @@ func (r *Room) SetRoomBindings(args ...any) error {
 	r.outputs = cleanDeviceList(outputs)
 	r.synced = synced
 	r.recompileRoutesLocked()
+	r.mu.Unlock()
+	r.recomputeLeader()
 	return nil
 }
 
@@ -602,30 +777,252 @@ func (r *Room) clearCompiledRoutesLocked() {
 	r.compiledRoutes = make(map[string]struct{})
 }
 
+func (r *Room) resolveDeviceEndpointLocked(devRef string) (nodeID, cleanDevID string) {
+	devRef = strings.TrimSpace(devRef)
+	if devRef == "" {
+		return "local", ""
+	}
+
+	// Step 1: Explicit canonical slash prefix "<node_id>/<device_id>"
+	if !strings.HasPrefix(devRef, "urn:") {
+		if slash := strings.Index(devRef, "/"); slash > 0 {
+			parsedNode := strings.TrimSpace(devRef[:slash])
+			parsedDev := strings.TrimSpace(devRef[slash+1:])
+			if parsedDev != "" {
+				// If parsed node is already local, return local
+				if parsedNode == "local" || (r.localID != "" && parsedNode == r.localID) {
+					if r.localID != "" {
+						return r.localID, parsedDev
+					}
+					return "local", parsedDev
+				}
+
+				// Only perform reconciliation if discovery or cluster manager is configured
+				if r.disc != nil || r.clusterMgr != nil {
+					isPeerLive := false
+					if r.disc != nil {
+						for _, peer := range r.disc.LivePeers() {
+							if peer.ID == parsedNode {
+								isPeerLive = true
+								break
+							}
+						}
+						if !isPeerLive {
+							for _, peer := range r.disc.Peers() {
+								if peer.ID == parsedNode {
+									isPeerLive = true
+									break
+								}
+							}
+						}
+					}
+					if !isPeerLive && r.clusterMgr != nil {
+						if snap := r.clusterMgr.GetSnapshot(); snap != nil {
+							if snap.Nodes != nil {
+								if _, exists := snap.Nodes[parsedNode]; exists {
+									isPeerLive = true
+								}
+							}
+							if !isPeerLive && snap.ClusterDevices != nil {
+								for _, cd := range snap.ClusterDevices {
+									if cd.NodeID == parsedNode {
+										isPeerLive = true
+										break
+									}
+								}
+							}
+						}
+					}
+					if !isPeerLive && r.members != nil {
+						if _, exists := r.members[parsedNode]; exists {
+							isPeerLive = true
+						}
+					}
+
+					// If parsedNode is NOT an active live peer in the cluster, check if parsedDev exists locally
+					if !isPeerLive {
+						isLocalDev := false
+						if r.devResolver != nil {
+							_, isLocalDev = r.devResolver.Resolve(parsedDev)
+						} else if gr := audio.GlobalResolver(); gr != nil {
+							_, isLocalDev = gr.Resolve(parsedDev)
+						}
+						if !isLocalDev && r.devResolver == nil && (strings.HasPrefix(parsedDev, "urn:audio:hw:") || strings.HasPrefix(parsedDev, "urn:audio:virt:")) {
+							isLocalDev = true
+						}
+
+						// Stale remote node prefix reconciled to active local node
+						if isLocalDev {
+							target := "local"
+							if r.localID != "" {
+								target = r.localID
+							}
+							log.Printf("[ROOM:RECONCILE] room=%s: reconciled stale node prefix %q -> local node %q for device %q",
+								r.id, parsedNode, target, parsedDev)
+							return target, parsedDev
+						}
+					}
+				}
+
+				return parsedNode, parsedDev
+			}
+		}
+	}
+
+	// Step 2: RFC 8141 node URN "urn:audio:node:<nodeID>:dev:<devID>"
+	const nodePrefix = "urn:audio:node:"
+	if strings.HasPrefix(devRef, nodePrefix) {
+		remainder := strings.TrimPrefix(devRef, nodePrefix)
+		if idx := strings.Index(remainder, ":dev:"); idx > 0 {
+			return remainder[:idx], remainder[idx+5:]
+		}
+	}
+
+	cleanDevID = devRef
+
+	// Step 3: Cluster snapshot consensus (prioritized over local)
+	if r.clusterMgr != nil {
+		if snap := r.clusterMgr.GetSnapshot(); snap != nil {
+			var matchingNodes []string
+			seenNodes := make(map[string]bool)
+			for _, cd := range snap.ClusterDevices {
+				if cd.URN == cleanDevID || cd.ID == cleanDevID || cd.DeviceID == cleanDevID {
+					if cd.NodeID != "" && !seenNodes[cd.NodeID] {
+						seenNodes[cd.NodeID] = true
+						matchingNodes = append(matchingNodes, cd.NodeID)
+					}
+				}
+			}
+			if len(matchingNodes) == 1 {
+				return matchingNodes[0], cleanDevID
+			} else if len(matchingNodes) > 1 {
+				// Deterministic tie-breaker: check if local node is an explicit cluster owner
+				hasLocal := false
+				for _, n := range matchingNodes {
+					if n == r.localID {
+						hasLocal = true
+						break
+					}
+				}
+				if hasLocal {
+					if r.localID != "" {
+						return r.localID, cleanDevID
+					}
+					return "local", cleanDevID
+				}
+				// If local node does not own it, select lowest lexicographical remote node
+				sort.Strings(matchingNodes)
+				return matchingNodes[0], cleanDevID
+			}
+		}
+	}
+
+	// Step 4: Local device resolver (r.devResolver / audio.GlobalResolver())
+	if r.devResolver != nil {
+		if _, ok := r.devResolver.Resolve(cleanDevID); ok {
+			if r.localID != "" {
+				return r.localID, cleanDevID
+			}
+			return "local", cleanDevID
+		}
+	} else if gr := audio.GlobalResolver(); gr != nil {
+		if _, ok := gr.Resolve(cleanDevID); ok {
+			if r.localID != "" {
+				return r.localID, cleanDevID
+			}
+			return "local", cleanDevID
+		}
+	}
+
+	// Host-bound physical hardware and virtual URNs unlisted in cluster snapshot are local
+	if strings.HasPrefix(cleanDevID, "urn:audio:hw:") || strings.HasPrefix(cleanDevID, "urn:audio:virt:") {
+		if r.localID != "" {
+			return r.localID, cleanDevID
+		}
+		return "local", cleanDevID
+	}
+
+	// Step 5: Fallback to single live peer in discovery (if 1 live peer exists), else r.localID, cleanDevID
+	if r.disc != nil {
+		live := r.disc.LivePeers()
+		if len(live) == 1 && live[0].ID != "" {
+			return live[0].ID, cleanDevID
+		}
+	}
+
+	if r.localID != "" {
+		return r.localID, cleanDevID
+	}
+	return "local", cleanDevID
+}
+
+// ResolveDeviceEndpoint resolves devRef to its owning nodeID and clean device ID.
+func (r *Room) ResolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.resolveDeviceEndpointLocked(devRef)
+}
+
+// resolveDeviceEndpoint resolves devRef to its owning nodeID and clean device ID.
+func (r *Room) resolveDeviceEndpoint(devRef string) (nodeID, cleanDevID string) {
+	return r.ResolveDeviceEndpoint(devRef)
+}
+
 func (r *Room) recompileRoutesLocked() {
 	if r.router == nil {
 		return
 	}
 
-	desired := make(map[string]router.MatrixRoute)
-	for _, inDev := range r.inputs {
-		for _, outDev := range r.outputs {
-			inKey := inDev
-			if strings.Contains(inDev, ":") {
-				inKey = urn.Checksum(inDev)
-			}
-			outKey := outDev
-			if strings.Contains(outDev, ":") {
-				outKey = urn.Checksum(outDev)
-			}
-			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, inKey, outKey)
+	log.Printf("[ROOM:ROUTE] Recompiling routes for room=%s (inputs=%v, outputs=%v)", r.id, r.inputs, r.outputs)
+
+	type endpoint struct {
+		raw        string
+		nodeID     string
+		cleanDevID string
+		key        string
+	}
+
+	endpointKey := func(nodeID, cleanDev string) string {
+		key := cleanDev
+		if strings.Contains(cleanDev, ":") {
+			key = urn.Checksum(cleanDev)
+		}
+		if nodeID != "" && nodeID != "local" {
+			key = nodeID + "-" + key
+		}
+		return key
+	}
+
+	// Pre-resolve endpoints: O(M + N) instead of O(M * N) inside the crossbar loop
+	resolvedInputs := make([]endpoint, len(r.inputs))
+	for i, inDev := range r.inputs {
+		nodeID, cleanDev := r.resolveDeviceEndpointLocked(inDev)
+		key := endpointKey(nodeID, cleanDev)
+		resolvedInputs[i] = endpoint{raw: inDev, nodeID: nodeID, cleanDevID: cleanDev, key: key}
+	}
+
+	resolvedOutputs := make([]endpoint, len(r.outputs))
+	for i, outDev := range r.outputs {
+		nodeID, cleanDev := r.resolveDeviceEndpointLocked(outDev)
+		key := endpointKey(nodeID, cleanDev)
+		resolvedOutputs[i] = endpoint{raw: outDev, nodeID: nodeID, cleanDevID: cleanDev, key: key}
+	}
+
+	desired := make(map[string]router.MatrixRoute, len(resolvedInputs)*len(resolvedOutputs))
+	for _, in := range resolvedInputs {
+		for _, out := range resolvedOutputs {
+			routeID := fmt.Sprintf("room-%s-%s-%s", r.id, in.key, out.key)
 
 			inGain := 1.0
-			if g, ok := r.inputGains[inDev]; ok {
+			if g, ok := r.inputGains[in.raw]; ok {
+				inGain = g
+			} else if g, ok := r.inputGains[in.cleanDevID]; ok {
 				inGain = g
 			}
 			outGain := 1.0
-			if g, ok := r.outputGains[outDev]; ok {
+			if g, ok := r.outputGains[out.raw]; ok {
+				outGain = g
+			} else if g, ok := r.outputGains[out.cleanDevID]; ok {
 				outGain = g
 			}
 			totalGain := inGain * outGain
@@ -637,18 +1034,21 @@ func (r *Room) recompileRoutesLocked() {
 
 			coeffs := []float64{totalGain, 0.0, 0.0, totalGain}
 
+			log.Printf("[ROOM:ROUTE] Synthesized intra-room route=%s in=%s (%s) out=%s (%s) gain=%.2f",
+				routeID, in.cleanDevID, in.nodeID, out.cleanDevID, out.nodeID, totalGain)
+
 			desired[routeID] = router.MatrixRoute{
 				ID:   routeID,
-				Name: fmt.Sprintf("room-%s-%s-%s", r.id, inDev, outDev),
+				Name: fmt.Sprintf("room-%s-%s-%s", r.id, in.cleanDevID, out.cleanDevID),
 				Source: router.MatrixEndpoint{
-					NodeID:   "local",
-					DeviceID: inDev,
+					NodeID:   in.nodeID,
+					DeviceID: in.cleanDevID,
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},
 				Destination: router.MatrixEndpoint{
-					NodeID:   "local",
-					DeviceID: outDev,
+					NodeID:   out.nodeID,
+					DeviceID: out.cleanDevID,
 					Layout:   router.LayoutStereo,
 					Channels: []int{0, 1},
 				},
@@ -666,23 +1066,52 @@ func (r *Room) recompileRoutesLocked() {
 	// Remove routes no longer wanted
 	for oldID := range r.compiledRoutes {
 		if _, stillWanted := desired[oldID]; !stillWanted {
+			log.Printf("[ROOM:ROUTE] Stopping obsolete route=%s", oldID)
 			if r.streamMgr != nil {
-				_ = r.streamMgr.StopRoute(oldID)
+				if err := r.streamMgr.StopRoute(oldID); err != nil {
+					log.Printf("[ROOM:ROUTE] ERROR stopping stream route %s: %v", oldID, err)
+				}
 			}
-			_ = r.router.DeleteMatrix(oldID)
+			if err := r.router.DeleteMatrix(oldID); err != nil {
+				log.Printf("[ROOM:ROUTE] ERROR deleting matrix route %s: %v", oldID, err)
+			}
 			delete(r.compiledRoutes, oldID)
 		}
 	}
 
 	// Add or update desired routes
 	for routeID, mr := range desired {
-		_ = r.router.AddMatrix(mr)
+		if err := r.router.AddMatrix(mr); err != nil {
+			log.Printf("[ROOM:ROUTE] ERROR adding matrix route %s: %v", routeID, err)
+		}
+		if _, alreadyCompiled := r.compiledRoutes[routeID]; alreadyCompiled {
+			continue
+		}
 		r.compiledRoutes[routeID] = struct{}{}
 		if r.streamMgr != nil {
 			sr := router.MatrixRouteToStreamRoute(mr)
-			_ = r.streamMgr.StartRoute(sr)
+			log.Printf("[ROOM:ROUTE] Starting stream route=%s (srcURN=%s dstURN=%s dests=%v)",
+				sr.ID, sr.SourceDeviceURN, sr.DestDeviceURN, sr.Destinations)
+			if err := r.streamMgr.StartRoute(sr); err != nil {
+				log.Printf("[ROOM:ROUTE] CRITICAL: failed to start stream route %s: %v", routeID, err)
+				delete(r.compiledRoutes, routeID)
+			} else {
+				log.Printf("[ROOM:ROUTE] SUCCESS: stream route %s started", routeID)
+			}
 		}
 	}
+}
+
+// CompiledRoutes returns a slice of active compiled route IDs.
+func (r *Room) CompiledRoutes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	routes := make([]string, 0, len(r.compiledRoutes))
+	for id := range r.compiledRoutes {
+		routes = append(routes, id)
+	}
+	sort.Strings(routes)
+	return routes
 }
 
 // Members returns all current members
@@ -734,6 +1163,107 @@ func (r *Room) Leave() error {
 	return nil
 }
 
+// Close gracefully terminates the room and cleans up resources.
+func (r *Room) Close() error {
+	return r.Leave()
+}
+
+// RecompileRoutes manually triggers route re-synthesis across the crossbar matrix.
+func (r *Room) RecompileRoutes() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.recompileRoutesLocked()
+}
+
+// OnDeviceLifecycle reactively handles physical and virtual device arrival or teardown.
+func (r *Room) OnDeviceLifecycle(evt audio.DeviceLifecycleEvent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	switch evt.Type {
+	case audio.DeviceRemoved, audio.DeviceQuarantined:
+		changed := false
+		var remainingInputs []string
+		for _, in := range r.inputs {
+			matched := false
+			if evt.DeviceURN != "" && EndpointMatches(r.localID, in, evt.DeviceURN) {
+				matched = true
+			}
+			if !matched && evt.LegacyID != "" && EndpointMatches(r.localID, in, evt.LegacyID) {
+				matched = true
+			}
+			if matched {
+				changed = true
+				delete(r.inputGains, in)
+				if evt.DeviceURN != "" {
+					delete(r.inputGains, evt.DeviceURN)
+				}
+				if evt.LegacyID != "" {
+					delete(r.inputGains, evt.LegacyID)
+				}
+			} else {
+				remainingInputs = append(remainingInputs, in)
+			}
+		}
+
+		var remainingOutputs []string
+		for _, out := range r.outputs {
+			matched := false
+			if evt.DeviceURN != "" && EndpointMatches(r.localID, out, evt.DeviceURN) {
+				matched = true
+			}
+			if !matched && evt.LegacyID != "" && EndpointMatches(r.localID, out, evt.LegacyID) {
+				matched = true
+			}
+			if matched {
+				changed = true
+				delete(r.outputGains, out)
+				if evt.DeviceURN != "" {
+					delete(r.outputGains, evt.DeviceURN)
+				}
+				if evt.LegacyID != "" {
+					delete(r.outputGains, evt.LegacyID)
+				}
+			} else {
+				remainingOutputs = append(remainingOutputs, out)
+			}
+		}
+
+		if changed {
+			r.inputs = remainingInputs
+			r.outputs = remainingOutputs
+			r.recompileRoutesLocked()
+		}
+
+	case audio.DeviceCreated, audio.DeviceRestored:
+		hasMatch := false
+		for _, in := range r.inputs {
+			if (evt.DeviceURN != "" && EndpointMatches(r.localID, in, evt.DeviceURN)) ||
+				(evt.LegacyID != "" && EndpointMatches(r.localID, in, evt.LegacyID)) {
+				hasMatch = true
+				break
+			}
+		}
+		if !hasMatch {
+			for _, out := range r.outputs {
+				if (evt.DeviceURN != "" && EndpointMatches(r.localID, out, evt.DeviceURN)) ||
+					(evt.LegacyID != "" && EndpointMatches(r.localID, out, evt.LegacyID)) {
+					hasMatch = true
+					break
+				}
+			}
+		}
+		if hasMatch {
+			r.recompileRoutesLocked()
+		}
+	}
+}
+
+// OnDeviceLifecycleEvent implements audio.DeviceLifecycleListener.
+func (r *Room) OnDeviceLifecycleEvent(evt audio.DeviceLifecycleEvent) {
+	r.OnDeviceLifecycle(evt)
+}
+
 // SetCallbacks registers room event callbacks.
 // onMemberJoin/onMemberLeave receive member events;
 // onLeaderChange receives the new leader peer ID;
@@ -759,8 +1289,9 @@ func (r *Room) roomLoop() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	// immediately announce + recompute
+	// immediately announce + sync + recompute
 	r.announcePresence()
+	r.syncMembersFromDiscovery()
 	r.recomputeLeader()
 
 	for {
@@ -817,43 +1348,96 @@ func (r *Room) removeMember(id string) bool {
 		delete(r.members, id)
 	}
 	// Any membership change re-enters the Election phase until the next
-	// recompute converges on a leader again. recomputeLeader then restores
-	// RoomStateActive on the following tick.
-	if left != nil {
+	// recompute converges on a leader again. Single-node rooms are immune unless the owner leaves.
+	owner, isSingleNode := r.singleOwningNodeLocked()
+	ownerLeaves := !isSingleNode || id == owner || (owner == "local" && id == r.localID)
+	if left != nil && ownerLeaves {
 		r.state.Store(RoomState(RoomStateElection))
 	}
+
+	cbState := r.onStateChange
+	cbLeave := r.onMemberLeave
 	r.mu.Unlock()
 
 	// Only fire the member/state events after the mutation is visible.
 	if left != nil && id != r.localID {
-		if r.onStateChange != nil {
-			r.onStateChange(RoomStateElection)
+		if cbState != nil && ownerLeaves {
+			cbState(RoomStateElection)
 		}
-		if r.onMemberLeave != nil {
-			r.onMemberLeave(left)
+		if cbLeave != nil {
+			cbLeave(left)
 		}
 	}
 	return left != nil
 }
 
-// recomputeLeader implements the deterministic lowest-ID rule.
-// The minimum peer ID among the converged member set is always the leader.
-// Every node runs this same function on the same member set, so all nodes
-// agree on a single leader; no network election is required and no
-// split-brain is possible (peer IDs are unique).
+// recomputeLeader implements deterministic leader convergence.
+//
+// When a room contains endpoints belonging to a single node:
+// The leader is unconditionally set to that owning node and room state to Active,
+// provided the owning node is local or verified healthy in discovery.
 func (r *Room) recomputeLeader() {
+	if r.disc != nil {
+		r.syncMembersFromDiscovery()
+	}
+
 	const peerTTL = 10 * time.Second
 	now := time.Now()
 
 	var present map[string]bool
 	if r.disc != nil {
 		present = make(map[string]bool, 16)
-		for _, p := range r.disc.Peers() {
+		for _, p := range r.disc.LivePeers() {
 			present[p.ID] = true
 		}
 	}
 
 	r.mu.RLock()
+	owner, isSingleNode := r.singleOwningNodeLocked()
+	cbLeader := r.onLeaderChange
+
+	if isSingleNode && owner != "" {
+		isLocal := r.isLocalNodeLocked(owner)
+		var isOwnerHealthy bool
+		if isLocal {
+			isOwnerHealthy = true
+		} else {
+			m, exists := r.members[owner]
+			isOwnerHealthy = exists &&
+				now.Sub(m.LastSeen) <= peerTTL &&
+				(r.disc == nil || present[owner])
+		}
+
+		if isOwnerHealthy {
+			r.mu.RUnlock()
+			leaderID := owner
+			if leaderID == "local" && r.localID != "" {
+				leaderID = r.localID
+			}
+
+			old := r.Leader()
+			r.leader.Store(leaderID)
+			r.state.Store(RoomState(RoomStateActive))
+			if isLocal {
+				log.Printf("room %s: recomputeLeader (local-only) -> leader=%s", r.id, leaderID)
+			} else {
+				log.Printf("room %s: recomputeLeader (single-node) -> leader=%s (localID=%s)", r.id, leaderID, r.localID)
+			}
+			if old != "" && old != leaderID {
+				log.Printf("room %s: leader change %q -> %q", r.id, old, leaderID)
+				if cbLeader != nil {
+					cbLeader(leaderID)
+				}
+			}
+			return
+		}
+
+		// Remote owner is absent or unhealthy: defer assertion and remain in Election
+		r.mu.RUnlock()
+		log.Printf("room %s: single owning node %s is absent or unhealthy, deferring active leader assertion", r.id, owner)
+		return
+	}
+
 	var lowest string
 	for id := range r.members {
 		if lowest == "" || id < lowest {
@@ -897,8 +1481,8 @@ func (r *Room) recomputeLeader() {
 	// integration oracles rely on (shared event channel ordering).
 	if old != "" && r.Leader() != old {
 		log.Printf("room %s: leader change %q -> %q", r.id, old, r.Leader())
-		if r.onLeaderChange != nil {
-			r.onLeaderChange(r.Leader())
+		if cbLeader != nil {
+			cbLeader(r.Leader())
 		}
 	}
 }
@@ -921,11 +1505,19 @@ func (r *Room) announcePresence() {
 
 // syncMembersFromDiscovery merges discovery peers into the member set.
 func (r *Room) syncMembersFromDiscovery() {
+	now := time.Now()
+	// Always refresh our own presence
+	if r.localID != "" {
+		r.addMember(r.localID, &RoomMember{
+			PeerID:   r.localID,
+			NodeID:   r.localID,
+			LastSeen: now,
+		})
+	}
 	if r.disc == nil {
 		return
 	}
-	now := time.Now()
-	for _, p := range r.disc.Peers() {
+	for _, p := range r.disc.LivePeers() {
 		r.addMember(p.ID, &RoomMember{
 			PeerID:     p.ID,
 			NodeID:     p.ID,
@@ -936,13 +1528,6 @@ func (r *Room) syncMembersFromDiscovery() {
 			LastSeen:   p.LastSeen, // presence-freshness: freeze when peer stops announcing
 		})
 	}
-	// always include ourselves
-	r.addMember(r.localID, &RoomMember{
-		PeerID:   r.localID,
-		NodeID:   r.localID,
-		Addr:     "",
-		LastSeen: now,
-	})
 }
 
 // checkPeerTimeouts removes members that are stale OR no longer present
@@ -956,7 +1541,7 @@ func (r *Room) checkPeerTimeouts() {
 	var present map[string]bool
 	if r.disc != nil {
 		present = make(map[string]bool, 16)
-		for _, p := range r.disc.Peers() {
+		for _, p := range r.disc.LivePeers() {
 			present[p.ID] = true
 		}
 	}

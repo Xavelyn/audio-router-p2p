@@ -294,6 +294,7 @@ export interface UpdateRoomBindingsRequest {
 
 export interface RoomDeviceBindingRequest {
   device_id: string;
+  node_id?: string;
   gain?: number;
   muted?: boolean;
 }
@@ -317,9 +318,11 @@ export type DTXState = 'Active' | 'Hangover' | 'Suppressed';
 
 export interface MeterFrame {
   stream_id: string;
-  timestamp_ns: number;
-  dtx_state: DTXState;
+  timestamp_ns?: number;
+  dtx_state?: DTXState;
   channels: ChannelMeter[];
+  closed?: boolean;
+  timestamp?: number;
 }
 
 export type StreamMeterFrame = MeterFrame;
@@ -329,6 +332,10 @@ export interface JitterStats {
   target_depth_frames: number;
   underruns: number;
   overruns: number;
+  /** ADR 0034: always present on the wire (0 when absent). */
+  late_packets: number;
+  /** ADR 0034: always present on the wire (0 when absent; dead counter kept for backward compatibility). */
+  early_packets: number;
   jitter_ms?: number;
 }
 
@@ -372,9 +379,101 @@ export interface StreamStats {
   plc: PLCStats;
   asrc: ASRCStats;
   peers?: Record<string, JitterStats>;
+  /**
+   * ADR 0034: optional per-route artifact health. Present only when the
+   * daemon's ArtifactAggregator is wired; omitted otherwise (byte-compatible).
+   */
+  health?: RouteHealth;
+  /**
+   * ADR 0034: optional device impact overlay (source/destination device
+   * artifact health). Shared device XRuns are never folded into the route score.
+   */
+  devices?: RouteDeviceImpact;
 }
 
 export type StreamTelemetry = StreamStats;
+
+// ============================================================================
+// AUDIO ARTIFACT HEALTH (ADR 0034)
+//
+// Two severity vocabularies coexist and must NEVER be conflated:
+//   - ArtifactSeverity (4 tiers): audio artifact AUDIBILITY (this section)
+//   - NodeHealthGrade  (5 tiers): link quality (see CLUSTER OBSERVABILITY)
+// Separate badge styling, no cross-mapping.
+// ============================================================================
+
+/** 4-tier audibility grade: NONE >= 90, MINOR >= 60, MAJOR >= 30, CRITICAL < 30. */
+export type ArtifactSeverity = 'NONE' | 'MINOR' | 'MAJOR' | 'CRITICAL';
+
+/** Per-second rates over the actual window span (ramp-up safe). */
+export interface ArtifactRates {
+  underrun_per_s: number;
+  overrun_per_s: number;
+  /** Device-shared XRun rate for the route's own devices (rendered on the "shared device" line). */
+  xrun_per_s: number;
+  ring_drop_per_s: number;
+}
+
+/** Windowed per-peer artifact triple (the "worst peer" column input). */
+export interface PeerArtifactHealth {
+  underruns: number;
+  overruns: number;
+  late_packets: number;
+}
+
+/**
+ * Per-route artifact health over the 10 s window. The score uses ONLY
+ * route-scoped coefficients; hardware XRuns are surfaced through the
+ * separate RouteDeviceImpact overlay (attribution discipline, ADR 0034 §1.C).
+ */
+export interface RouteHealth {
+  score: number;
+  severity: ArtifactSeverity;
+  window_s: number;
+  underruns: number;
+  overruns: number;
+  ring_drops: number;
+  plc_concealed: number;
+  fec_unrecoverable: number;
+  packets_lost: number;
+  /** Informational only: proof FEC is working, carries no scoring weight. */
+  fec_recovered: number;
+  /** Informational only: not scored (pre-roll inflates it). */
+  playout_gaps: number;
+  rates: ArtifactRates;
+  ghost: boolean;
+  peers: Record<string, PeerArtifactHealth>;
+}
+
+/** Per-direction hardware XRun summary on a device (window vs. lifetime total). */
+export interface DeviceDirArtifacts {
+  xrun_window: number;
+  xrun_total: number;
+}
+
+/**
+ * Per-physical-device artifact health, merging up to one input and one output
+ * controller per URN. A missing direction contributes C = 1.0 and its JSON
+ * object is omitted.
+ */
+export interface DeviceHealth {
+  urn: string;
+  ghost: boolean;
+  score: number;
+  severity: ArtifactSeverity;
+  input?: DeviceDirArtifacts;
+  output?: DeviceDirArtifacts;
+}
+
+/**
+ * Per-route overlay exposing the artifact health of the route's source
+ * ("input") and destination ("output") devices, so a route transiting a
+ * degraded device is never shown as falsely clean.
+ */
+export interface RouteDeviceImpact {
+  input?: DeviceHealth;
+  output?: DeviceHealth;
+}
 
 // System resource metrics snapshot for diagnostics
 export interface SystemMetrics {
@@ -466,6 +565,10 @@ export interface StreamLinkStats {
   jitter_target_delay_ms: number;
   underruns: number;
   overruns: number;
+  /** ADR 0034: always present on the wire (0 when absent). */
+  late_packets: number;
+  /** ADR 0034: always present on the wire (0 when absent; dead counter kept for backward compatibility). */
+  early_packets: number;
   fec_recovered: number;
   plc_concealed: number;
 }

@@ -3,11 +3,14 @@ package v1
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
+	"github.com/audio-router-p2p/pkg/api/telemetry"
+	"github.com/audio-router-p2p/pkg/streamer"
+	netTelemetry "github.com/audio-router-p2p/pkg/telemetry"
 	"golang.org/x/net/websocket"
 )
 
@@ -21,6 +24,15 @@ func (s *V1Server) handleTelemetryStreamStats(w http.ResponseWriter, r *http.Req
 	result := make(map[string]StreamStats)
 	if s.streams != nil {
 		rawStats := s.streams.Stats()
+
+		// ADR 0034: load the artifact snapshot exactly once. When the
+		// aggregator is unwired (tests, partial startup) it stays nil and the
+		// response is byte-compatible with today's (health/devices omitted).
+		var snap *netTelemetry.ArtifactSnapshot
+		if s.artifactAggregator != nil {
+			snap = s.artifactAggregator.GetArtifactSnapshot()
+		}
+
 		for id, st := range rawStats {
 			peers := make(map[string]JitterStats, len(st.Peers))
 			for pAddr, jb := range st.Peers {
@@ -30,10 +42,12 @@ func (s *V1Server) handleTelemetryStreamStats(w http.ResponseWriter, r *http.Req
 					Underruns:          jb.Underruns,
 					Overruns:           jb.Overruns,
 					JitterMS:           float64(jb.TargetDelay.Milliseconds()),
+					LatePackets:        jb.LatePackets,
+					EarlyPackets:       jb.EarlyPackets,
 				}
 			}
 
-			result[id] = StreamStats{
+			entry := StreamStats{
 				StreamID:          st.StreamID,
 				PacketsSent:       st.PacketsSent,
 				PacketsReceived:   st.PacketsReceived,
@@ -68,10 +82,69 @@ func (s *V1Server) handleTelemetryStreamStats(w http.ResponseWriter, r *http.Req
 				},
 				Peers: peers,
 			}
+
+			if snap != nil {
+				if rh, ok := snap.Routes[id]; ok {
+					health := rh // copy: the snapshot is immutable but keep ownership local
+					entry.Health = &health
+				}
+				if impact := buildRouteDeviceImpact(st, snap); impact != nil {
+					entry.Devices = impact
+				}
+			}
+
+			result[id] = entry
 		}
 	}
 
 	s.WriteJSON(w, http.StatusOK, result)
+}
+
+// buildRouteDeviceImpact overlays the artifact health of the route's source
+// and destination devices (ADR 0034 attribution discipline: device XRuns are
+// shared, never folded into the route score). Returns nil when neither
+// device is present in the snapshot.
+func buildRouteDeviceImpact(st streamer.StreamerStats, snap *netTelemetry.ArtifactSnapshot) *RouteDeviceImpact {
+	var impact *RouteDeviceImpact
+	if urn := st.SourceDeviceURN; urn != "" {
+		if dh, ok := snap.Devices[urn]; ok {
+			if impact == nil {
+				impact = &RouteDeviceImpact{}
+			}
+			health := dh
+			impact.Input = &health
+		}
+	}
+	if urn := st.DestDeviceURN; urn != "" {
+		if dh, ok := snap.Devices[urn]; ok {
+			if impact == nil {
+				impact = &RouteDeviceImpact{}
+			}
+			health := dh
+			impact.Output = &health
+		}
+	}
+	return impact
+}
+
+// handleTelemetryDeviceArtifacts handles GET /api/v1/telemetry/device-artifacts
+// (ADR 0034): the URN-keyed map of per-device artifact health. Returns an
+// empty object when the aggregator is unwired.
+func (s *V1Server) handleTelemetryDeviceArtifacts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	resp := make(map[string]DeviceHealth)
+	if s.artifactAggregator != nil {
+		snap := s.artifactAggregator.GetArtifactSnapshot()
+		for urn, dh := range snap.Devices {
+			resp[urn] = dh
+		}
+	}
+
+	s.WriteJSON(w, http.StatusOK, resp)
 }
 
 // handleTelemetryMetersSSE handles GET /api/v1/telemetry/meters (Server-Sent Events).
@@ -105,14 +178,32 @@ func (s *V1Server) handleTelemetryMetersSSE(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
 
-	sub := s.hub.Subscribe(4)
+	localOnly := r.URL.Query().Get("local_only") == "true" || r.Header.Get("X-Cluster-Relay") == "true"
+	var sub *telemetry.Subscriber
+	if localOnly {
+		sub = s.hub.SubscribeLocalOnly(4)
+	} else {
+		sub = s.hub.Subscribe(4)
+	}
 	defer s.hub.Unsubscribe(sub)
 
 	ctx := r.Context()
+
+	// Periodic SSE keepalive comment. The hub stays silent when no taps are
+	// registered, so without this idle connections can be reaped by intermediaries
+	// and peers cannot detect dead links promptly.
+	keepalive := time.NewTicker(15 * time.Second)
+	defer keepalive.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-keepalive.C:
+			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case msg, ok := <-sub.Ch:
 			if !ok {
 				return
@@ -143,14 +234,22 @@ func (s *V1Server) serveWebSocket(ws *websocket.Conn) {
 	sub := s.hub.Subscribe(4)
 	defer s.hub.Unsubscribe(sub)
 
-	doneCh := make(chan struct{})
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			close(stopCh)
+			_ = ws.Close()
+		})
+	}
+	defer stop()
 
 	// Goroutine 1: Fan-out telemetry frames to WebSocket client
 	go func() {
-		defer close(doneCh)
+		defer stop()
 		for {
 			select {
-			case <-doneCh:
+			case <-stopCh:
 				return
 			case msg, ok := <-sub.Ch:
 				if !ok {
@@ -168,9 +267,6 @@ func (s *V1Server) serveWebSocket(ws *websocket.Conn) {
 	for {
 		var rawMsg string
 		if err := websocket.Message.Receive(ws, &rawMsg); err != nil {
-			if err == io.EOF {
-				break
-			}
 			break
 		}
 
@@ -193,11 +289,24 @@ func (s *V1Server) processWSCommand(ws *websocket.Conn, cmd WSControlMessage) {
 
 	switch cmd.Type {
 	case "crosspoint":
+		outCh := cmd.OutChannel
+		inCh := cmd.InChannel
+		gain := cmd.Gain
 		slew := cmd.SlewMS
+
+		if cmd.Crosspoint != nil {
+			outCh = cmd.Crosspoint.OutChannel
+			inCh = cmd.Crosspoint.InChannel
+			gain = cmd.Crosspoint.Gain
+			if cmd.Crosspoint.SlewMS > 0 {
+				slew = cmd.Crosspoint.SlewMS
+			}
+		}
+
 		if slew <= 0 {
 			slew = 20.0
 		}
-		mr, err := s.router.UpdateCrosspoint(cmd.RouteID, cmd.OutChannel, cmd.InChannel, cmd.Gain, slew)
+		mr, err := s.router.UpdateCrosspoint(cmd.RouteID, outCh, inCh, gain, slew)
 		if err != nil {
 			_ = websocket.JSON.Send(ws, map[string]string{"error": err.Error()})
 			return

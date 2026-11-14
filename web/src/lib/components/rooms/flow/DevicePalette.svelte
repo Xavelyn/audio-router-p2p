@@ -21,7 +21,7 @@
 
   interface Props {
     onAddDevice?: (device: AudioDevice | AudioDeviceSummary, direction?: 'input' | 'output') => void;
-    onFocusDevice?: (deviceId: string) => void;
+    onFocusDevice?: (deviceId: string, direction?: 'input' | 'output') => void;
   }
 
   let { onAddDevice, onFocusDevice }: Props = $props();
@@ -88,11 +88,11 @@
           devices: node.devices || [],
         });
       }
-    } else {
-      // Fallback: only local deviceStore available
+    } else if (localDevices.length > 0) {
+      // Only local devices available
       result.push({
         id: 'node-local',
-        name: 'Local Gateway Node',
+        name: 'Local Node',
         address: '127.0.0.1:8080',
         isLocal: true,
         swimState: 'alive',
@@ -164,7 +164,7 @@
 
   const stagedClusterDevices = $derived(
     groupedNodes.reduce((acc, n) => {
-      return acc + n.devices.filter((d) => flowLayoutStore.isDeviceEnabled(d.id)).length;
+      return acc + n.devices.filter((d) => flowLayoutStore.isDeviceEnabled(d.id, n.id)).length;
     }, 0)
   );
 </script>
@@ -270,7 +270,12 @@
 
   <!-- Node Accordions List -->
   <div class="flex-1 overflow-y-auto p-3 space-y-3">
-    {#each groupedNodes as node (node.id)}
+    {#if groupedNodes.length === 0}
+      <div class="rounded-xl border border-dashed border-zinc-800 p-6 text-center text-xs font-mono text-zinc-500">
+        No gateway or audio devices connected
+      </div>
+    {:else}
+      {#each groupedNodes as node (node.id)}
       {@const isCollapsed = flowLayoutStore.isNodeCollapsed(node.id)}
       {@const matchingDevices = node.devices.filter((d) => filterDevice(d, node.name))}
 
@@ -286,7 +291,7 @@
           class="w-full text-left p-2.5 flex items-center justify-between gap-2 hover:bg-zinc-800/40 transition-colors"
           aria-expanded={!isCollapsed}
         >
-          <div class="flex items-center gap-2 min-w-0">
+          <div class="flex items-center gap-2 min-w-0 flex-1">
             <span class="text-zinc-400 shrink-0">
               {#if isCollapsed}
                 <ChevronRight class="w-3.5 h-3.5" />
@@ -295,7 +300,7 @@
               {/if}
             </span>
 
-            <div class="min-w-0">
+            <div class="min-w-0 flex-1">
               <div class="flex items-center gap-1.5 leading-tight">
                 <span class="text-xs font-bold text-zinc-100 truncate font-mono">
                   {node.name}
@@ -307,11 +312,11 @@
                 {/if}
               </div>
               <div class="flex items-center gap-1.5 text-[9px] font-mono text-zinc-400 truncate">
-                <span class="h-1.5 w-1.5 rounded-full {node.swimState === 'alive' ? 'bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.8)]' : 'bg-amber-400'}"></span>
-                <span>{node.address.replace(/^https?:\/\//, '')}</span>
+                <span class="h-1.5 w-1.5 rounded-full shrink-0 {node.swimState === 'alive' ? 'bg-emerald-400 shadow-[0_0_4px_rgba(52,211,153,0.8)]' : 'bg-amber-400'}"></span>
+                <span class="truncate">{node.address.replace(/^https?:\/\//, '')}</span>
                 {#if node.clockRole}
-                  <span class="text-zinc-500">&bull;</span>
-                  <span class="uppercase text-cyan-400">{node.clockRole}</span>
+                  <span class="text-zinc-500 shrink-0">&bull;</span>
+                  <span class="uppercase text-cyan-400 shrink-0">{node.clockRole}</span>
                 {/if}
               </div>
             </div>
@@ -333,11 +338,15 @@
                 No matching devices found
               </div>
             {:else}
-              {#each matchingDevices as device (device.id)}
-                {@const isStaged = flowLayoutStore.isDeviceEnabled(device.id)}
+              {#each matchingDevices as device (node.id && !device.id.includes('/') ? `${node.id}/${device.id}` : device.id)}
+                {@const canvasKey = node.id && !device.id.includes('/') ? `${node.id}/${device.id}` : device.id}
                 {@const isInput = device.max_input > 0 && device.max_output === 0}
                 {@const isOutput = device.max_output > 0 && device.max_input === 0}
                 {@const isDuplex = device.max_input > 0 && device.max_output > 0}
+                {@const isInputStaged = flowLayoutStore.isEndpointStaged(canvasKey, 'input')}
+                {@const isOutputStaged = flowLayoutStore.isEndpointStaged(canvasKey, 'output')}
+                {@const isBothStaged = isInputStaged && isOutputStaged}
+                {@const isSimplexStaged = (isInput && isInputStaged) || (isOutput && isOutputStaged)}
 
                 <!-- Draggable Device Card -->
                 <div
@@ -345,13 +354,17 @@
                   draggable="true"
                   ondragstart={(e) => handleDragStart(e, device, node.id)}
                   aria-label="Draggable device {device.name}"
-                  class="group relative rounded-lg border p-2 bg-zinc-900/90 transition-all flex items-center justify-between gap-2 cursor-grab active:cursor-grabbing {isStaged
+                  class="group relative rounded-lg border p-2 bg-zinc-900/90 transition-all flex items-center justify-between gap-2 cursor-grab active:cursor-grabbing {isBothStaged || isSimplexStaged
                     ? 'border-cyan-500/40 bg-cyan-950/15 shadow-sm'
-                    : 'border-zinc-800/90 hover:border-cyan-500/50 hover:bg-zinc-850/90'}"
+                    : isInputStaged
+                      ? 'border-cyan-500/30 bg-cyan-950/10 shadow-sm'
+                      : isOutputStaged
+                        ? 'border-purple-500/30 bg-purple-950/10 shadow-sm'
+                        : 'border-zinc-800/90 hover:border-cyan-500/50 hover:bg-zinc-850/90'}"
                   title="Drag onto Canvas or click + Add to route"
                 >
                   <!-- Drag Handle Icon & Device Info -->
-                  <div class="flex items-center gap-1.5 min-w-0">
+                  <div class="flex items-center gap-1.5 min-w-0 flex-1">
                     <GripVertical class="w-3.5 h-3.5 text-zinc-600 group-hover:text-cyan-400 shrink-0 transition-colors" />
 
                     <div class="flex h-6 w-6 items-center justify-center rounded bg-zinc-800/80 border border-zinc-700 text-zinc-300 shrink-0">
@@ -366,52 +379,119 @@
                       {/if}
                     </div>
 
-                    <div class="min-w-0">
+                    <div class="min-w-0 flex-1">
                       <div class="text-xs font-semibold text-zinc-200 truncate leading-snug font-sans group-hover:text-white" title={device.name}>
                         {device.name}
                       </div>
-                      <div class="flex items-center gap-1 text-[9px] font-mono text-zinc-400">
+                      <div class="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[9px] font-mono text-zinc-400">
                         <!-- Direction Badge -->
                         {#if isInput}
-                          <span class="text-cyan-400 font-bold">IN ({device.max_input}ch)</span>
+                          <span class="text-cyan-400 font-bold shrink-0">IN ({device.max_input}ch)</span>
                         {:else if isOutput}
-                          <span class="text-purple-400 font-bold">OUT ({device.max_output}ch)</span>
+                          <span class="text-purple-400 font-bold shrink-0">OUT ({device.max_output}ch)</span>
                         {:else}
-                          <span class="text-emerald-400 font-bold">DUP ({device.max_input}x{device.max_output})</span>
+                          <span class="text-emerald-400 font-bold shrink-0">DUP ({device.max_input}x{device.max_output})</span>
                         {/if}
 
-                        <span class="text-zinc-600">&bull;</span>
-                        <span>{device.default_sample_rate / 1000}k</span>
+                        <span class="text-zinc-600 shrink-0">&bull;</span>
+                        <span class="shrink-0">{device.default_sample_rate / 1000}k</span>
 
-                        <span class="text-zinc-600">&bull;</span>
-                        <span class="{device.is_virtual ? 'text-purple-400' : 'text-zinc-400'}">
+                        <span class="text-zinc-600 shrink-0">&bull;</span>
+                        <span class="shrink-0 {device.is_virtual ? 'text-purple-400' : 'text-zinc-400'}">
                           {device.is_virtual ? 'VIRT' : 'HW'}
                         </span>
                       </div>
                     </div>
                   </div>
 
-                  <!-- Staging Status Pill / Add Button -->
+                  <!-- Staging Status Pill / Add Button (ADR 0027, ADR 0028 Directional & Canonical Isolation) -->
                   <div class="shrink-0 flex items-center gap-1">
-                    {#if isStaged}
+                    {#if isDuplex}
+                      {#if isBothStaged}
+                        <button
+                          type="button"
+                          onclick={() => onFocusDevice?.(canvasKey)}
+                          class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
+                          title="Both endpoints staged on canvas. Click to focus."
+                        >
+                          <Check class="w-2.5 h-2.5 text-cyan-400 shrink-0" />
+                          <span>On Canvas</span>
+                        </button>
+                      {:else if isInputStaged && !isOutputStaged}
+                        <div class="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onclick={() => onFocusDevice?.(canvasKey, 'input')}
+                            class="inline-flex items-center gap-0.5 rounded bg-cyan-500/20 px-1.5 py-0.5 text-[8px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
+                            title="Input endpoint is on canvas. Click to focus."
+                          >
+                            <Check class="w-2 h-2 text-cyan-400 shrink-0" />
+                            <span>IN</span>
+                          </button>
+                          <button
+                            type="button"
+                            onclick={() => onAddDevice?.({ ...device, node_id: (device as any).node_id || node.id }, 'output')}
+                            class="inline-flex items-center gap-0.5 rounded bg-purple-500/10 hover:bg-purple-500 px-1.5 py-0.5 text-[8px] font-mono font-bold text-purple-300 hover:text-zinc-950 border border-purple-500/30 transition-all cursor-pointer"
+                            title="Add output endpoint to canvas"
+                            aria-label="Add output of {device.name} to canvas"
+                          >
+                            <Plus class="w-2 h-2 shrink-0" />
+                            <span>OUT</span>
+                          </button>
+                        </div>
+                      {:else if !isInputStaged && isOutputStaged}
+                        <div class="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            onclick={() => onAddDevice?.({ ...device, node_id: (device as any).node_id || node.id }, 'input')}
+                            class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-1.5 py-0.5 text-[8px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all cursor-pointer"
+                            title="Add input endpoint to canvas"
+                            aria-label="Add input of {device.name} to canvas"
+                          >
+                            <Plus class="w-2 h-2 shrink-0" />
+                            <span>IN</span>
+                          </button>
+                          <button
+                            type="button"
+                            onclick={() => onFocusDevice?.(canvasKey, 'output')}
+                            class="inline-flex items-center gap-0.5 rounded bg-purple-500/20 px-1.5 py-0.5 text-[8px] font-mono font-bold text-purple-300 border border-purple-500/40 hover:bg-purple-500/30 transition-colors cursor-pointer"
+                            title="Output endpoint is on canvas. Click to focus."
+                          >
+                            <Check class="w-2 h-2 text-purple-400 shrink-0" />
+                            <span>OUT</span>
+                          </button>
+                        </div>
+                      {:else}
+                        <button
+                          type="button"
+                          onclick={() => onAddDevice?.({ ...device, node_id: (device as any).node_id || node.id })}
+                          class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all shadow-sm cursor-pointer"
+                          title="Add duplex device (both input and output) to canvas"
+                          aria-label="Add {device.name} to canvas"
+                        >
+                          <Plus class="w-2.5 h-2.5 shrink-0" />
+                          <span>Add</span>
+                        </button>
+                      {/if}
+                    {:else if isSimplexStaged}
                       <button
                         type="button"
-                        onclick={() => onFocusDevice?.(device.id)}
-                        class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors"
+                        onclick={() => onFocusDevice?.(canvasKey)}
+                        class="inline-flex items-center gap-1 rounded bg-cyan-500/20 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 transition-colors cursor-pointer"
                         title="Already staged on canvas. Click to focus."
                       >
-                        <Check class="w-2.5 h-2.5 text-cyan-400" />
+                        <Check class="w-2.5 h-2.5 text-cyan-400 shrink-0" />
                         <span>On Canvas</span>
                       </button>
                     {:else}
                       <button
                         type="button"
-                        onclick={() => onAddDevice?.(device, isOutput ? 'output' : 'input')}
-                        class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all shadow-sm"
+                        onclick={() => onAddDevice?.({ ...device, node_id: (device as any).node_id || node.id }, isOutput ? 'output' : 'input')}
+                        class="inline-flex items-center gap-0.5 rounded bg-cyan-500/10 hover:bg-cyan-500 px-2 py-0.5 text-[9px] font-mono font-bold text-cyan-300 hover:text-zinc-950 border border-cyan-500/30 transition-all shadow-sm cursor-pointer"
                         title="Add to canvas"
                         aria-label="Add {device.name} to canvas"
                       >
-                        <Plus class="w-2.5 h-2.5" />
+                        <Plus class="w-2.5 h-2.5 shrink-0" />
                         <span>Add</span>
                       </button>
                     {/if}
@@ -423,6 +503,7 @@
         {/if}
       </div>
     {/each}
+    {/if}
   </div>
 
   <!-- Palette Footer Stats & Hint -->

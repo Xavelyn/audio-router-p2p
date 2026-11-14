@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net"
+	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
@@ -90,7 +91,9 @@ func TestDiscoveryInitialization(t *testing.T) {
 	}
 
 	// Verify automatic NodeID generation when empty
-	d2, err := New(testConfig("239.255.0.1", freeUDPPort(t)), "")
+	cfg2 := testConfig("239.255.0.1", freeUDPPort(t))
+	cfg2.NodeIDFile = filepath.Join(t.TempDir(), "node.id")
+	d2, err := New(cfg2, "")
 	if err != nil {
 		t.Fatalf("New auto-id: %v", err)
 	}
@@ -509,8 +512,8 @@ func TestDiscoveryTelemetryCounters(t *testing.T) {
 	if len(peers) != 1 || peers[0].ID != "peer-test-1" {
 		t.Errorf("unexpected discovered peers: %+v", peers)
 	}
-	if state := d.PeerState("peer-test-1"); state != "alive" {
-		t.Errorf("expected alive state, got %s", state)
+	if state := d.PeerState("peer-test-1"); state != "unknown" {
+		t.Errorf("expected unknown state for peer not in memberlist, got %s", state)
 	}
 }
 
@@ -570,5 +573,206 @@ func TestDiscoveryAPIAddr(t *testing.T) {
 	peers := dTLS.DiscoveredPeers()
 	if len(peers) != 1 || peers[0].APIAddr != "https://10.0.1.11:8443" {
 		t.Errorf("DiscoveredPeers APIAddr = %q, want %q", peers[0].APIAddr, "https://10.0.1.11:8443")
+	}
+}
+
+// TestCalculateSeedBackoff verifies truncated exponential backoff scaling, jitter bounds, and maximum caps.
+func TestCalculateSeedBackoff(t *testing.T) {
+	tests := []struct {
+		fails   int
+		minWait time.Duration
+		maxWait time.Duration
+	}{
+		{fails: 0, minWait: 500 * time.Millisecond, maxWait: 1500 * time.Millisecond},     // 1s base +- 20%
+		{fails: 1, minWait: 1500 * time.Millisecond, maxWait: 2600 * time.Millisecond},    // 2s base +- 20%
+		{fails: 2, minWait: 3000 * time.Millisecond, maxWait: 5000 * time.Millisecond},    // 4s base +- 20%
+		{fails: 3, minWait: 6000 * time.Millisecond, maxWait: 10000 * time.Millisecond},   // 8s base +- 20%
+		{fails: 4, minWait: 12000 * time.Millisecond, maxWait: 20000 * time.Millisecond},  // 16s base +- 20%
+		{fails: 5, minWait: 20000 * time.Millisecond, maxWait: 38000 * time.Millisecond},  // 30s cap +- 20%
+		{fails: 10, minWait: 20000 * time.Millisecond, maxWait: 38000 * time.Millisecond}, // capped at 30s
+	}
+
+	for _, tc := range tests {
+		for i := 0; i < 20; i++ { // Multiple samples to account for random jitter
+			b := calculateSeedBackoff(tc.fails)
+			if b < tc.minWait || b > tc.maxWait {
+				t.Errorf("calculateSeedBackoff(%d) = %v, want within [%v, %v]", tc.fails, b, tc.minWait, tc.maxWait)
+			}
+			if b < 500*time.Millisecond {
+				t.Errorf("calculateSeedBackoff(%d) = %v fell below minimum 500ms bound", tc.fails, b)
+			}
+		}
+	}
+}
+
+// TestIsSeedAlive verifies seed liveness evaluation against Memberlist alive nodes and discovery peer maps.
+func TestIsSeedAlive(t *testing.T) {
+	ip1 := net.ParseIP("127.0.0.1")
+	ip2 := net.ParseIP("10.0.0.5")
+
+	aliveNodes := []*memberlist.Node{
+		{
+			Name: "node-1",
+			Addr: ip1,
+			Port: 48001,
+		},
+		{
+			Name: "node-2",
+			Addr: ip2,
+			Port: 48002,
+		},
+	}
+
+	peers := map[string]*Peer{
+		"node-1": {
+			ID:   "node-1",
+			Addr: "127.0.0.1:48001",
+		},
+		"node-2": {
+			ID:   "node-2",
+			Addr: "10.0.0.5:48002",
+		},
+	}
+
+	// 1. Direct IP:port match
+	if !isSeedAlive("127.0.0.1:48001", aliveNodes, peers) {
+		t.Error("expected 127.0.0.1:48001 to be detected as alive")
+	}
+
+	// 2. Localhost alias match
+	if !isSeedAlive("localhost:48001", aliveNodes, peers) {
+		t.Error("expected localhost:48001 to match 127.0.0.1 alive node")
+	}
+
+	// 3. Remote node IP:port match
+	if !isSeedAlive("10.0.0.5:48002", aliveNodes, peers) {
+		t.Error("expected 10.0.0.5:48002 to be detected as alive")
+	}
+
+	// 4. Dead / unknown seed
+	if isSeedAlive("127.0.0.1:48999", aliveNodes, peers) {
+		t.Error("expected 127.0.0.1:48999 to NOT be detected as alive")
+	}
+
+	// 5. Empty alive nodes
+	if isSeedAlive("127.0.0.1:48001", nil, peers) {
+		t.Error("expected false with nil aliveNodes")
+	}
+}
+
+// TestRefreshActiveMembers_SWIMFiltering verifies that suspect or dead memberlist nodes
+// do not reset p.LastSeen, preventing phantom peer resurrection.
+func TestRefreshActiveMembers_SWIMFiltering(t *testing.T) {
+	d, err := New(testConfig("239.255.0.1", freeUDPPort(t)), "node-swim-test")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d.Close()
+
+	oldTimestamp := time.Now().Add(-10 * time.Minute)
+	d.AddPeer(&Peer{
+		ID:       "peer-unconfirmed",
+		Addr:     "127.0.0.1:49123",
+		LastSeen: oldTimestamp,
+	})
+
+	// refreshActiveMembers called when node is NOT in Memberlist or not StateAlive
+	d.refreshActiveMembers()
+
+	d.mu.RLock()
+	p := d.peers["peer-unconfirmed"]
+	d.mu.RUnlock()
+
+	if p == nil {
+		t.Fatal("peer missing from table")
+	}
+	if p.LastSeen != oldTimestamp {
+		t.Fatalf("p.LastSeen was refreshed for unconfirmed SWIM node: got %v, want %v", p.LastSeen, oldTimestamp)
+	}
+}
+
+// TestDiscoveryLivePeersAndPruning verifies LivePeers() exclusions and deterministic prune() eviction.
+func TestDiscoveryLivePeersAndPruning(t *testing.T) {
+	cfg := testConfig("239.255.0.1", freeUDPPort(t))
+	cfg.PeerTTL = 500 * time.Millisecond
+
+	d, err := New(cfg, "node-prune-test")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d.Close()
+
+	// 1. Peer with fresh timestamp but not in Memberlist
+	d.AddPeer(&Peer{
+		ID:       "peer-fresh",
+		Addr:     "127.0.0.1:49100",
+		LastSeen: time.Now(),
+	})
+
+	// 2. Peer with stale timestamp
+	d.AddPeer(&Peer{
+		ID:       "peer-stale",
+		Addr:     "127.0.0.1:49200",
+		LastSeen: time.Now().Add(-5 * time.Second),
+	})
+
+	// Peers() returns both initially before pruning
+	allPeers := d.Peers()
+	if len(allPeers) != 2 {
+		t.Fatalf("expected 2 peers in table, got %d", len(allPeers))
+	}
+
+	// LivePeers() must exclude the stale peer (and fresh peer since it's not confirmed in Memberlist)
+	live := d.LivePeers()
+	for _, lp := range live {
+		if lp.ID == "peer-stale" {
+			t.Errorf("LivePeers() included stale peer: %+v", lp)
+		}
+	}
+
+	// Prune must evict peer-stale because LastSeen > PeerTTL (500ms)
+	d.prune()
+
+	allAfterPrune := d.Peers()
+	if len(allAfterPrune) != 1 || allAfterPrune[0].ID != "peer-fresh" {
+		t.Errorf("expected only peer-fresh after prune, got %+v", allAfterPrune)
+	}
+}
+
+// TestEvaluateSeedJoins_BackoffSchedule verifies that failing seed joins increment consecFails
+// and schedule future retries with backoff rather than spinning in a busy loop.
+func TestEvaluateSeedJoins_BackoffSchedule(t *testing.T) {
+	d, err := New(testConfig("239.255.0.1", freeUDPPort(t)), "node-seed-test")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d.Close()
+
+	// Use an unassigned local port where connection will fail immediately
+	deadSeed := "127.0.0.1:59998"
+	tracker := &seedTracker{addr: deadSeed}
+
+	before := time.Now()
+	d.evaluateSeedJoins([]*seedTracker{tracker})
+
+	if tracker.consecFails != 1 {
+		t.Fatalf("expected consecFails = 1, got %d", tracker.consecFails)
+	}
+	if tracker.nextAttempt.Before(before.Add(500 * time.Millisecond)) {
+		t.Fatalf("expected nextAttempt to be scheduled in the future with backoff: %v", tracker.nextAttempt)
+	}
+
+	initialAttempts := d.seedJoinAttempts.Load()
+	if initialAttempts != 1 {
+		t.Fatalf("expected 1 join attempt recorded, got %d", initialAttempts)
+	}
+
+	// Immediately calling evaluateSeedJoins again should be a no-op because now < tracker.nextAttempt
+	d.evaluateSeedJoins([]*seedTracker{tracker})
+	if tracker.consecFails != 1 {
+		t.Fatalf("expected consecFails to remain 1, got %d", tracker.consecFails)
+	}
+	if d.seedJoinAttempts.Load() != initialAttempts {
+		t.Fatalf("join attempt was made prematurely before backoff elapsed")
 	}
 }

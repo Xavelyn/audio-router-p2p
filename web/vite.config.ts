@@ -1,3 +1,4 @@
+/// <reference types="vitest" />
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import path from 'path';
@@ -18,5 +19,18 @@ export default defineConfig({
         secure: false,
       },
     },
+  },
+  test: {
+    environment: 'happy-dom',
+    environmentOptions: {
+      happyDOM: {
+        settings: {
+          fetch: {
+            disableStrictSSL: true,
+          },
+        },
+      },
+    },
+    globals: true,
   },
 });

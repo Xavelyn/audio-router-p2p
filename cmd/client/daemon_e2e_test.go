@@ -99,6 +99,7 @@ func setupDaemon(t *testing.T, id string) *testDaemon {
 	roomMgr := group.NewDefaultRoomManager(cfg, disc, sm, trans, vp)
 
 	apiSrv := api.NewServer(cfg, rt, disc, sm, streamMgr, roomMgr)
+	streamMgr.SetHub(apiSrv.Hub())
 
 	hubCtx, hubCancel := context.WithCancel(context.Background())
 	apiSrv.Hub().Start(hubCtx)

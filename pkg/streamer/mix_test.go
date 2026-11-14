@@ -21,6 +21,7 @@ func (q *queuedFrame) PopNonBlock() ([]byte, uint32, error) {
 	return data, 0, nil
 }
 func (q *queuedFrame) Stats() JitterBufferStats { return JitterBufferStats{} }
+func (q *queuedFrame) Reset()                   {}
 func (q *queuedFrame) Close() error             { return nil }
 
 type countSink struct {

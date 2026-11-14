@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, onDestroy, untrack } from 'svelte';
   import {
     SvelteFlow,
     Controls,
@@ -16,6 +16,7 @@
   import { deviceStore } from '$lib/stores/devices.svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
   import { meterStore } from '$lib/stores/meters.svelte';
+  import { telemetryStore } from '$lib/stores/telemetry.svelte';
   import { flowLayoutStore } from '$lib/stores/flowLayout.svelte';
   import type { AudioDevice, AudioDeviceSummary } from '$lib/api/types';
   import DevicePalette from './flow/DevicePalette.svelte';
@@ -48,7 +49,7 @@
 
   let nodes = $state<Node[]>([]);
   let edges = $state<Edge[]>([]);
-  let viewport = $state<Viewport>({ x: 0, y: 0, zoom: 1 });
+  let viewport = $state<Viewport>(flowLayoutStore.viewport || { x: 0, y: 0, zoom: 1 });
 
   let flowContainer: HTMLDivElement | null = $state(null);
 
@@ -60,70 +61,120 @@
     // Graceful fallback if SvelteFlowProvider is not yet active in parent context
   }
 
-  onMount(() => {
-    roomStore.loadRooms();
-    deviceStore.loadDevices();
-    clusterStore.pollCluster();
+  onMount(async () => {
+    await Promise.allSettled([
+      roomStore.loadRooms(),
+      deviceStore.loadDevices(),
+      clusterStore.pollCluster(),
+    ]);
     meterStore.init();
 
-    // Initial default staging if canvas has never been configured
-    setTimeout(() => {
+    // ADR 0034: the flow-canvas device HealthPills need the 2 s artifact
+    // telemetry (stream-stats + device-artifacts). Start the per-page
+    // polling here, mirroring TelemetryDashboard's convention.
+    telemetryStore.startPolling(2000);
+
+    // Initial default staging ONLY if canvas has never been configured
+    if (!flowLayoutStore.hasSavedLayout) {
+      ensureRoomDevicesStaged();
       ensureDefaultStaging();
-      syncFlowGraph();
-    }, 150);
+    }
+    syncFlowGraph();
+  });
+
+  onDestroy(() => {
+    // Stop artifact telemetry when the flow canvas unmounts (tab switch).
+    telemetryStore.stopPolling();
   });
 
   // Consolidate devices from local deviceStore and clusterStore
   function getAllKnownDevices(): Map<string, AudioDevice | AudioDeviceSummary> {
     const map = new Map<string, AudioDevice | AudioDeviceSummary>();
+    const localNodeId = clusterStore.localNode?.node_id || clusterStore.localNode?.id || '';
+
     if (clusterStore.devices) {
       for (const d of clusterStore.devices) {
-        map.set(d.id, d);
-        if (d.device_id) map.set(d.device_id, d);
+        const nodeId = d.node_id || localNodeId;
+        const enriched = { ...d, node_id: nodeId };
+        if (nodeId) {
+          map.set(`${nodeId}/${d.id}`, enriched);
+          if (d.device_id) map.set(`${nodeId}/${d.device_id}`, enriched);
+          if (d.urn) map.set(`${nodeId}/${d.urn}`, enriched);
+        }
+        if (!map.has(d.id)) map.set(d.id, enriched);
+        if (d.device_id && !map.has(d.device_id)) map.set(d.device_id, enriched);
+        if (d.urn && !map.has(d.urn)) map.set(d.urn, enriched);
       }
     }
     if (deviceStore.devices) {
       for (const d of deviceStore.devices) {
-        map.set(d.id, d);
+        const nodeId = (d as any).node_id || localNodeId;
+        const enriched = { ...d, node_id: nodeId };
+        if (nodeId) {
+          map.set(`${nodeId}/${d.id}`, enriched);
+          if (d.urn) map.set(`${nodeId}/${d.urn}`, enriched);
+        }
+        if (!map.has(d.id)) map.set(d.id, enriched);
+        if (d.urn && !map.has(d.urn)) map.set(d.urn, enriched);
       }
     }
     return map;
   }
 
-  // Calculate default column coordinates for Left-to-Right signal flow
+  // Calculate default column coordinates for Left-to-Right signal flow with non-colliding margins
   function getDefaultPosition(type: 'input' | 'room' | 'output', index: number): { x: number; y: number } {
     switch (type) {
       case 'input':
-        return { x: 50, y: 70 + index * 270 };
+        return { x: 50, y: 70 + index * 340 };
       case 'room':
-        return { x: 440, y: 70 + index * 420 };
+        return { x: 480, y: 70 + index * 500 };
       case 'output':
-        return { x: 970, y: 70 + index * 270 };
+        return { x: 1020, y: 70 + index * 340 };
+    }
+  }
+
+  // Ensure devices bound to any room are staged on canvas (ADR 0027 directional staging)
+  function ensureRoomDevicesStaged() {
+    for (const room of roomStore.rooms) {
+      if (room.inputs) {
+        for (const inId of room.inputs) {
+          if (!flowLayoutStore.isEndpointStaged(inId, 'input')) {
+            flowLayoutStore.stageEndpoint(inId, 'input');
+          }
+        }
+      }
+      if (room.outputs) {
+        for (const outId of room.outputs) {
+          if (!flowLayoutStore.isEndpointStaged(outId, 'output')) {
+            flowLayoutStore.stageEndpoint(outId, 'output');
+          }
+        }
+      }
     }
   }
 
   // Ensure sensible defaults on first load (e.g. stage room-bound devices or default hardware)
   function ensureDefaultStaging() {
-    if (flowLayoutStore.enabledDevices.size > 0) return;
+    if (flowLayoutStore.hasSavedLayout || flowLayoutStore.enabledDevices.size > 0) return;
 
     const defaultIds = new Set<string>();
 
     // Stage all devices currently participating in rooms
     for (const room of roomStore.rooms) {
       if (room.inputs) {
-        for (const inId of room.inputs) defaultIds.add(inId);
+        for (const inId of room.inputs) defaultIds.add(`in:${inId}`);
       }
       if (room.outputs) {
-        for (const outId of room.outputs) defaultIds.add(outId);
+        for (const outId of room.outputs) defaultIds.add(`out:${outId}`);
       }
     }
 
-    // If still empty, stage primary local inputs and outputs
+    // If still empty and hardware devices exist, stage primary local inputs and outputs
     if (defaultIds.size === 0 && deviceStore.devices.length > 0) {
       const inputs = deviceStore.inputDevices.slice(0, 2);
       const outputs = deviceStore.outputDevices.slice(0, 2);
-      for (const d of inputs) defaultIds.add(d.id);
-      for (const d of outputs) defaultIds.add(d.id);
+      for (const d of inputs) defaultIds.add(`in:${d.id}`);
+      for (const d of outputs) defaultIds.add(`out:${d.id}`);
     }
 
     if (defaultIds.size > 0) {
@@ -140,14 +191,22 @@
     }
   }
 
-  // Update persistent position when node dragging stops
-  function handleNodeDragStop({ targetNode }: { targetNode: Node | null }) {
+  // Update persistent position when node dragging stops (supports single or multi-selection drags)
+  function handleNodeDragStop({ targetNode, nodes: draggedNodes }: { targetNode: Node | null; nodes?: Node[] }) {
     if (targetNode) {
       flowLayoutStore.setPosition(targetNode.id, {
         x: targetNode.position.x,
         y: targetNode.position.y,
       });
+    } else if (draggedNodes && draggedNodes.length > 0) {
+      for (const n of draggedNodes) {
+        flowLayoutStore.setPosition(n.id, {
+          x: n.position.x,
+          y: n.position.y,
+        });
+      }
     }
+    flowLayoutStore.persistNow();
   }
 
   // Validate directional room-centric routing rules
@@ -160,15 +219,36 @@
 
   function handleConnect(connection: Connection) {
     invalidConnectionNotice = null;
+    const allKnown = getAllKnownDevices();
 
     if (connection.source.startsWith('input-') && connection.target.startsWith('room-')) {
-      const devId = connection.source.replace('input-', '');
+      const rawIn = connection.source.replace('input-', '');
       const roomId = connection.target.replace('room-', '');
-      roomStore.addRoomInput(roomId, devId);
+      let devId = rawIn;
+      let nodeId = '';
+      if (rawIn.includes('/')) {
+        const slash = rawIn.indexOf('/');
+        nodeId = rawIn.slice(0, slash);
+        devId = rawIn.slice(slash + 1);
+      } else {
+        const d = allKnown.get(devId);
+        nodeId = (d as any)?.node_id || '';
+      }
+      roomStore.addRoomInput(roomId, devId, nodeId);
     } else if (connection.source.startsWith('room-') && connection.target.startsWith('output-')) {
       const roomId = connection.source.replace('room-', '');
-      const devId = connection.target.replace('output-', '');
-      roomStore.addRoomOutput(roomId, devId);
+      const rawOut = connection.target.replace('output-', '');
+      let devId = rawOut;
+      let nodeId = '';
+      if (rawOut.includes('/')) {
+        const slash = rawOut.indexOf('/');
+        nodeId = rawOut.slice(0, slash);
+        devId = rawOut.slice(slash + 1);
+      } else {
+        const d = allKnown.get(devId);
+        nodeId = (d as any)?.node_id || '';
+      }
+      roomStore.addRoomOutput(roomId, devId, nodeId);
     } else {
       invalidConnectionNotice =
         'Direct connection rejected: In Room-Centric Audio Flow, connect Input devices to a Room, and the Room to Output devices.';
@@ -178,47 +258,137 @@
     }
   }
 
-  function handleDelete({ edges: deletedEdges }: { edges: Edge[] }) {
+  // Canvas element deletion handler (handles both keyboard delete on nodes and edges)
+  async function handleDelete({ nodes: deletedNodes = [], edges: deletedEdges = [] }: { nodes?: Node[]; edges?: Edge[] }) {
+    // 1. Defensively handle deleted edges (disconnect audio routes)
     for (const edge of deletedEdges) {
       if (edge.source.startsWith('input-') && edge.target.startsWith('room-')) {
-        const devId = edge.source.replace('input-', '');
+        const rawDevId = edge.source.replace('input-', '');
         const roomId = edge.target.replace('room-', '');
-        roomStore.removeRoomInput(roomId, devId);
+        const targetRoom = roomStore.rooms.find((r) => r.id === roomId);
+        const matchId = targetRoom?.inputs?.find((i) => {
+          if (i === rawDevId) return true;
+          if (rawDevId.includes('/')) {
+            const devPart = rawDevId.slice(rawDevId.indexOf('/') + 1);
+            return !i.includes('/') && i === devPart;
+          }
+          return i.endsWith(`/${rawDevId}`);
+        }) || rawDevId;
+        try {
+          await roomStore.removeRoomInput(roomId, matchId);
+        } catch (err) {
+          console.warn(`[RoomCanvas] Failed to unbind edge input ${matchId} from room ${roomId}:`, err);
+        }
       } else if (edge.source.startsWith('room-') && edge.target.startsWith('output-')) {
         const roomId = edge.source.replace('room-', '');
-        const devId = edge.target.replace('output-', '');
-        roomStore.removeRoomOutput(roomId, devId);
+        const rawDevId = edge.target.replace('output-', '');
+        const targetRoom = roomStore.rooms.find((r) => r.id === roomId);
+        const matchId = targetRoom?.outputs?.find((o) => {
+          if (o === rawDevId) return true;
+          if (rawDevId.includes('/')) {
+            const devPart = rawDevId.slice(rawDevId.indexOf('/') + 1);
+            return !o.includes('/') && o === devPart;
+          }
+          return o.endsWith(`/${rawDevId}`);
+        }) || rawDevId;
+        try {
+          await roomStore.removeRoomOutput(roomId, matchId);
+        } catch (err) {
+          console.warn(`[RoomCanvas] Failed to unbind edge output ${matchId} from room ${roomId}:`, err);
+        }
       }
     }
+
+    // 2. Defensively handle deleted nodes (input, output, or room nodes)
+    for (const node of deletedNodes) {
+      if (node.id.startsWith('input-')) {
+        const devId = node.id.replace('input-', '');
+        await handleDismissDevice(devId, 'input');
+      } else if (node.id.startsWith('output-')) {
+        const devId = node.id.replace('output-', '');
+        await handleDismissDevice(devId, 'output');
+      } else if (node.id.startsWith('room-')) {
+        const roomId = node.id.replace('room-', '');
+        flowLayoutStore.deleteNodePosition(node.id);
+        try {
+          await roomStore.deleteRoom(roomId);
+        } catch (err) {
+          console.error(`Failed to delete room ${roomId}:`, err);
+        }
+      }
+    }
+
+    flowLayoutStore.persistNow();
+    syncFlowGraph();
   }
 
-  // Dismiss a node from the canvas: unbind dangling room routes and remove from flowLayoutStore
-  function handleDismissDevice(deviceId: string, direction?: 'input' | 'output') {
-    // 1. Defensively unbind audio routes from roomStore
-    for (const room of roomStore.rooms) {
-      if (direction !== 'output' && room.inputs && room.inputs.includes(deviceId)) {
-        roomStore.removeRoomInput(room.id, deviceId);
+  // Dismiss a node from the canvas: unbind dangling room routes and unstage strictly by direction and node (ADR 0027, ADR 0028)
+  async function handleDismissDevice(deviceId: string, direction?: 'input' | 'output') {
+    const isTargetMatch = (item: string) => {
+      if (item === deviceId) return true;
+      if (deviceId.includes('/')) {
+        const clean = deviceId.slice(deviceId.indexOf('/') + 1);
+        return !item.includes('/') && item === clean;
       }
-      if (direction !== 'input' && room.outputs && room.outputs.includes(deviceId)) {
-        roomStore.removeRoomOutput(room.id, deviceId);
+      return item.endsWith(`/${deviceId}`);
+    };
+
+    // 1. Defensively unbind audio routes from roomStore (strictly direction-scoped and node-isolated per ADR 0027, ADR 0028)
+    for (const room of roomStore.rooms) {
+      if (direction === 'input') {
+        const matched = room.inputs?.find(isTargetMatch);
+        if (matched) {
+          try {
+            await roomStore.removeRoomInput(room.id, matched);
+          } catch (err) {
+            console.warn(`[RoomCanvas] Failed to unbind input route ${matched} from room ${room.id}:`, err);
+          }
+        }
+      } else if (direction === 'output') {
+        const matched = room.outputs?.find(isTargetMatch);
+        if (matched) {
+          try {
+            await roomStore.removeRoomOutput(room.id, matched);
+          } catch (err) {
+            console.warn(`[RoomCanvas] Failed to unbind output route ${matched} from room ${room.id}:`, err);
+          }
+        }
+      } else {
+        // Direction not specified: defensive unbind for both
+        const matchedIn = room.inputs?.find(isTargetMatch);
+        if (matchedIn) {
+          try {
+            await roomStore.removeRoomInput(room.id, matchedIn);
+          } catch (err) {
+            console.warn(`[RoomCanvas] Failed to unbind input route ${matchedIn} from room ${room.id}:`, err);
+          }
+        }
+        const matchedOut = room.outputs?.find(isTargetMatch);
+        if (matchedOut) {
+          try {
+            await roomStore.removeRoomOutput(room.id, matchedOut);
+          } catch (err) {
+            console.warn(`[RoomCanvas] Failed to unbind output route ${matchedOut} from room ${room.id}:`, err);
+          }
+        }
       }
     }
 
-    // 2. Remove device from persistent layout staging
-    flowLayoutStore.disableDevice(deviceId);
+    // 2. Unstage directional endpoint or disable device strictly for this deviceId (NO cleanKey unstage wipeout)
+    if (direction) {
+      flowLayoutStore.unstageEndpoint(deviceId, direction);
+    } else {
+      flowLayoutStore.disableDevice(deviceId);
+    }
 
-    // 3. Re-synchronize canvas graph
+    // 3. Immediately persist to localStorage
+    flowLayoutStore.persistNow();
+
+    // 4. Re-synchronize canvas graph
     syncFlowGraph();
   }
 
   // HTML5 Drag-and-Drop handlers
-  function handleDragOver(event: DragEvent) {
-    event.preventDefault();
-    if (event.dataTransfer) {
-      event.dataTransfer.dropEffect = 'copy';
-    }
-  }
-
   function handleDrop(event: DragEvent) {
     event.preventDefault();
     const rawData = event.dataTransfer?.getData('application/json');
@@ -228,9 +398,7 @@
       const data = JSON.parse(rawData);
       const deviceId = data.deviceId;
       if (!deviceId) return;
-
-      const isOutput = data.direction === 'output';
-      const nodeId = isOutput ? `output-${deviceId}` : `input-${deviceId}`;
+      const devNodeId = data.nodeId || clusterStore.localNode?.node_id || '';
 
       // Project screen coordinates to SvelteFlow canvas coordinates
       let flowPos: { x: number; y: number };
@@ -249,39 +417,101 @@
         flowPos = { x: 100, y: 100 };
       }
 
-      flowLayoutStore.setPosition(nodeId, flowPos);
-      flowLayoutStore.enableDevice(deviceId);
+      // If user dropped on the right side of the canvas (x > 750) or device is an output, target the output node
+      const isOutput = data.direction === 'output' || (data.direction === 'duplex' && flowPos.x > 750);
+      const canvasKey = devNodeId && !deviceId.includes('/') ? `${devNodeId}/${deviceId}` : deviceId;
+      const dir: 'input' | 'output' = isOutput ? 'output' : 'input';
+
+      flowLayoutStore.stageEndpoint(canvasKey, dir, flowPos);
       syncFlowGraph();
     } catch (err) {
       console.error('[RoomCanvas] Failed to process dropped device payload:', err);
     }
   }
 
-  // Palette "+ Add" action handler
+  function handleDragOver(event: DragEvent) {
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = 'copy';
+    }
+  }
+
+  // Palette "+ Add" action handler (ADR 0027 directional staging)
   function handleAddDevice(device: AudioDevice | AudioDeviceSummary, direction?: 'input' | 'output') {
     const isOutput = direction === 'output' || (device.max_output > 0 && device.max_input === 0);
-    const nodeId = isOutput ? `output-${device.id}` : `input-${device.id}`;
+    const isInput = direction === 'input' || (device.max_input > 0 && device.max_output === 0);
+    const devNodeId = (device as any).node_id || clusterStore.localNode?.node_id || '';
+    const canvasKey = devNodeId && !device.id.includes('/') ? `${devNodeId}/${device.id}` : device.id;
 
-    // Compute default column slot if no coordinate exists
-    if (!flowLayoutStore.getPosition(nodeId)) {
-      const stagedInputCount = nodes.filter((n) => n.type === 'inputDevice').length;
-      const stagedOutputCount = nodes.filter((n) => n.type === 'outputDevice').length;
-      const defPos = getDefaultPosition(
-        isOutput ? 'output' : 'input',
-        isOutput ? stagedOutputCount : stagedInputCount
-      );
-      flowLayoutStore.setPosition(nodeId, defPos);
+    if (direction) {
+      const nodeId = direction === 'output' ? `output-${canvasKey}` : `input-${canvasKey}`;
+      let pos = flowLayoutStore.getPosition(nodeId) || flowLayoutStore.getPosition(direction === 'output' ? `output-${device.id}` : `input-${device.id}`);
+      if (!pos) {
+        const count = nodes.filter((n) => n.type === (direction === 'output' ? 'outputDevice' : 'inputDevice')).length;
+        pos = getDefaultPosition(direction, count);
+      }
+      flowLayoutStore.stageEndpoint(canvasKey, direction, pos);
+    } else if (isOutput) {
+      const nodeId = `output-${canvasKey}`;
+      let pos = flowLayoutStore.getPosition(nodeId) || flowLayoutStore.getPosition(`output-${device.id}`);
+      if (!pos) {
+        const count = nodes.filter((n) => n.type === 'outputDevice').length;
+        pos = getDefaultPosition('output', count);
+      }
+      flowLayoutStore.stageEndpoint(canvasKey, 'output', pos);
+    } else if (isInput) {
+      const nodeId = `input-${canvasKey}`;
+      let pos = flowLayoutStore.getPosition(nodeId) || flowLayoutStore.getPosition(`input-${device.id}`);
+      if (!pos) {
+        const count = nodes.filter((n) => n.type === 'inputDevice').length;
+        pos = getDefaultPosition('input', count);
+      }
+      flowLayoutStore.stageEndpoint(canvasKey, 'input', pos);
+    } else {
+      // Duplex device with unspecified direction: stage both endpoints
+      const inNodeId = `input-${canvasKey}`;
+      let inPos = flowLayoutStore.getPosition(inNodeId) || flowLayoutStore.getPosition(`input-${device.id}`);
+      if (!inPos) {
+        const count = nodes.filter((n) => n.type === 'inputDevice').length;
+        inPos = getDefaultPosition('input', count);
+      }
+      flowLayoutStore.stageEndpoint(canvasKey, 'input', inPos);
+
+      const outNodeId = `output-${canvasKey}`;
+      let outPos = flowLayoutStore.getPosition(outNodeId) || flowLayoutStore.getPosition(`output-${device.id}`);
+      if (!outPos) {
+        const count = nodes.filter((n) => n.type === 'outputDevice').length;
+        outPos = getDefaultPosition('output', count);
+      }
+      flowLayoutStore.stageEndpoint(canvasKey, 'output', outPos);
     }
 
-    flowLayoutStore.enableDevice(device.id);
     syncFlowGraph();
   }
 
-  // Palette "On Canvas" focus handler
-  function handleFocusDevice(deviceId: string) {
-    const inputNodeId = `input-${deviceId}`;
-    const outputNodeId = `output-${deviceId}`;
-    const targetNode = nodes.find((n) => n.id === inputNodeId || n.id === outputNodeId);
+  // Palette "On Canvas" focus handler with directional awareness (ADR 0027, ADR 0028)
+  function handleFocusDevice(deviceId: string, direction?: 'input' | 'output') {
+    const isTargetMatch = (nId: string, prefix: string) => {
+      const stripped = nId.slice(prefix.length);
+      if (stripped === deviceId) return true;
+      if (deviceId.includes('/')) {
+        return false;
+      }
+      return stripped.endsWith(`/${deviceId}`);
+    };
+
+    const targetNode = nodes.find((n) => {
+      if (direction === 'input') {
+        return n.id.startsWith('input-') && isTargetMatch(n.id, 'input-');
+      }
+      if (direction === 'output') {
+        return n.id.startsWith('output-') && isTargetMatch(n.id, 'output-');
+      }
+      if (n.id.startsWith('input-')) return isTargetMatch(n.id, 'input-');
+      if (n.id.startsWith('output-')) return isTargetMatch(n.id, 'output-');
+      return n.id === deviceId;
+    });
+
     if (targetNode && svelteFlowInstance?.setCenter) {
       svelteFlowInstance.setCenter(targetNode.position.x + 144, targetNode.position.y + 90, {
         zoom: 1.0,
@@ -290,50 +520,161 @@
     }
   }
 
-  // Synchronize visual graph: ONLY renders nodes for staged devices present in flowLayoutStore
+  // Helper to resolve an endpoint device from allKnown, or synthesize an offline fallback (ADR 0027, ADR 0028)
+  function resolveEndpointDevice(
+    rawId: string,
+    direction: 'input' | 'output',
+    allKnown: Map<string, AudioDevice | AudioDeviceSummary>
+  ): AudioDevice | AudioDeviceSummary {
+    let cleanId = rawId;
+    let inferredNodeId = '';
+    if (rawId.includes('/')) {
+      const slash = rawId.indexOf('/');
+      inferredNodeId = rawId.slice(0, slash);
+      cleanId = rawId.slice(slash + 1);
+    }
+
+    // If rawId has node qualification, match allKnown.get(rawId) ONLY.
+    // Do NOT fall back to cleanId if rawId is qualified, because cleanId might belong to another node!
+    const match = rawId.includes('/') ? allKnown.get(rawId) : (allKnown.get(rawId) || allKnown.get(cleanId));
+    if (match) {
+      return {
+        ...match,
+        node_id: inferredNodeId || (match as any).node_id || clusterStore.localNode?.node_id || '',
+      };
+    }
+
+    // Synthetic Fallback Descriptor for offline/unstaged devices (ADR 0027, ADR 0028)
+    const isVirt = cleanId.startsWith('virt:');
+    return {
+      id: cleanId,
+      node_id: inferredNodeId || clusterStore.localNode?.node_id || '',
+      name: `${cleanId} (Offline / Unstaged)`,
+      max_input: direction === 'input' ? (isVirt ? 2 : 1) : 0,
+      max_output: direction === 'output' ? (isVirt ? 2 : 1) : 0,
+      default_sample_rate: 48000,
+      is_virtual: isVirt,
+      volume: 1.0,
+      muted: false,
+    } as AudioDeviceSummary;
+  }
+
+  // Synchronize visual graph: ONLY renders nodes for staged directional endpoints present in flowLayoutStore
+  // or bound to active rooms (ADR 0027, ADR 0028)
   function syncFlowGraph(forceResetPositions = false) {
     const allKnown = getAllKnownDevices();
-    const stagedIds = flowLayoutStore.enabledDevices;
+    const currentRooms = roomStore.rooms;
 
-    const stagedDevs: (AudioDevice | AudioDeviceSummary)[] = [];
-    for (const id of stagedIds) {
-      const dev = allKnown.get(id);
-      if (dev) {
-        stagedDevs.push(dev);
-      } else {
-        // Disconnected or offline device fallback
-        stagedDevs.push({
-          id,
-          name: `${id} (Offline / Disconnected)`,
-          max_input: 2,
-          max_output: 2,
-          default_sample_rate: 48000,
-          is_virtual: id.startsWith('virt:'),
-          volume: 1.0,
-          muted: false,
-        });
+    const isDevInList = (devId: string, nodePrefix: string, list?: string[]) => {
+      if (!list || list.length === 0) return false;
+      const qualified = nodePrefix && !devId.includes('/') ? `${nodePrefix}/${devId}` : devId;
+      for (const item of list) {
+        if (item === qualified) return true;
+        if (item.includes('/')) {
+          if (qualified.includes('/')) continue; // Both qualified but different nodes: no match (ADR 0028)
+          if (item.endsWith(`/${devId}`)) return true;
+        } else {
+          if (item === devId) return true;
+        }
+      }
+      return false;
+    };
+
+    // Gather unique candidate devices across allKnown, room bindings, and flowLayoutStore staging
+    const candidateMap = new Map<string, AudioDevice | AudioDeviceSummary>();
+    for (const [key, dev] of allKnown) {
+      candidateMap.set(key, dev);
+    }
+
+    // Include devices from rooms
+    for (const room of currentRooms) {
+      if (room.inputs) {
+        for (const inId of room.inputs) {
+          const existing = candidateMap.get(inId);
+          if (!existing) {
+            candidateMap.set(inId, resolveEndpointDevice(inId, 'input', allKnown));
+          } else if (existing.max_input === 0) {
+            existing.max_input = existing.is_virtual ? 2 : 1;
+          }
+        }
+      }
+      if (room.outputs) {
+        for (const outId of room.outputs) {
+          const existing = candidateMap.get(outId);
+          if (!existing) {
+            candidateMap.set(outId, resolveEndpointDevice(outId, 'output', allKnown));
+          } else if (existing.max_output === 0) {
+            existing.max_output = existing.is_virtual ? 2 : 1;
+          }
+        }
       }
     }
 
-    const inputDevs = stagedDevs.filter((d) => d.max_input > 0);
-    const outputDevs = stagedDevs.filter((d) => d.max_output > 0);
-    const currentRooms = roomStore.rooms;
-    const roomSummaries = currentRooms.map((r) => ({ id: r.id, name: r.name }));
+    // Include devices from flowLayoutStore staging
+    for (const rawId of flowLayoutStore.enabledDevices) {
+      const clean = rawId.replace(/^(in:|out:|input-|output-)/, '');
+      const dir = rawId.startsWith('out:') || rawId.startsWith('output-') ? 'output' : 'input';
+      const existing = candidateMap.get(clean);
+      if (!existing) {
+        candidateMap.set(clean, resolveEndpointDevice(clean, dir, allKnown));
+      } else if (dir === 'input' && existing.max_input === 0) {
+        existing.max_input = existing.is_virtual ? 2 : 1;
+      } else if (dir === 'output' && existing.max_output === 0) {
+        existing.max_output = existing.is_virtual ? 2 : 1;
+      }
+    }
 
+    // Filter candidate devices to inputDevs and outputDevs based on directional staging
+    const inputDevs: (AudioDevice | AudioDeviceSummary)[] = [];
+    const outputDevs: (AudioDevice | AudioDeviceSummary)[] = [];
+
+    const seenInputKeys = new Set<string>();
+    const seenOutputKeys = new Set<string>();
+
+    for (const dev of candidateMap.values()) {
+      const devNodeId = (dev as any).node_id || clusterStore.localNode?.node_id || '';
+      const canvasKey = devNodeId && !dev.id.includes('/') ? `${devNodeId}/${dev.id}` : dev.id;
+
+      // Check input staging: staged in store OR bound to any room input (ADR 0028 strict canonical)
+      const isInputStaged =
+        dev.max_input > 0 &&
+        (flowLayoutStore.isEndpointStaged(canvasKey, 'input') ||
+          currentRooms.some((r) => isDevInList(dev.id, devNodeId, r.inputs)));
+
+      if (isInputStaged && !seenInputKeys.has(canvasKey)) {
+        seenInputKeys.add(canvasKey);
+        inputDevs.push(dev);
+      }
+
+      // Check output staging: staged in store OR bound to any room output (ADR 0028 strict canonical)
+      const isOutputStaged =
+        dev.max_output > 0 &&
+        (flowLayoutStore.isEndpointStaged(canvasKey, 'output') ||
+          currentRooms.some((r) => isDevInList(dev.id, devNodeId, r.outputs)));
+
+      if (isOutputStaged && !seenOutputKeys.has(canvasKey)) {
+        seenOutputKeys.add(canvasKey);
+        outputDevs.push(dev);
+      }
+    }
+
+    const roomSummaries = currentRooms.map((r) => ({ id: r.id, name: r.name }));
     const nextNodes: Node[] = [];
     const nextEdges: Edge[] = [];
 
     // 1. Generate Staged Input Nodes (Left Column)
     inputDevs.forEach((dev, index) => {
-      const nodeId = `input-${dev.id}`;
-      let pos = forceResetPositions ? null : flowLayoutStore.getPosition(nodeId);
+      const devNodeId = (dev as any).node_id || clusterStore.localNode?.node_id || '';
+      const canvasKey = devNodeId && !dev.id.includes('/') ? `${devNodeId}/${dev.id}` : dev.id;
+      const nodeId = `input-${canvasKey}`;
+      let pos = forceResetPositions ? null : (flowLayoutStore.getPosition(nodeId) || flowLayoutStore.getPosition(`input-${dev.id}`));
       if (!pos) {
         pos = getDefaultPosition('input', index);
         flowLayoutStore.setPosition(nodeId, pos);
       }
 
       const assignedRooms = currentRooms
-        .filter((r) => r.inputs && r.inputs.includes(dev.id))
+        .filter((r) => isDevInList(dev.id, devNodeId, r.inputs))
         .map((r) => ({ id: r.id, name: r.name }));
 
       nextNodes.push({
@@ -344,9 +685,9 @@
           device: dev,
           assignedRooms,
           allRooms: roomSummaries,
-          onAddToRoom: (roomId: string) => roomStore.addRoomInput(roomId, dev.id),
-          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomInput(roomId, dev.id),
-          onDismiss: () => handleDismissDevice(dev.id, 'input'),
+          onAddToRoom: (roomId: string) => roomStore.addRoomInput(roomId, dev.id, devNodeId),
+          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomInput(roomId, canvasKey),
+          onDismiss: () => handleDismissDevice(canvasKey, 'input'),
         },
       });
     });
@@ -360,18 +701,25 @@
         flowLayoutStore.setPosition(nodeId, pos);
       }
 
-      const assignedInputs = stagedDevs.filter(
-        (d) => d.max_input > 0 && room.inputs && room.inputs.includes(d.id)
-      );
-      const assignedOutputs = stagedDevs.filter(
-        (d) => d.max_output > 0 && room.outputs && room.outputs.includes(d.id)
-      );
+      // ADR 0027, ADR 0028: Decouple assignedInputs and assignedOutputs from stagedDevs!
+      // Resolve every device in room.inputs and room.outputs directly from allKnown (or synthetic fallback).
+      // Guarantees room.inputs.length === assignedInputs.length 1:1, preserving canonical endpoint_id.
+      const assignedInputs = (room.inputs || []).map((inId) => {
+        const d = resolveEndpointDevice(inId, 'input', allKnown);
+        return { ...d, endpoint_id: inId };
+      });
+      const assignedOutputs = (room.outputs || []).map((outId) => {
+        const d = resolveEndpointDevice(outId, 'output', allKnown);
+        return { ...d, endpoint_id: outId };
+      });
 
-      const availableInputs = stagedDevs.filter(
-        (d) => d.max_input > 0 && (!room.inputs || !room.inputs.includes(d.id))
+      // Available inputs/outputs for the "+ Input" / "+ Output" dropdown menus
+      const uniqueKnown = Array.from(new Set(allKnown.values()));
+      const availableInputs = uniqueKnown.filter(
+        (d) => d.max_input > 0 && !isDevInList(d.id, (d as any).node_id || '', room.inputs)
       );
-      const availableOutputs = stagedDevs.filter(
-        (d) => d.max_output > 0 && (!room.outputs || !room.outputs.includes(d.id))
+      const availableOutputs = uniqueKnown.filter(
+        (d) => d.max_output > 0 && !isDevInList(d.id, (d as any).node_id || '', room.outputs)
       );
 
       nextNodes.push({
@@ -385,26 +733,64 @@
           availableInputs,
           availableOutputs,
           onToggleSync: (synced: boolean) => roomStore.setRoomSync(room.id, synced),
-          onAddInput: (devId: string) => roomStore.addRoomInput(room.id, devId),
-          onRemoveInput: (devId: string) => roomStore.removeRoomInput(room.id, devId),
-          onAddOutput: (devId: string) => roomStore.addRoomOutput(room.id, devId),
-          onRemoveOutput: (devId: string) => roomStore.removeRoomOutput(room.id, devId),
-          onDeleteRoom: () => {
+          onAddInput: (devId: string) => {
+            let devNodeId = '';
+            let targetDev = devId;
+            if (devId.includes('/')) {
+              devNodeId = devId.slice(0, devId.indexOf('/'));
+              targetDev = devId.slice(devId.indexOf('/') + 1);
+            } else {
+              const d = allKnown.get(devId);
+              devNodeId = (d as any)?.node_id || '';
+            }
+            roomStore.addRoomInput(room.id, targetDev, devNodeId);
+          },
+          onRemoveInput: (endpointId: string) => roomStore.removeRoomInput(room.id, endpointId),
+          onAddOutput: (devId: string) => {
+            let devNodeId = '';
+            let targetDev = devId;
+            if (devId.includes('/')) {
+              devNodeId = devId.slice(0, devId.indexOf('/'));
+              targetDev = devId.slice(devId.indexOf('/') + 1);
+            } else {
+              const d = allKnown.get(devId);
+              devNodeId = (d as any)?.node_id || '';
+            }
+            roomStore.addRoomOutput(room.id, targetDev, devNodeId);
+          },
+          onRemoveOutput: (endpointId: string) => roomStore.removeRoomOutput(room.id, endpointId),
+          onDeleteRoom: async () => {
             if (confirm(`Delete audio room "${room.name}" (${room.id})?`)) {
-              roomStore.deleteRoom(room.id);
+              flowLayoutStore.deleteNodePosition(`room-${room.id}`);
+              flowLayoutStore.persistNow();
+              try {
+                await roomStore.deleteRoom(room.id);
+              } catch (err) {
+                console.error(`Failed to delete room ${room.id}:`, err);
+              }
+              syncFlowGraph();
             }
           },
         },
       });
 
       // 3. Generate Edges for this Room
-      // (a) Input -> Room
+      // (a) Input -> Room (ADR 0028 strict canonical matching)
       if (room.inputs) {
         for (const inputDevId of room.inputs) {
-          if (inputDevs.some((d) => d.id === inputDevId)) {
+          const matchDev = inputDevs.find((d) => {
+            const devNodeId = (d as any).node_id || clusterStore.localNode?.node_id || '';
+            const qualifiedId = devNodeId && !d.id.includes('/') ? `${devNodeId}/${d.id}` : d.id;
+            if (qualifiedId === inputDevId) return true;
+            if (inputDevId.includes('/')) return false;
+            return d.id === inputDevId;
+          });
+          if (matchDev) {
+            const devNodeId = (matchDev as any).node_id || clusterStore.localNode?.node_id || '';
+            const canvasKey = devNodeId && !matchDev.id.includes('/') ? `${devNodeId}/${matchDev.id}` : matchDev.id;
             nextEdges.push({
-              id: `edge-in-${inputDevId}-to-${room.id}`,
-              source: `input-${inputDevId}`,
+              id: `edge-in-${canvasKey}-to-${room.id}`,
+              source: `input-${canvasKey}`,
               target: `room-${room.id}`,
               sourceHandle: 'out',
               targetHandle: 'in',
@@ -416,14 +802,23 @@
         }
       }
 
-      // (b) Room -> Output
+      // (b) Room -> Output (ADR 0028 strict canonical matching)
       if (room.outputs) {
         for (const outputDevId of room.outputs) {
-          if (outputDevs.some((d) => d.id === outputDevId)) {
+          const matchDev = outputDevs.find((d) => {
+            const devNodeId = (d as any).node_id || clusterStore.localNode?.node_id || '';
+            const qualifiedId = devNodeId && !d.id.includes('/') ? `${devNodeId}/${d.id}` : d.id;
+            if (qualifiedId === outputDevId) return true;
+            if (outputDevId.includes('/')) return false;
+            return d.id === outputDevId;
+          });
+          if (matchDev) {
+            const devNodeId = (matchDev as any).node_id || clusterStore.localNode?.node_id || '';
+            const canvasKey = devNodeId && !matchDev.id.includes('/') ? `${devNodeId}/${matchDev.id}` : matchDev.id;
             nextEdges.push({
-              id: `edge-room-${room.id}-to-out-${outputDevId}`,
+              id: `edge-room-${room.id}-to-out-${canvasKey}`,
               source: `room-${room.id}`,
-              target: `output-${outputDevId}`,
+              target: `output-${canvasKey}`,
               sourceHandle: 'out',
               targetHandle: 'in',
               animated: true,
@@ -437,15 +832,17 @@
 
     // 4. Generate Staged Output Nodes (Right Column)
     outputDevs.forEach((dev, index) => {
-      const nodeId = `output-${dev.id}`;
-      let pos = forceResetPositions ? null : flowLayoutStore.getPosition(nodeId);
+      const devNodeId = (dev as any).node_id || clusterStore.localNode?.node_id || '';
+      const canvasKey = devNodeId && !dev.id.includes('/') ? `${devNodeId}/${dev.id}` : dev.id;
+      const nodeId = `output-${canvasKey}`;
+      let pos = forceResetPositions ? null : (flowLayoutStore.getPosition(nodeId) || flowLayoutStore.getPosition(`output-${dev.id}`));
       if (!pos) {
         pos = getDefaultPosition('output', index);
         flowLayoutStore.setPosition(nodeId, pos);
       }
 
       const sourceRooms = currentRooms
-        .filter((r) => r.outputs && r.outputs.includes(dev.id))
+        .filter((r) => isDevInList(dev.id, devNodeId, r.outputs))
         .map((r) => ({ id: r.id, name: r.name }));
 
       nextNodes.push({
@@ -456,9 +853,9 @@
           device: dev,
           sourceRooms,
           allRooms: roomSummaries,
-          onAddToRoom: (roomId: string) => roomStore.addRoomOutput(roomId, dev.id),
-          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomOutput(roomId, dev.id),
-          onDismiss: () => handleDismissDevice(dev.id, 'output'),
+          onAddToRoom: (roomId: string) => roomStore.addRoomOutput(roomId, dev.id, devNodeId),
+          onRemoveFromRoom: (roomId: string) => roomStore.removeRoomOutput(roomId, canvasKey),
+          onDismiss: () => handleDismissDevice(canvasKey, 'output'),
         },
       });
     });
@@ -475,6 +872,11 @@
     const _staged = flowLayoutStore.enabledDevices;
 
     untrack(() => {
+      // If canvas has never been configured and rooms/devices just arrived (e.g. after initial gateway disconnect), stage defaults
+      if (!flowLayoutStore.hasSavedLayout && flowLayoutStore.enabledDevices.size === 0 && roomStore.rooms.length > 0) {
+        ensureRoomDevicesStaged();
+        ensureDefaultStaging();
+      }
       syncFlowGraph(false);
     });
   });
@@ -485,7 +887,7 @@
 </script>
 
 <div class="relative flex h-full w-full bg-studio-dark select-none overflow-hidden">
-  <!-- Left Side: Collapsible Multi-Node Device Palette (ADR 0012) -->
+  <!-- Left Side: Collapsible Multi-Node Device Palette (ADR 0012, ADR 0027) -->
   {#if flowLayoutStore.sidebarOpen}
     <DevicePalette
       onAddDevice={handleAddDevice}
@@ -503,14 +905,14 @@
     aria-label="Audio Flow Canvas"
   >
     <!-- Prominent Sticky Error Notification Banner -->
-    {#if roomStore.lastError || deviceStore.error || invalidConnectionNotice}
+    {#if roomStore.lastError || roomStore.error || deviceStore.error || invalidConnectionNotice}
       <div
-        class="absolute top-2 left-1/2 -translate-x-1/2 z-50 w-11/12 max-w-2xl rounded-xl bg-red-950/95 border border-red-500/50 p-3 shadow-2xl backdrop-blur-md flex items-center justify-between gap-3 text-xs text-red-200 animate-in fade-in slide-in-from-top-2 duration-200"
+        class="absolute top-20 left-1/2 -translate-x-1/2 z-50 w-11/12 max-w-2xl rounded-xl bg-red-950/95 border border-red-500/50 p-3 shadow-2xl backdrop-blur-md flex items-center justify-between gap-3 text-xs text-red-200 animate-in fade-in slide-in-from-top-2 duration-200"
       >
         <div class="flex items-center gap-2 min-w-0">
           <AlertCircle class="w-4 h-4 text-red-400 shrink-0" />
           <span class="truncate font-mono">
-            {invalidConnectionNotice || roomStore.lastError || deviceStore.error}
+            {invalidConnectionNotice || roomStore.lastError || roomStore.error || deviceStore.error}
           </span>
         </div>
         <button
@@ -534,27 +936,27 @@
       bind:edges
       bind:viewport
       {nodeTypes}
-      fitView
+      fitView={!flowLayoutStore.viewport}
       minZoom={0.2}
       maxZoom={2.0}
       onnodedragstop={handleNodeDragStop}
+      onmoveend={({ viewport: vp }) => {
+        if (vp) flowLayoutStore.setViewport(vp);
+      }}
       onconnect={handleConnect}
       ondelete={handleDelete}
       {isValidConnection}
       class="bg-zinc-950"
     >
       <!-- Background grid dots -->
-      <Background gap={20} size={1.5} color="#27272a" />
+      <Background color="#27272a" gap={20} size={1.5} />
 
-      <!-- Canvas Navigation Controls -->
-      <Controls class="!bg-zinc-900/90 !border !border-zinc-800 !text-zinc-200 !rounded-xl !shadow-xl overflow-hidden" />
-
-      <!-- MiniMap for studio configurations -->
+      <!-- Controls & Minimap -->
+      <Controls class="!bg-zinc-900/90 !border !border-zinc-800 !rounded-xl !shadow-xl !fill-zinc-300" />
       <MiniMap
-        nodeStrokeColor="#06b6d4"
-        nodeColor="#18181b"
-        maskColor="rgba(9, 9, 11, 0.8)"
-        class="!bg-zinc-950 !border !border-zinc-800/90 !rounded-xl !shadow-2xl overflow-hidden"
+        class="!bg-zinc-900/90 !border !border-zinc-800 !rounded-xl !shadow-xl"
+        nodeColor="#3f3f46"
+        maskColor="rgba(9, 9, 11, 0.75)"
       />
 
       <!-- Top Left Information & Palette Toggle Panel -->
@@ -604,32 +1006,34 @@
 
       <!-- Top Right Action Toolbar Panel -->
       <Panel position="top-right" class="m-3">
-        <div class="flex items-center gap-2 rounded-2xl border border-zinc-800/90 bg-zinc-950/85 backdrop-blur-md p-2 shadow-2xl">
+        <div class="flex flex-wrap items-center justify-end gap-1.5 sm:gap-2 rounded-2xl border border-zinc-800/90 bg-zinc-950/85 backdrop-blur-md p-2 shadow-2xl">
           <!-- Add Room Button -->
           <button
             type="button"
             onclick={() => (isCreateRoomOpen = true)}
-            class="inline-flex items-center gap-1.5 rounded-lg bg-cyan-500 px-3 py-1.5 text-xs font-mono font-bold text-zinc-950 shadow-sm shadow-cyan-500/30 hover:bg-cyan-400 transition-all cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-lg bg-cyan-500 px-2.5 sm:px-3 py-1.5 text-xs font-mono font-bold text-zinc-950 shadow-sm shadow-cyan-500/30 hover:bg-cyan-400 transition-all cursor-pointer shrink-0"
           >
             <Plus class="w-3.5 h-3.5" />
-            <span>New Room</span>
+            <span class="hidden sm:inline">New Room</span>
+            <span class="sm:hidden">Room</span>
           </button>
 
           <!-- Add Virtual Device Button -->
           <button
             type="button"
             onclick={() => (isCreateVirtualOpen = true)}
-            class="inline-flex items-center gap-1.5 rounded-lg border border-purple-500/30 bg-purple-500/10 px-3 py-1.5 text-xs font-mono font-semibold text-purple-300 hover:bg-purple-500/20 transition-all cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-purple-500/30 bg-purple-500/10 px-2.5 sm:px-3 py-1.5 text-xs font-mono font-semibold text-purple-300 hover:bg-purple-500/20 transition-all cursor-pointer shrink-0"
           >
             <Radio class="w-3.5 h-3.5 text-purple-400" />
-            <span>New Virtual Loopback</span>
+            <span class="hidden md:inline">New Virtual Loopback</span>
+            <span class="md:hidden">Virtual</span>
           </button>
 
           <!-- Auto-Arrange Layout Button -->
           <button
             type="button"
             onclick={handleAutoArrange}
-            class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono font-medium text-zinc-300 hover:bg-zinc-800 transition-colors cursor-pointer"
+            class="inline-flex items-center gap-1.5 rounded-lg border border-zinc-700 bg-zinc-900 px-2.5 py-1.5 text-xs font-mono font-medium text-zinc-300 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
             title="Reset layout and align nodes in Left-to-Right signal flow columns"
           >
             <RotateCcw class="w-3.5 h-3.5 text-cyan-400" />
@@ -640,7 +1044,7 @@
           <button
             type="button"
             onclick={() => meterStore.toggleSimulation()}
-            class="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-mono transition-colors cursor-pointer {meterStore.useSimulation
+            class="inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-xs font-mono transition-colors cursor-pointer shrink-0 {meterStore.useSimulation
               ? 'border-emerald-500/50 bg-emerald-950/30 text-emerald-300'
               : 'border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200'}"
             title="Toggle audio signal simulation for live LED meters"
@@ -657,7 +1061,7 @@
               deviceStore.loadDevices();
               clusterStore.pollCluster();
             }}
-            class="inline-flex items-center justify-center h-8 w-8 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer"
+            class="inline-flex items-center justify-center h-8 w-8 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800 transition-colors cursor-pointer shrink-0"
             title="Reload devices and rooms"
             aria-label="Reload devices and rooms"
           >

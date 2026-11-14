@@ -64,54 +64,21 @@ class DeviceStore {
     return ports;
   });
 
-  async loadDevices(kind?: 'all' | 'input' | 'output' | 'virtual') {
-    this.isLoading = true;
-    this.error = null;
+  async loadDevices(kind?: 'all' | 'input' | 'output' | 'virtual', silent = false) {
+    if (!silent) this.isLoading = true;
     try {
       const fetched = await apiClient.listDevices(kind);
-      this.devices = fetched;
+      if (JSON.stringify(fetched) !== JSON.stringify(this.devices)) {
+        this.devices = fetched;
+      }
+      this.error = null;
     } catch (err: any) {
       this.error = err.message || 'Failed to enumerate audio devices';
-      // If server unreachable, provide sample hardware and loopback devices so UI remains operable
-      if (this.devices.length === 0) {
-        this.devices = [
-          {
-            id: 'hw:0',
-            name: 'ALSA Default Soundcard (PCM 24-bit/48kHz)',
-            max_input: 2,
-            max_output: 2,
-            default_sample_rate: 48000,
-            is_virtual: false,
-            volume: 1.0,
-            muted: false,
-            supported_layouts: ['stereo'],
-          },
-          {
-            id: 'hw:1',
-            name: 'USB Audio Interface (Focusrite Scarlett 4i4)',
-            max_input: 4,
-            max_output: 4,
-            default_sample_rate: 96000,
-            is_virtual: false,
-            volume: 1.0,
-            muted: false,
-            supported_layouts: ['stereo', 'quad'],
-          },
-          {
-            id: 'virt:loop-main',
-            name: 'Virtual Loopback Bus A (DAW Out)',
-            max_input: 2,
-            max_output: 2,
-            default_sample_rate: 48000,
-            is_virtual: true,
-            volume: 1.0,
-            muted: false,
-            supported_layouts: ['stereo'],
-          },
-        ];
+      if (!silent) {
+        this.devices = [];
       }
     } finally {
-      this.isLoading = false;
+      if (!silent) this.isLoading = false;
     }
   }
 

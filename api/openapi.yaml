@@ -557,10 +557,13 @@ paths:
 
   /api/v1/rooms/{roomId}/join:
     post:
+      deprecated: true
       tags:
         - Rooms
-      summary: Join local node to audio room
-      description: Joins the room, establishes mesh audio peer connections, and engages format downmix/upmix adapters.
+      summary: Join local node to audio room (Deprecated)
+      description: |
+        Deprecated: Audio routes are automatically compiled via bindings and the Audio Flow engine.
+        Joins the room, establishes mesh audio peer connections, and engages format downmix/upmix adapters.
       operationId: joinRoom
       parameters:
         - $ref: '#/components/parameters/RoomIdParam'
@@ -576,10 +579,13 @@ paths:
 
   /api/v1/rooms/{roomId}/leave:
     post:
+      deprecated: true
       tags:
         - Rooms
-      summary: Leave audio room
-      description: Disconnects local peer from room session.
+      summary: Leave audio room (Deprecated)
+      description: |
+        Deprecated: Audio routes are automatically compiled via bindings and the Audio Flow engine.
+        Disconnects local peer from room session.
       operationId: leaveRoom
       parameters:
         - $ref: '#/components/parameters/RoomIdParam'
@@ -738,17 +744,53 @@ paths:
       tags:
         - Telemetry
       summary: Query snapshot of stream diagnostics
-      description: Returns real-time metrics including FEC recovery counts, PLC concealment events, ASRC drift ppm, and jitter buffer histograms.
+      description: |
+        Returns real-time metrics including FEC recovery counts, PLC concealment events, ASRC
+        drift ppm, and jitter buffer histograms.
+
+        The response map is keyed by ROUTE ID (room routes are of the form
+        `room-<roomId>-<inDev>-<outDev>`; the per-entry `stream_id` field remains the opaque
+        derived hex stream ID). ADR 0034: each entry additively gains optional `health`
+        (RouteHealth) and `devices` (RouteDeviceImpact) fields, present only when the
+        daemon's ArtifactAggregator is wired, plus always-present `late_packets` /
+        `early_packets` on the per-peer `JitterStats`.
       operationId: getStreamStats
       responses:
         '200':
-          description: Stream statistics by stream ID.
+          description: Stream statistics by route ID.
           content:
             application/json:
               schema:
                 type: object
                 additionalProperties:
                   $ref: '#/components/schemas/StreamStats'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+
+  /api/v1/telemetry/device-artifacts:
+    get:
+      tags:
+        - Telemetry
+      summary: Per-physical-device audio artifact health (ADR 0034)
+      description: |
+        Returns the URN-keyed map of per-device artifact health: 10 s windowed hardware
+        XRun counts per direction, lifetime XRun totals, the audibility score (0-100), and
+        the 4-tier ArtifactSeverity grade (NONE / MINOR / MAJOR / CRITICAL).
+
+        Hardware XRuns are shared across every route using the device (one physical
+        PortAudio stream per device, ref-counted) and are intentionally NOT folded into
+        per-route scores. Returns an empty object when the ArtifactAggregator is unwired
+        (tests, partial startup).
+      operationId: getDeviceArtifacts
+      responses:
+        '200':
+          description: Device artifact health by device URN.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  $ref: '#/components/schemas/DeviceHealth'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
 
@@ -1767,6 +1809,8 @@ components:
         - target_depth_frames
         - underruns
         - overruns
+        - late_packets
+        - early_packets
       properties:
         current_depth_frames:
           type: integer
@@ -1779,6 +1823,14 @@ components:
           example: 0
         overruns:
           type: integer
+          example: 0
+        late_packets:
+          type: integer
+          description: ADR 0034 — always present (0 when absent). Late-arriving packets dropped by the jitter buffer.
+          example: 2
+        early_packets:
+          type: integer
+          description: ADR 0034 — always present (0 when absent). Retained for backward compatibility (no increment site).
           example: 0
         jitter_ms:
           type: number
@@ -1913,6 +1965,270 @@ components:
           additionalProperties:
             $ref: '#/components/schemas/JitterStats'
           description: Per-remote-peer jitter and reception statistics.
+        health:
+          $ref: '#/components/schemas/RouteHealth'
+          description: ADR 0034 — optional per-route artifact health over the 10 s window. Omitted when the ArtifactAggregator is unwired.
+        devices:
+          $ref: '#/components/schemas/RouteDeviceImpact'
+          description: ADR 0034 — optional overlay of the route's source/destination device artifact health (shared XRuns are never folded into the route score). Omitted when the ArtifactAggregator is unwired.
+
+    # --------------------------------------------------------------------------
+    # Audio Artifact Health (ADR 0034)
+    #
+    # ArtifactSeverity is a 4-tier audibility grade (NONE / MINOR / MAJOR /
+    # CRITICAL) and is deliberately DISTINCT from the 5-tier node link-quality
+    # grade (EXCELLENT / GOOD / FAIR / POOR / CRITICAL). No cross-mapping.
+    # --------------------------------------------------------------------------
+    ArtifactRates:
+      type: object
+      required:
+        - underrun_per_s
+        - overrun_per_s
+        - xrun_per_s
+        - ring_drop_per_s
+      properties:
+        underrun_per_s:
+          type: number
+          description: Jitter underrun events per second over the actual window span (ramp-up safe).
+          example: 0.1
+        overrun_per_s:
+          type: number
+          description: Jitter overrun events per second over the window.
+          example: 0.0
+        xrun_per_s:
+          type: number
+          description: Device-shared hardware XRun rate for the route's own devices (rendered on the distinct "shared device" line).
+          example: 0.1
+        ring_drop_per_s:
+          type: number
+          description: Capture/playback ring drop events per second over the window.
+          example: 0.0
+
+    PeerArtifactHealth:
+      type: object
+      required:
+        - underruns
+        - overruns
+        - late_packets
+      properties:
+        underruns:
+          type: integer
+          example: 1
+        overruns:
+          type: integer
+          example: 0
+        late_packets:
+          type: integer
+          example: 0
+
+    RouteHealth:
+      type: object
+      required:
+        - score
+        - severity
+        - window_s
+        - underruns
+        - overruns
+        - ring_drops
+        - plc_concealed
+        - fec_unrecoverable
+        - packets_lost
+        - fec_recovered
+        - playout_gaps
+        - rates
+        - ghost
+        - peers
+      properties:
+        score:
+          type: number
+          description: Audibility-based score 0-100 (multiplicative coefficients over the 10 s window; route-scoped counters only).
+          example: 80
+        severity:
+          type: string
+          description: "4-tier ArtifactSeverity: NONE (score >= 90), MINOR (>= 60), MAJOR (>= 30), CRITICAL (< 30)."
+          enum: [NONE, MINOR, MAJOR, CRITICAL]
+          example: MINOR
+        window_s:
+          type: integer
+          description: Aggregation window length in seconds.
+          example: 10
+        underruns:
+          type: integer
+          description: Windowed jitter buffer underrun events.
+          example: 1
+        overruns:
+          type: integer
+          description: Windowed jitter buffer overrun events.
+          example: 0
+        ring_drops:
+          type: integer
+          description: Windowed capture/playback ring drop events.
+          example: 0
+        plc_concealed:
+          type: integer
+          description: Windowed PLC-concealed frames.
+          example: 10
+        fec_unrecoverable:
+          type: integer
+          description: Windowed FEC-unrecoverable groups.
+          example: 0
+        packets_lost:
+          type: integer
+          description: Windowed lost packets.
+          example: 0
+        fec_recovered:
+          type: integer
+          description: Windowed FEC-recovered packets. Informational only (proof FEC is working; no scoring weight).
+          example: 2
+        playout_gaps:
+          type: integer
+          description: Windowed playout gaps. Informational only (not scored; pre-roll inflates it).
+          example: 0
+        rates:
+          $ref: '#/components/schemas/ArtifactRates'
+        ghost:
+          type: boolean
+          description: True when the route's device is quarantined (GHOST); severity may read NONE, which is correct.
+          example: false
+        peers:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/PeerArtifactHealth'
+          description: Per-remote-peer windowed artifact triple (underruns / overruns / late_packets) for the "worst peer" column.
+          example:
+            node-audio-02:
+              underruns: 1
+              overruns: 0
+              late_packets: 0
+
+    DeviceDirArtifacts:
+      type: object
+      required:
+        - xrun_window
+        - xrun_total
+      properties:
+        xrun_window:
+          type: integer
+          description: Hardware XRuns in the 10 s window for this direction.
+          example: 1
+        xrun_total:
+          type: integer
+          description: Device-lifetime hardware XRuns for this direction (monotonic across stream swaps).
+          example: 12
+
+    DeviceHealth:
+      type: object
+      required:
+        - urn
+        - ghost
+        - score
+        - severity
+      properties:
+        urn:
+          type: string
+          description: Canonical device URN (the map key).
+          example: alsa://hw:1,0
+        ghost:
+          type: boolean
+          description: True when the device is quarantined (GHOST).
+          example: false
+        score:
+          type: number
+          description: Device audibility score 0-100 (C_xrun(input) * C_xrun(output); a missing direction contributes 1.0).
+          example: 70
+        severity:
+          type: string
+          description: 4-tier ArtifactSeverity (same mapping as RouteHealth).
+          enum: [NONE, MINOR, MAJOR, CRITICAL]
+          example: MINOR
+        input:
+          $ref: '#/components/schemas/DeviceDirArtifacts'
+          description: Present only when the device has an active input direction.
+        output:
+          $ref: '#/components/schemas/DeviceDirArtifacts'
+          description: Present only when the device has an active output direction.
+
+    RouteDeviceImpact:
+      type: object
+      properties:
+        input:
+          $ref: '#/components/schemas/DeviceHealth'
+          description: Artifact health of the route's source device (omitted when absent from the snapshot).
+        output:
+          $ref: '#/components/schemas/DeviceHealth'
+          description: Artifact health of the route's destination device (omitted when absent from the snapshot).
+
+    StreamLinkStats:
+      type: object
+      required:
+        - stream_id
+        - packets_sent
+        - packets_received
+        - packets_lost
+        - loss_ratio
+        - effective_kbps
+        - jitter_depth_frames
+        - jitter_target_delay_ms
+        - underruns
+        - overruns
+        - late_packets
+        - early_packets
+        - fec_recovered
+        - plc_concealed
+      description: |
+        Per-stream link statistics as carried by `GET /api/v1/network/health`
+        (streams keyed by opaque hex stream ID). ADR 0034 additively adds
+        always-present `late_packets` / `early_packets`; there is deliberately
+        NO RouteHealth/DeviceHealth mirror on this surface (hex stream IDs
+        cannot carry route or device identity).
+      properties:
+        stream_id:
+          type: string
+          example: 9f2ab6c1e4d38a5b0c7d1f6e2a9b4c0d
+        peer_id:
+          type: string
+          example: node-audio-02
+        packets_sent:
+          type: integer
+          example: 145020
+        packets_received:
+          type: integer
+          example: 145018
+        packets_lost:
+          type: integer
+          example: 0
+        loss_ratio:
+          type: number
+          example: 0.00001
+        effective_kbps:
+          type: number
+          example: 482.5
+        jitter_depth_frames:
+          type: integer
+          example: 4
+        jitter_target_delay_ms:
+          type: number
+          example: 4.2
+        underruns:
+          type: integer
+          example: 1
+        overruns:
+          type: integer
+          example: 0
+        late_packets:
+          type: integer
+          description: ADR 0034 — always present (0 when absent).
+          example: 0
+        early_packets:
+          type: integer
+          description: ADR 0034 — always present (0 when absent; dead counter kept for backward compatibility).
+          example: 0
+        fec_recovered:
+          type: integer
+          example: 2
+        plc_concealed:
+          type: integer
+          example: 0
 
     # --------------------------------------------------------------------------
     # Network Condition Simulator

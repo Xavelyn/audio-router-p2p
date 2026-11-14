@@ -167,8 +167,8 @@
   <!-- Multi-Node Filter Bar -->
   <div class="border-b border-zinc-800/80 bg-zinc-950/50 px-4 py-2 flex flex-wrap items-center justify-between gap-3 shrink-0">
     <!-- Node Filter Pills -->
-    <div class="flex items-center gap-1.5 overflow-x-auto">
-      <span class="text-xs font-mono text-zinc-500 flex items-center gap-1 mr-1">
+    <div class="flex items-center gap-1.5 overflow-x-auto min-w-0 flex-1 py-0.5">
+      <span class="text-xs font-mono text-zinc-500 flex items-center gap-1 mr-1 shrink-0">
         <Server class="w-3.5 h-3.5 text-zinc-400" />
         <span>Node:</span>
       </span>
@@ -176,7 +176,7 @@
       <!-- All Nodes -->
       <button
         onclick={() => (selectedNodeFilter = 'all')}
-        class="rounded-lg px-2.5 py-1 text-xs font-mono transition-all {selectedNodeFilter === 'all'
+        class="shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 text-xs font-mono transition-all cursor-pointer {selectedNodeFilter === 'all'
           ? 'bg-cyan-500 text-zinc-950 font-bold shadow-sm shadow-cyan-500/20'
           : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-zinc-800'}"
       >
@@ -189,11 +189,11 @@
         {@const localDevCount = allDevices.filter(d => d.node_id === localId || d.node_name?.toLowerCase().includes('local')).length}
         <button
           onclick={() => (selectedNodeFilter = 'local')}
-          class="rounded-lg px-2.5 py-1 text-xs font-mono transition-all flex items-center gap-1.5 {selectedNodeFilter === 'local'
+          class="shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 text-xs font-mono transition-all flex items-center gap-1.5 cursor-pointer {selectedNodeFilter === 'local'
             ? 'bg-cyan-500 text-zinc-950 font-bold shadow-sm shadow-cyan-500/20'
             : 'bg-zinc-900 text-zinc-300 hover:bg-zinc-800 hover:text-zinc-100 border border-zinc-800'}"
         >
-          <span class="h-1.5 w-1.5 rounded-full bg-cyan-400"></span>
+          <span class="h-1.5 w-1.5 rounded-full bg-cyan-400 shrink-0"></span>
           <span>Local Node ({localDevCount})</span>
         </button>
       {/if}
@@ -204,19 +204,19 @@
         {@const rDevCount = allDevices.filter(d => d.node_id === rId).length}
         <button
           onclick={() => (selectedNodeFilter = rId)}
-          class="rounded-lg px-2.5 py-1 text-xs font-mono transition-all flex items-center gap-1.5 {selectedNodeFilter === rId
+          class="shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 text-xs font-mono transition-all flex items-center gap-1.5 cursor-pointer {selectedNodeFilter === rId
             ? 'bg-cyan-500 text-zinc-950 font-bold shadow-sm shadow-cyan-500/20'
             : 'bg-zinc-900 text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200 border border-zinc-800'}"
         >
-          <span class="h-1.5 w-1.5 rounded-full {rNode.swim_state === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+          <span class="h-1.5 w-1.5 rounded-full shrink-0 {rNode.swim_state === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
           <span>{rNode.name || rId} ({rDevCount})</span>
         </button>
       {/each}
     </div>
 
     <!-- Kind Filter Pills -->
-    <div class="flex items-center gap-1">
-      <span class="text-xs font-mono text-zinc-500 flex items-center gap-1 mr-1">
+    <div class="flex items-center gap-1 shrink-0">
+      <span class="text-xs font-mono text-zinc-500 flex items-center gap-1 mr-1 shrink-0">
         <Filter class="w-3.5 h-3.5 text-zinc-400" />
         <span>Kind:</span>
       </span>
@@ -229,7 +229,7 @@
       ] as kind}
         <button
           onclick={() => (selectedKindFilter = kind.id as any)}
-          class="rounded-md px-2 py-0.5 text-xs font-mono transition-colors {selectedKindFilter === kind.id
+          class="shrink-0 whitespace-nowrap rounded-md px-2 py-0.5 text-xs font-mono transition-colors cursor-pointer {selectedKindFilter === kind.id
             ? 'bg-zinc-800 text-cyan-400 font-semibold border border-cyan-500/30'
             : 'text-zinc-400 hover:text-zinc-200'}"
         >
@@ -268,59 +268,59 @@
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {#each inputsList as dev}
                 {@const nodeInfo = getNodeInfo(dev.node_id)}
-                <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg hover:border-zinc-700 transition-all flex flex-col justify-between">
+                <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg hover:border-zinc-700 transition-all flex flex-col justify-between">
                   <div>
                     <!-- Top Badges: Node Origin & Direction -->
                     <div class="flex items-start justify-between gap-2">
-                      <div class="flex items-center gap-1.5 flex-wrap">
+                      <div class="flex items-center gap-1.5 flex-wrap min-w-0">
                         <!-- Host Node Badge -->
-                        <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold border flex items-center gap-1 {nodeInfo.isLocal
+                        <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold border flex items-center gap-1 shrink-0 {nodeInfo.isLocal
                           ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
                           : 'bg-zinc-800 text-zinc-300 border-zinc-700'}">
-                          <span class="h-1.5 w-1.5 rounded-full {nodeInfo.swimState === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                          <span>{nodeInfo.name}</span>
+                          <span class="h-1.5 w-1.5 rounded-full shrink-0 {nodeInfo.swimState === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                          <span class="truncate max-w-[120px]">{nodeInfo.name}</span>
                         </span>
 
-                        <span class="rounded bg-blue-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-blue-400 border border-blue-500/20">
+                        <span class="rounded bg-blue-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-blue-400 border border-blue-500/20 shrink-0">
                           INPUT
                         </span>
 
                         {#if dev.status === 'quarantined'}
-                          <span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40 animate-pulse">
+                          <span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40 animate-pulse shrink-0">
                             GHOST (OFFLINE)
                           </span>
                         {/if}
                       </div>
 
-                      <span class="rounded bg-zinc-950/80 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800">
+                      <span class="rounded bg-zinc-950/80 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800 shrink-0">
                         {dev.max_input || 2} Ch
                       </span>
                     </div>
 
                     <!-- Device Name -->
-                    <h3 class="mt-2.5 text-sm font-semibold text-zinc-100 line-clamp-2">
+                    <h3 class="mt-2.5 text-sm font-semibold text-zinc-100 line-clamp-2" title={dev.name}>
                       {dev.name}
                     </h3>
-                    <p class="text-[10px] font-mono text-zinc-500 truncate mt-0.5">
+                    <p class="text-[10px] font-mono text-zinc-500 truncate mt-0.5" title={dev.device_id || dev.id}>
                       ID: {dev.device_id || dev.id}
                     </p>
 
                     <!-- Technical Specs Grid -->
                     <div class="mt-3 grid grid-cols-2 gap-2 text-xs font-mono">
-                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                         <span class="text-[10px] text-zinc-400 block">CHANNELS</span>
-                        <span class="text-zinc-200 font-bold">{dev.max_input} In Channels</span>
+                        <span class="text-zinc-200 font-bold truncate block">{dev.max_input} In Channels</span>
                       </div>
-                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                         <span class="text-[10px] text-zinc-400 block">SAMPLE RATE</span>
-                        <span class="text-cyan-400 font-bold">{dev.default_sample_rate / 1000} kHz</span>
+                        <span class="text-cyan-400 font-bold truncate block">{dev.default_sample_rate / 1000} kHz</span>
                       </div>
                     </div>
                   </div>
 
                   <!-- Fader & Remote Mute Controls -->
                   <div class="mt-4 pt-3 border-t border-zinc-800/80 flex items-center justify-between gap-3">
-                    <div class="flex items-center gap-2 flex-1">
+                    <div class="flex items-center gap-2 flex-1 min-w-0">
                       <Volume2 class="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                       <input
                         type="range"
@@ -329,16 +329,16 @@
                         step="0.05"
                         value={dev.volume ?? 1.0}
                         onchange={(e) => handleVolumeChange(dev, parseFloat((e.target as HTMLInputElement).value))}
-                        class="w-full accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
+                        class="w-full min-w-[50px] accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg shrink"
                       />
-                      <span class="text-[10px] font-mono text-zinc-400 w-8 text-right">
+                      <span class="text-[10px] font-mono text-zinc-400 w-9 text-right shrink-0">
                         {Math.round((dev.volume ?? 1.0) * 100)}%
                       </span>
                     </div>
 
                     <button
                       onclick={() => handleMuteToggle(dev)}
-                      class="rounded p-1.5 transition-colors {dev.muted ? 'bg-red-950/60 text-red-400 border border-red-500/30' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'}"
+                      class="rounded p-1.5 transition-colors shrink-0 cursor-pointer {dev.muted ? 'bg-red-950/60 text-red-400 border border-red-500/30' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'}"
                       title={dev.muted ? 'Unmute' : 'Mute'}
                     >
                       {#if dev.muted}
@@ -380,59 +380,59 @@
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {#each outputsList as dev}
                 {@const nodeInfo = getNodeInfo(dev.node_id)}
-                <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg hover:border-zinc-700 transition-all flex flex-col justify-between">
+                <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg hover:border-zinc-700 transition-all flex flex-col justify-between">
                   <div>
                     <!-- Top Badges: Node Origin & Direction -->
                     <div class="flex items-start justify-between gap-2">
-                      <div class="flex items-center gap-1.5 flex-wrap">
+                      <div class="flex items-center gap-1.5 flex-wrap min-w-0">
                         <!-- Host Node Badge -->
-                        <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold border flex items-center gap-1 {nodeInfo.isLocal
+                        <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold border flex items-center gap-1 shrink-0 {nodeInfo.isLocal
                           ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
                           : 'bg-zinc-800 text-zinc-300 border-zinc-700'}">
-                          <span class="h-1.5 w-1.5 rounded-full {nodeInfo.swimState === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                          <span>{nodeInfo.name}</span>
+                          <span class="h-1.5 w-1.5 rounded-full shrink-0 {nodeInfo.swimState === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                          <span class="truncate max-w-[120px]">{nodeInfo.name}</span>
                         </span>
 
-                        <span class="rounded bg-purple-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-purple-400 border border-purple-500/20">
+                        <span class="rounded bg-purple-500/10 px-2 py-0.5 text-[10px] font-mono font-semibold text-purple-400 border border-purple-500/20 shrink-0">
                           OUTPUT
                         </span>
 
                         {#if dev.status === 'quarantined'}
-                          <span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40 animate-pulse">
+                          <span class="rounded bg-amber-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-amber-300 border border-amber-500/40 animate-pulse shrink-0">
                             GHOST (OFFLINE)
                           </span>
                         {/if}
                       </div>
 
-                      <span class="rounded bg-zinc-950/80 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800">
+                      <span class="rounded bg-zinc-950/80 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800 shrink-0">
                         {dev.max_output || 2} Ch
                       </span>
                     </div>
 
                     <!-- Device Name -->
-                    <h3 class="mt-2.5 text-sm font-semibold text-zinc-100 line-clamp-2">
+                    <h3 class="mt-2.5 text-sm font-semibold text-zinc-100 line-clamp-2" title={dev.name}>
                       {dev.name}
                     </h3>
-                    <p class="text-[10px] font-mono text-zinc-500 truncate mt-0.5">
+                    <p class="text-[10px] font-mono text-zinc-500 truncate mt-0.5" title={dev.device_id || dev.id}>
                       ID: {dev.device_id || dev.id}
                     </p>
 
                     <!-- Technical Specs Grid -->
                     <div class="mt-3 grid grid-cols-2 gap-2 text-xs font-mono">
-                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                         <span class="text-[10px] text-zinc-400 block">OUTPUTS</span>
-                        <span class="text-zinc-200 font-bold">{dev.max_output} Out Channels</span>
+                        <span class="text-zinc-200 font-bold truncate block">{dev.max_output} Out Channels</span>
                       </div>
-                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                         <span class="text-[10px] text-zinc-400 block">SAMPLE RATE</span>
-                        <span class="text-cyan-400 font-bold">{dev.default_sample_rate / 1000} kHz</span>
+                        <span class="text-cyan-400 font-bold truncate block">{dev.default_sample_rate / 1000} kHz</span>
                       </div>
                     </div>
                   </div>
 
                   <!-- Fader & Remote Mute Controls -->
                   <div class="mt-4 pt-3 border-t border-zinc-800/80 flex items-center justify-between gap-3">
-                    <div class="flex items-center gap-2 flex-1">
+                    <div class="flex items-center gap-2 flex-1 min-w-0">
                       <Volume2 class="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                       <input
                         type="range"
@@ -441,16 +441,16 @@
                         step="0.05"
                         value={dev.volume ?? 1.0}
                         onchange={(e) => handleVolumeChange(dev, parseFloat((e.target as HTMLInputElement).value))}
-                        class="w-full accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
+                        class="w-full min-w-[50px] accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg shrink"
                       />
-                      <span class="text-[10px] font-mono text-zinc-400 w-8 text-right">
+                      <span class="text-[10px] font-mono text-zinc-400 w-9 text-right shrink-0">
                         {Math.round((dev.volume ?? 1.0) * 100)}%
                       </span>
                     </div>
 
                     <button
                       onclick={() => handleMuteToggle(dev)}
-                      class="rounded p-1.5 transition-colors {dev.muted ? 'bg-red-950/60 text-red-400 border border-red-500/30' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'}"
+                      class="rounded p-1.5 transition-colors shrink-0 cursor-pointer {dev.muted ? 'bg-red-950/60 text-red-400 border border-red-500/30' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'}"
                       title={dev.muted ? 'Unmute' : 'Mute'}
                     >
                       {#if dev.muted}
@@ -497,18 +497,18 @@
             <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {#each virtualList as vDev}
                 {@const nodeInfo = getNodeInfo(vDev.node_id)}
-                <div class="rounded-xl border border-cyan-900/40 bg-zinc-900/80 p-4 shadow-lg hover:border-cyan-700/60 transition-all flex flex-col justify-between">
+                <div class="min-w-0 rounded-xl border border-cyan-900/40 bg-zinc-900/80 p-4 shadow-lg hover:border-cyan-700/60 transition-all flex flex-col justify-between">
                   <div>
                     <div class="flex items-start justify-between gap-2">
-                      <div class="flex items-center gap-1.5 flex-wrap">
-                        <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold border flex items-center gap-1 {nodeInfo.isLocal
+                      <div class="flex items-center gap-1.5 flex-wrap min-w-0">
+                        <span class="rounded px-2 py-0.5 text-[10px] font-mono font-bold border flex items-center gap-1 shrink-0 {nodeInfo.isLocal
                           ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30'
                           : 'bg-zinc-800 text-zinc-300 border-zinc-700'}">
-                          <span class="h-1.5 w-1.5 rounded-full {nodeInfo.swimState === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                          <span>{nodeInfo.name}</span>
+                          <span class="h-1.5 w-1.5 rounded-full shrink-0 {nodeInfo.swimState === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                          <span class="truncate max-w-[120px]">{nodeInfo.name}</span>
                         </span>
 
-                        <span class="rounded bg-cyan-500/10 px-2 py-0.5 text-[10px] font-mono text-cyan-400 border border-cyan-500/20">
+                        <span class="rounded bg-cyan-500/10 px-2 py-0.5 text-[10px] font-mono text-cyan-400 border border-cyan-500/20 shrink-0">
                           VIRTUAL BUS
                         </span>
                       </div>
@@ -516,36 +516,37 @@
                       {#if nodeInfo.isLocal}
                         <button
                           onclick={() => handleDeleteVirtual(vDev.id || vDev.device_id || '')}
-                          class="rounded p-1 text-zinc-500 hover:text-red-400 hover:bg-red-950/30 transition-colors"
+                          class="rounded p-1 text-zinc-500 hover:text-red-400 hover:bg-red-950/30 transition-colors shrink-0 cursor-pointer"
                           title="Delete Virtual Device"
+                          aria-label="Delete Virtual Device"
                         >
                           <Trash2 class="w-3.5 h-3.5" />
                         </button>
                       {/if}
                     </div>
 
-                    <h3 class="mt-2.5 text-sm font-semibold text-zinc-100">
+                    <h3 class="mt-2.5 text-sm font-semibold text-zinc-100 truncate" title={vDev.name}>
                       {vDev.name}
                     </h3>
-                    <p class="text-[10px] font-mono text-zinc-500 truncate mt-0.5">
+                    <p class="text-[10px] font-mono text-zinc-500 truncate mt-0.5" title={vDev.device_id || vDev.id}>
                       ID: {vDev.device_id || vDev.id}
                     </p>
 
                     <div class="mt-3 grid grid-cols-2 gap-2 text-xs font-mono">
-                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                         <span class="text-[10px] text-zinc-400 block">CHANNELS</span>
-                        <span class="text-zinc-200 font-bold">{Math.max(vDev.max_input, vDev.max_output)} Channels</span>
+                        <span class="text-zinc-200 font-bold truncate block">{Math.max(vDev.max_input, vDev.max_output)} Channels</span>
                       </div>
-                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                      <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                         <span class="text-[10px] text-zinc-400 block">SAMPLE RATE</span>
-                        <span class="text-cyan-400 font-bold">{vDev.default_sample_rate / 1000} kHz</span>
+                        <span class="text-cyan-400 font-bold truncate block">{vDev.default_sample_rate / 1000} kHz</span>
                       </div>
                     </div>
                   </div>
 
                   <!-- Fader & Mute -->
                   <div class="mt-4 pt-3 border-t border-zinc-800/80 flex items-center justify-between gap-3">
-                    <div class="flex items-center gap-2 flex-1">
+                    <div class="flex items-center gap-2 flex-1 min-w-0">
                       <Volume2 class="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                       <input
                         type="range"
@@ -554,16 +555,16 @@
                         step="0.05"
                         value={vDev.volume ?? 1.0}
                         onchange={(e) => handleVolumeChange(vDev, parseFloat((e.target as HTMLInputElement).value))}
-                        class="w-full accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
+                        class="w-full min-w-[50px] accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg shrink"
                       />
-                      <span class="text-[10px] font-mono text-zinc-400 w-8 text-right">
+                      <span class="text-[10px] font-mono text-zinc-400 w-9 text-right shrink-0">
                         {Math.round((vDev.volume ?? 1.0) * 100)}%
                       </span>
                     </div>
 
                     <button
                       onclick={() => handleMuteToggle(vDev)}
-                      class="rounded p-1.5 transition-colors {vDev.muted ? 'bg-red-950/60 text-red-400 border border-red-500/30' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'}"
+                      class="rounded p-1.5 transition-colors shrink-0 cursor-pointer {vDev.muted ? 'bg-red-950/60 text-red-400 border border-red-500/30' : 'bg-zinc-900 text-zinc-400 hover:text-zinc-100 border border-zinc-800'}"
                       title={vDev.muted ? 'Unmute' : 'Mute'}
                     >
                       {#if vDev.muted}

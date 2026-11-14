@@ -128,6 +128,89 @@ func TestASRCResampler_NaNAndInfSanitization(t *testing.T) {
 	}
 }
 
+func TestASRCResampler_SmallPacketHistoryContinuity(t *testing.T) {
+	channels := 1
+	resampler := NewASRCResampler(channels)
+	frameBytes := channels * 2
+
+	// Feed 5 frames one by one (1-frame packets)
+	values := []int16{1000, 2000, 3000, 4000, 5000}
+	outBuf := make([]byte, 16)
+	for _, val := range values {
+		inBuf := make([]byte, frameBytes)
+		binary.LittleEndian.PutUint16(inBuf, uint16(val))
+		resampler.Process(inBuf, outBuf, 1.0)
+	}
+
+	// At this point, history must contain the last 3 frames: [3000, 4000, 5000]
+	// If the old zero-padding bug were present, history[0] and history[1] would be 0!
+	expectedHist := []int16{3000, 4000, 5000}
+	for i, exp := range expectedHist {
+		got := resampler.history[i]
+		if got != exp {
+			t.Errorf("history[%d] = %d, want %d (zero-padding wiped history!)", i, got, exp)
+		}
+	}
+
+	// Now feed a 2-frame packet: [6000, 7000]
+	inBuf2 := make([]byte, 2*frameBytes)
+	binary.LittleEndian.PutUint16(inBuf2[0:], 6000)
+	binary.LittleEndian.PutUint16(inBuf2[2:], 7000)
+	resampler.Process(inBuf2, outBuf, 1.0)
+
+	// History should now be [5000, 6000, 7000]
+	expectedHist2 := []int16{5000, 6000, 7000}
+	for i, exp := range expectedHist2 {
+		got := resampler.history[i]
+		if got != exp {
+			t.Errorf("after 2-frame packet: history[%d] = %d, want %d", i, got, exp)
+		}
+	}
+
+	// Verify audio continuity: compare stream processed in 1-2 frame chunks vs contiguous
+	fullInput := generateSinePCM(48000, 2, 440.0, 100)
+	rContig := NewASRCResampler(2)
+	outContig := make([]byte, len(fullInput)*2)
+	nContig := rContig.Process(fullInput, outContig, 1.0001)
+
+	rSmall := NewASRCResampler(2)
+	var outSmall []byte
+	chunkSizes := []int{1, 2, 1, 3, 1, 2}
+	off := 0
+	csIdx := 0
+	frameBytes2 := 4
+	for off < len(fullInput) {
+		frames := chunkSizes[csIdx%len(chunkSizes)]
+		csIdx++
+		byteLen := frames * frameBytes2
+		if off+byteLen > len(fullInput) {
+			byteLen = len(fullInput) - off
+		}
+		inChunk := fullInput[off : off+byteLen]
+		chunkOut := make([]byte, 32)
+		n := rSmall.Process(inChunk, chunkOut, 1.0001)
+		outSmall = append(outSmall, chunkOut[:n]...)
+		off += byteLen
+	}
+
+	minLen := nContig
+	if len(outSmall) < minLen {
+		minLen = len(outSmall)
+	}
+	maxDiff := 0
+	for i := 0; i < minLen/2; i++ {
+		s1 := int(int16(binary.LittleEndian.Uint16(outContig[i*2:])))
+		s2 := int(int16(binary.LittleEndian.Uint16(outSmall[i*2:])))
+		diff := int(math.Abs(float64(s1 - s2)))
+		if diff > maxDiff {
+			maxDiff = diff
+		}
+	}
+	if maxDiff > 100 {
+		t.Fatalf("small-packet processing resulted in audio discontinuity, max diff = %d", maxDiff)
+	}
+}
+
 func BenchmarkASRCResampler_Process(b *testing.B) {
 	channels := 2
 	resampler := NewASRCResampler(channels)

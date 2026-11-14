@@ -15,6 +15,11 @@ var (
 	ErrInvalidParameter      = errors.New("invalid parameter")
 )
 
+// TelemetryBroadcaster dispatches relayed meter frames to local subscribers.
+type TelemetryBroadcaster interface {
+	BroadcastRelayed(msg []byte)
+}
+
 // AudioDeviceSummary represents a physical soundcard or virtual loopback audio device
 // situated on a local or remote node in the cluster.
 type AudioDeviceSummary struct {

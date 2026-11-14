@@ -49,6 +49,7 @@ type RoomInfo struct {
 type RoomManager interface {
 	ListRooms() []RoomInfo
 	CreateRoom(id, name string) (RoomInfo, error)
+	DeleteRoom(id string) error
 	JoinRoom(id string) error
 	LeaveRoom(id string) error
 	AddInput(roomID, deviceID string) error
@@ -78,8 +79,9 @@ type Server struct {
 	hub      *telemetry.TelemetryHub
 	v1Server *v1.V1Server
 
-	aggregator       *netTelemetry.Aggregator
-	networkCollector *metrics.NetworkMetricsCollector
+	aggregator         *netTelemetry.Aggregator
+	artifactAggregator *netTelemetry.ArtifactAggregator
+	networkCollector   *metrics.NetworkMetricsCollector
 
 	clusterMgr *cluster.Manager
 }
@@ -158,6 +160,9 @@ func NewServer(cfg *config.Config, rt *router.Router, disc *discovery.Discovery,
 
 	// Pre-initialize telemetry hub and canonical v1 server
 	_ = s.Hub()
+	if s.clusterMgr != nil {
+		s.clusterMgr.SetTelemetryBroadcaster(s.hub)
+	}
 	_ = s.V1()
 	s.V1().SetAggregator(s.aggregator)
 	s.V1().SetClusterManager(s.clusterMgr)
@@ -179,6 +184,22 @@ func (s *Server) SetAggregator(agg *netTelemetry.Aggregator) {
 	}
 }
 
+// ArtifactAggregator returns the audio artifact telemetry aggregator (ADR
+// 0034). It is constructed in the daemon, which owns its route/device
+// sources; the API server only holds and exposes it.
+func (s *Server) ArtifactAggregator() *netTelemetry.ArtifactAggregator {
+	return s.artifactAggregator
+}
+
+// SetArtifactAggregator configures the artifact telemetry aggregator and
+// forwards it to the V1 server (mirrors SetAggregator).
+func (s *Server) SetArtifactAggregator(agg *netTelemetry.ArtifactAggregator) {
+	s.artifactAggregator = agg
+	if s.v1Server != nil {
+		s.v1Server.SetArtifactAggregator(agg)
+	}
+}
+
 // GetHealthSnapshot supplies the latest atomic snapshot to the Prometheus collector.
 func (s *Server) GetHealthSnapshot() *netTelemetry.NetworkHealthSnapshot {
 	if s.aggregator != nil {
@@ -195,6 +216,9 @@ func (s *Server) ClusterManager() *cluster.Manager {
 // SetClusterManager configures an external or custom cluster manager.
 func (s *Server) SetClusterManager(mgr *cluster.Manager) {
 	s.clusterMgr = mgr
+	if s.hub != nil && mgr != nil {
+		mgr.SetTelemetryBroadcaster(s.hub)
+	}
 	if s.v1Server != nil {
 		s.v1Server.SetClusterManager(mgr)
 	}
@@ -208,6 +232,15 @@ func (s *Server) SetNetworkSimulator(sim *transport.NetworkSimulator) {
 
 // Close gracefully shuts down the API server and its background subsystems.
 func (s *Server) Close() error {
+	if s.hub != nil {
+		s.hub.Stop()
+	}
+	if s.aggregator != nil {
+		_ = s.aggregator.Close()
+	}
+	if s.artifactAggregator != nil {
+		s.artifactAggregator.Stop()
+	}
 	if s.clusterMgr != nil {
 		_ = s.clusterMgr.Close()
 	}
@@ -328,6 +361,22 @@ func (a *localClusterNodeAdapter) ActiveStreams() int {
 	return 0
 }
 
+func (a *localClusterNodeAdapter) ExportCRDTRooms() ([]byte, error) {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ ExportCRDTRooms() ([]byte, error) }); ok {
+		return syncer.ExportCRDTRooms()
+	}
+	return nil, fmt.Errorf("crdt room sync not supported")
+}
+
+func (a *localClusterNodeAdapter) MergeCRDTRooms(data []byte) error {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ MergeCRDTRooms([]byte) error }); ok {
+		return syncer.MergeCRDTRooms(data)
+	}
+	return fmt.Errorf("crdt room sync not supported")
+}
+
 type clusterDiscoveryAdapter struct {
 	disc *discovery.Discovery
 }
@@ -346,6 +395,13 @@ func (a *clusterDiscoveryAdapter) Peers() []discovery.Peer {
 	return nil
 }
 
+func (a *clusterDiscoveryAdapter) LivePeers() []discovery.Peer {
+	if a.disc != nil {
+		return a.disc.LivePeers()
+	}
+	return nil
+}
+
 func (a *clusterDiscoveryAdapter) PeerByID(id string) *discovery.Peer {
 	if a.disc != nil {
 		return a.disc.PeerByID(id)
@@ -357,7 +413,7 @@ func (a *clusterDiscoveryAdapter) PeerState(id string) string {
 	if a.disc != nil {
 		return a.disc.PeerState(id)
 	}
-	return "alive"
+	return "unknown"
 }
 
 type streamProviderAdapter struct {
@@ -406,6 +462,9 @@ func (a *streamProviderAdapter) StreamLinkStats() []netTelemetry.StreamLinkStats
 func (s *Server) Hub() *telemetry.TelemetryHub {
 	if s.hub == nil {
 		s.hub = telemetry.NewTelemetryHub(30)
+		if s.clusterMgr != nil {
+			s.clusterMgr.SetTelemetryBroadcaster(s.hub)
+		}
 	}
 	return s.hub
 }
@@ -499,6 +558,14 @@ func (a *v1RoomManagerAdapter) CreateRoom(id, name string) (v1.RoomInfo, error) 
 		InputGains:    r.InputGains,
 		OutputGains:   r.OutputGains,
 	}, nil
+}
+
+func (a *v1RoomManagerAdapter) DeleteRoom(id string) error {
+	rm := a.s.getRoomManager()
+	if rm == nil {
+		return fmt.Errorf("room manager not configured")
+	}
+	return rm.DeleteRoom(id)
 }
 
 func (a *v1RoomManagerAdapter) JoinRoom(id string) error {
@@ -604,6 +671,22 @@ func (a *v1RoomManagerAdapter) SetOutputGain(roomID, deviceID string, gain float
 	return nil
 }
 
+func (a *v1RoomManagerAdapter) ExportCRDTRooms() ([]byte, error) {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ ExportCRDTRooms() ([]byte, error) }); ok {
+		return syncer.ExportCRDTRooms()
+	}
+	return nil, fmt.Errorf("crdt room sync not supported")
+}
+
+func (a *v1RoomManagerAdapter) MergeCRDTRooms(data []byte) error {
+	rm := a.s.getRoomManager()
+	if syncer, ok := rm.(interface{ MergeCRDTRooms([]byte) error }); ok {
+		return syncer.MergeCRDTRooms(data)
+	}
+	return fmt.Errorf("crdt room sync not supported")
+}
+
 // Handler returns the fully-wrapped HTTP handler with CORS, body size limiting, metrics, and panic recovery.
 func (s *Server) Handler() http.Handler {
 	return s.cors(s.recoverPanic(s.metrics(s.maxBytes(s.mux))))
@@ -648,6 +731,9 @@ func (s *Server) routes() {
 
 	// 3. Canonical OpenAPI 3.1 V1 endpoints
 	s.V1().MountRoutes(s.mux)
+
+	// 4. Embedded SPA Web UI serving with fallback
+	s.mountSPAHandler()
 }
 
 func writeJSON(w http.ResponseWriter, code int, v interface{}) {

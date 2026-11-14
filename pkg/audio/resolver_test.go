@@ -1,7 +1,15 @@
 package audio
 
 import (
+	"bytes"
+	"encoding/binary"
+	"io"
+	"math"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestDeviceResolver_RegistrationAndAliases(t *testing.T) {
@@ -79,12 +87,16 @@ func TestDeviceResolver_QuarantineAndGhost(t *testing.T) {
 		t.Errorf("expected quarantined status, got %s", dQuar.Status)
 	}
 
-	// Open input should return Ghost stream without failing
+	// Open input should return Ghost stream virtual handle without failing
 	st, err := resolver.OpenInput("0", 48000, 2, true)
 	if err != nil {
 		t.Fatalf("OpenInput error: %v", err)
 	}
-	if _, ok := st.(*GhostAudioStream); !ok {
+	if handle, ok := st.(*RefStreamHandle); ok {
+		if _, isGhost := handle.Underlying().(*GhostAudioStream); !isGhost {
+			t.Errorf("expected underlying GhostAudioStream for quarantined device, got %T", handle.Underlying())
+		}
+	} else if _, ok := st.(*GhostAudioStream); !ok {
 		t.Errorf("expected GhostAudioStream for quarantined device, got %T", st)
 	}
 	_ = st.Close()
@@ -122,5 +134,1398 @@ func TestDeviceResolver_AlsaNameRegex(t *testing.T) {
 	d2, ok2 := resolver.Resolve("hw:1,0")
 	if !ok2 || d2.URN != dev.URN {
 		t.Fatalf("failed to resolve by hw:1,0: %+v", d2)
+	}
+}
+
+func TestDeviceResolver_SiblingSubdeviceMigration(t *testing.T) {
+	resolver := NewDeviceResolver()
+
+	// Creative Sound Blaster Play! 3:
+	// Subdevice 0: Playback ONLY (d=0)
+	// Subdevice 1: Capture ONLY (d=1)
+	spkURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=0"
+	micURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=1"
+
+	spkDev := Device{
+		ID:        spkURN,
+		URN:       spkURN,
+		LegacyID:  "0",
+		RuntimeID: 0,
+		Name:      "Sound Blaster Play! 3 (hw:1,0)",
+		MaxInput:  0,
+		MaxOutput: 2,
+	}
+	micDev := Device{
+		ID:        micURN,
+		URN:       micURN,
+		LegacyID:  "1",
+		RuntimeID: 1,
+		Name:      "Sound Blaster Play! 3 (hw:1,1)",
+		MaxInput:  2,
+		MaxOutput: 0,
+	}
+
+	resolver.Register(spkDev)
+	resolver.Register(micDev)
+
+	// If a user or legacy room configuration requested spkURN (d=0) as an INPUT:
+	// Resolver OpenInput should auto-migrate to micURN (d=1)
+	inStream, err := resolver.OpenInput(spkURN, 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenInput error: %v", err)
+	}
+	if inStream == nil {
+		t.Fatal("expected valid input stream")
+	}
+	_ = inStream.Close()
+
+	// ResolveInput should resolve to micURN
+	migratedIn, okIn := resolver.ResolveInput(spkURN)
+	if !okIn || migratedIn.URN != micURN {
+		t.Errorf("expected ResolveInput migration to micURN (%s), got %+v", micURN, migratedIn)
+	}
+
+	// Conversely, if micURN (d=1) is requested as an OUTPUT:
+	// Resolver OpenOutput should auto-migrate to spkURN (d=0)
+	outStream, err := resolver.OpenOutput(micURN, 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenOutput error: %v", err)
+	}
+	if outStream == nil {
+		t.Fatal("expected valid output stream")
+	}
+	_ = outStream.Close()
+
+	// ResolveOutput should resolve to spkURN
+	migratedOut, okOut := resolver.ResolveOutput(micURN)
+	if !okOut || migratedOut.URN != spkURN {
+		t.Errorf("expected ResolveOutput migration to spkURN (%s), got %+v", spkURN, migratedOut)
+	}
+
+	// Verify that standard Resolve() was NOT corrupted in aliases:
+	// spkURN must still resolve to spkURN, micURN must still resolve to micURN.
+	dSpk, okSpk := resolver.Resolve(spkURN)
+	if !okSpk || dSpk.URN != spkURN {
+		t.Errorf("canonical Resolve(%s) corrupted: got %s", spkURN, dSpk.URN)
+	}
+	dMic, okMic := resolver.Resolve(micURN)
+	if !okMic || dMic.URN != micURN {
+		t.Errorf("canonical Resolve(%s) corrupted: got %s", micURN, dMic.URN)
+	}
+}
+
+// TestDeviceResolver_ZombiePrevention verifies that opening a handle, closing it,
+// and reopening the device produces a working handle that reads audio without returning premature io.EOF.
+func TestDeviceResolver_ZombiePrevention(t *testing.T) {
+	resolver := NewDeviceResolver()
+	resolver.SetGracePeriod(50 * time.Millisecond)
+
+	micURN := "urn:audio:hw:test:zombie-mic"
+	vDev := NewVirtualAudioDevice()
+	resolver.Register(Device{
+		ID:        micURN,
+		URN:       micURN,
+		Name:      "Zombie Mic",
+		MaxInput:  2,
+		MaxOutput: 0,
+		Status:    "active",
+	})
+	resolver.Rebind(micURN, vDev)
+
+	// 1. Open handle 1
+	h1, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput 1 failed: %v", err)
+	}
+
+	// Push audio to vDev
+	pcm1 := makeTestPCM(480, 2, 440)
+	_, _ = vDev.InjectPush(pcm1)
+
+	readBuf := make([]byte, len(pcm1))
+	n1, err := readTimeout(h1, readBuf, 500*time.Millisecond)
+	if err != nil || n1 != len(pcm1) {
+		t.Fatalf("h1.Read failed: n=%d err=%v", n1, err)
+	}
+
+	// 2. Close handle 1
+	if err := h1.Close(); err != nil {
+		t.Fatalf("h1.Close failed: %v", err)
+	}
+
+	// Reading from closed handle 1 must return io.EOF
+	_, err = h1.Read(readBuf)
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF on closed handle h1, got %v", err)
+	}
+
+	// 3. Reopen device immediately (within grace window)
+	h2, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput 2 failed: %v", err)
+	}
+	defer h2.Close()
+
+	// Push more audio to vDev
+	pcm2 := makeTestPCM(480, 2, 880)
+	_, _ = vDev.InjectPush(pcm2)
+
+	// Handle 2 MUST NOT return io.EOF; it should read pcm2 cleanly
+	n2, err := readTimeout(h2, readBuf, 500*time.Millisecond)
+	if err == io.EOF {
+		t.Fatalf("ZOMBIE BUG DETECTED: h2 returned io.EOF on initial read!")
+	}
+	if err != nil || n2 != len(pcm2) {
+		t.Fatalf("h2.Read failed: n=%d err=%v", n2, err)
+	}
+
+	// 4. Close h2 and wait for grace period to expire
+	_ = h2.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify controller was evicted
+	if count := resolver.ActiveControllerCount(); count != 0 {
+		t.Fatalf("expected 0 active controllers after grace expiration, got %d", count)
+	}
+
+	// 5. Reopen device after grace expiration: should open cleanly with a new controller
+	vDev2 := NewVirtualAudioDevice()
+	resolver.Rebind(micURN, vDev2)
+	h3, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput 3 failed: %v", err)
+	}
+	defer h3.Close()
+
+	pcm3 := makeTestPCM(480, 2, 1000)
+	_, _ = vDev2.InjectPush(pcm3)
+
+	n3, err := readTimeout(h3, readBuf, 500*time.Millisecond)
+	if err != nil || n3 != len(pcm3) {
+		t.Fatalf("h3.Read failed after grace expiry: n=%d err=%v", n3, err)
+	}
+}
+
+// TestDeviceResolver_FullDuplexIsolation verifies that opening input and output on the same
+// full-duplex device URN maintains segregated controllers that do not close or interfere with each other.
+func TestDeviceResolver_FullDuplexIsolation(t *testing.T) {
+	resolver := NewDeviceResolver()
+
+	duplexURN := "urn:audio:hw:alsa:c=PCH:d=0"
+	inDev := NewVirtualAudioDevice()
+	outDev := NewVirtualAudioDevice()
+
+	resolver.Register(Device{
+		ID:        duplexURN,
+		URN:       duplexURN,
+		Name:      "Full Duplex Onboard Codec",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+
+	// Open input
+	resolver.RebindDirectional(duplexURN, DirectionInput, inDev)
+	inHandle, err := resolver.OpenInput(duplexURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput failed: %v", err)
+	}
+	defer inHandle.Close()
+
+	// Open output on the SAME URN - this must NOT close or clobber the input stream!
+	resolver.RebindDirectional(duplexURN, DirectionOutput, outDev)
+	outHandle, err := resolver.OpenOutput(duplexURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenOutput failed: %v", err)
+	}
+	defer outHandle.Close()
+
+	// Verify both controllers are registered in resolver
+	inKey := StreamKey{URN: duplexURN, Direction: DirectionInput}
+	outKey := StreamKey{URN: duplexURN, Direction: DirectionOutput}
+
+	resolver.mu.RLock()
+	inCtrl, hasIn := resolver.controllers[inKey]
+	outCtrl, hasOut := resolver.controllers[outKey]
+	resolver.mu.RUnlock()
+
+	if !hasIn || inCtrl == nil {
+		t.Fatal("expected active input controller")
+	}
+	if !hasOut || outCtrl == nil {
+		t.Fatal("expected active output controller")
+	}
+	if inCtrl == outCtrl {
+		t.Fatal("input and output controllers must be distinct instances")
+	}
+
+	// Push audio to input and verify read
+	pcmIn := makeTestPCM(256, 2, 440)
+	_, _ = inDev.InjectPush(pcmIn)
+	readBuf := make([]byte, len(pcmIn))
+	nIn, err := readTimeout(inHandle, readBuf, 500*time.Millisecond)
+	if err != nil || nIn != len(pcmIn) {
+		t.Fatalf("inHandle.Read failed: n=%d err=%v", nIn, err)
+	}
+
+	// Write audio to output and verify captured
+	pcmOut := makeTestPCM(256, 2, 880)
+	nOut, err := outHandle.Write(pcmOut)
+	if err != nil || nOut != len(pcmOut) {
+		t.Fatalf("outHandle.Write failed: n=%d err=%v", nOut, err)
+	}
+	if captured := outDev.CapturedBytes(); len(captured) < len(pcmOut) {
+		t.Fatalf("expected >= %d captured bytes, got %d", len(pcmOut), len(captured))
+	}
+
+	// Close output handle - input handle MUST remain fully operational!
+	if err := outHandle.Close(); err != nil {
+		t.Fatalf("outHandle.Close failed: %v", err)
+	}
+
+	_, _ = inDev.InjectPush(pcmIn)
+	nIn2, err := readTimeout(inHandle, readBuf, 500*time.Millisecond)
+	if err != nil || nIn2 != len(pcmIn) {
+		t.Fatalf("inHandle.Read failed after outHandle closed: n=%d err=%v", nIn2, err)
+	}
+}
+
+// TestDeviceResolver_CaptureFanOut verifies that two input handles on the same device receive
+// pushed audio independently with zero frame stealing.
+func TestDeviceResolver_CaptureFanOut(t *testing.T) {
+	resolver := NewDeviceResolver()
+
+	micURN := "urn:audio:hw:test:fanout-mic"
+	vDev := NewVirtualAudioDevice()
+
+	resolver.Register(Device{
+		ID:        micURN,
+		URN:       micURN,
+		Name:      "Fan-Out Mic",
+		MaxInput:  2,
+		MaxOutput: 0,
+		Status:    "active",
+	})
+	resolver.Rebind(micURN, vDev)
+
+	// Open two handles targeting the same input device
+	h1, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput 1 failed: %v", err)
+	}
+	defer h1.Close()
+
+	h2, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput 2 failed: %v", err)
+	}
+	defer h2.Close()
+
+	// Push 3 distinct audio blocks
+	blocks := [][]byte{
+		makeTestPCM(256, 2, 220),
+		makeTestPCM(256, 2, 440),
+		makeTestPCM(256, 2, 880),
+	}
+
+	for i, block := range blocks {
+		_, _ = vDev.InjectPush(block)
+
+		// Both h1 and h2 must receive the FULL block
+		buf1 := make([]byte, len(block))
+		buf2 := make([]byte, len(block))
+
+		n1, err1 := readTimeout(h1, buf1, 500*time.Millisecond)
+		if err1 != nil || n1 != len(block) {
+			t.Fatalf("block %d: h1.Read failed: n=%d err=%v", i, n1, err1)
+		}
+
+		n2, err2 := readTimeout(h2, buf2, 500*time.Millisecond)
+		if err2 != nil || n2 != len(block) {
+			t.Fatalf("block %d: h2.Read failed: n=%d err=%v", i, n2, err2)
+		}
+
+		if !bytes.Equal(buf1, block) {
+			t.Fatalf("block %d: h1 data mismatch", i)
+		}
+		if !bytes.Equal(buf2, block) {
+			t.Fatalf("block %d: h2 data mismatch", i)
+		}
+	}
+
+	// Now close h1: h2 must continue receiving subsequent audio
+	_ = h1.Close()
+
+	nextBlock := makeTestPCM(256, 2, 1760)
+	_, _ = vDev.InjectPush(nextBlock)
+
+	buf2 := make([]byte, len(nextBlock))
+	n2, err := readTimeout(h2, buf2, 500*time.Millisecond)
+	if err != nil || n2 != len(nextBlock) {
+		t.Fatalf("h2.Read failed after h1 closed: n=%d err=%v", n2, err)
+	}
+	if !bytes.Equal(buf2, nextBlock) {
+		t.Fatal("h2 data mismatch after h1 closed")
+	}
+}
+
+// TestDeviceResolver_PlaybackMixer_SoftSaturation verifies that multiple output handles
+// sum concurrent frames and apply soft-knee saturation to prevent integer wrap-around clipping.
+func TestDeviceResolver_PlaybackMixer_SoftSaturation(t *testing.T) {
+	resolver := NewDeviceResolver()
+
+	spkURN := "urn:audio:hw:test:mixer-spk"
+	outDev := NewVirtualAudioDevice()
+
+	resolver.Register(Device{
+		ID:        spkURN,
+		URN:       spkURN,
+		Name:      "Mixer Speaker",
+		MaxInput:  0,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+	resolver.Rebind(spkURN, outDev)
+
+	// Open two output handles to activate mixer bus
+	h1, err := resolver.OpenOutput(spkURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenOutput 1 failed: %v", err)
+	}
+	defer h1.Close()
+
+	h2, err := resolver.OpenOutput(spkURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenOutput 2 failed: %v", err)
+	}
+	defer h2.Close()
+
+	// Generate two full-scale sine waves (each ~0.9 dBFS)
+	// When summed naively (0.9 + 0.9 = 1.8), integer overflow would wrap around to negative numbers!
+	frames := 480
+	channels := 2
+	block1 := makeTestPCM(frames, channels, 440)
+	block2 := makeTestPCM(frames, channels, 440)
+
+	// Write concurrently
+	done1 := make(chan struct{})
+	done2 := make(chan struct{})
+	go func() {
+		_, _ = h1.Write(block1)
+		close(done1)
+	}()
+	go func() {
+		_, _ = h2.Write(block2)
+		close(done2)
+	}()
+
+	<-done1
+	<-done2
+
+	// Wait for mixer worker to process
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if len(outDev.CapturedBytes()) >= len(block1) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	captured := outDev.CapturedBytes()
+	if len(captured) < len(block1) {
+		t.Fatalf("expected >= %d mixed bytes captured, got %d", len(block1), len(captured))
+	}
+
+	// Verify that samples are soft-saturated and never wrapped around
+	for i := 0; i < len(block1); i += 2 {
+		s := int16(binary.LittleEndian.Uint16(captured[i : i+2]))
+		// Clamped to valid range [-32768, 32767]
+		if s > 32767 || s < -32768 {
+			t.Fatalf("sample out of range: %d", s)
+		}
+	}
+}
+
+// TestDeviceResolver_HotSwapRebind verifies that Rebind seamlessly updates the physical stream
+// beneath active RefStreamHandles without breaking downstream readers.
+func TestDeviceResolver_HotSwapRebind(t *testing.T) {
+	resolver := NewDeviceResolver()
+
+	micURN := "urn:audio:hw:test:hotswap-mic"
+	dev1 := NewVirtualAudioDevice()
+	dev2 := NewVirtualAudioDevice()
+
+	resolver.Register(Device{
+		ID:        micURN,
+		URN:       micURN,
+		Name:      "HotSwap Mic",
+		MaxInput:  2,
+		MaxOutput: 0,
+		Status:    "active",
+	})
+	resolver.Rebind(micURN, dev1)
+
+	handle, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput failed: %v", err)
+	}
+	defer handle.Close()
+
+	// Push from dev1
+	pcm1 := makeTestPCM(256, 2, 440)
+	_, _ = dev1.InjectPush(pcm1)
+
+	readBuf := make([]byte, len(pcm1))
+	n1, err := readTimeout(handle, readBuf, 500*time.Millisecond)
+	if err != nil || n1 != len(pcm1) {
+		t.Fatalf("read 1 failed: n=%d err=%v", n1, err)
+	}
+	if !bytes.Equal(readBuf, pcm1) {
+		t.Fatal("read 1 data mismatch")
+	}
+
+	// Hot-swap underlying stream to dev2
+	resolver.Rebind(micURN, dev2)
+
+	// Push from dev2
+	pcm2 := makeTestPCM(256, 2, 880)
+	_, _ = dev2.InjectPush(pcm2)
+
+	n2, err := readTimeout(handle, readBuf, 500*time.Millisecond)
+	if err != nil || n2 != len(pcm2) {
+		t.Fatalf("read 2 failed after hot-swap: n=%d err=%v", n2, err)
+	}
+	if !bytes.Equal(readBuf, pcm2) {
+		t.Fatal("read 2 data mismatch after hot-swap")
+	}
+}
+
+// makeTestPCM generates test sine wave PCM frames.
+func makeTestPCM(frames, channels int, freq float64) []byte {
+	buf := make([]byte, frames*channels*2)
+	sampleRate := 48000.0
+	for i := 0; i < frames; i++ {
+		val := int16(32000.0 * math.Sin(2.0*math.Pi*freq*float64(i)/sampleRate))
+		for ch := 0; ch < channels; ch++ {
+			binary.LittleEndian.PutUint16(buf[(i*channels+ch)*2:], uint16(val))
+		}
+	}
+	return buf
+}
+
+// readTimeout reads from stream with a timeout.
+func readTimeout(st AudioStream, p []byte, timeout time.Duration) (int, error) {
+	type result struct {
+		n   int
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		offset := 0
+		for offset < len(p) {
+			n, err := st.Read(p[offset:])
+			if n > 0 {
+				offset += n
+			}
+			if err != nil {
+				ch <- result{offset, err}
+				return
+			}
+		}
+		ch <- result{offset, nil}
+	}()
+
+	select {
+	case res := <-ch:
+		return res.n, res.err
+	case <-time.After(timeout):
+		return 0, io.ErrNoProgress
+	}
+}
+
+// TestDeviceResolver_ConcurrentReadClose_NoDeadlock tests that concurrent Read and Close
+// on an input handle do not trigger lock-inversion deadlocks.
+func TestDeviceResolver_ConcurrentReadClose_NoDeadlock(t *testing.T) {
+	for iter := 0; iter < 20; iter++ {
+		resolver := NewDeviceResolver()
+		micURN := "urn:audio:hw:test:deadlock-mic"
+		vDev := NewVirtualAudioDevice()
+		resolver.Register(Device{
+			ID:        micURN,
+			URN:       micURN,
+			Name:      "Deadlock Mic",
+			MaxInput:  2,
+			MaxOutput: 0,
+			Status:    "active",
+		})
+		resolver.Rebind(micURN, vDev)
+
+		h, err := resolver.OpenInput(micURN, 48000, 2, false)
+		if err != nil {
+			t.Fatalf("OpenInput error: %v", err)
+		}
+
+		readDone := make(chan struct{})
+		go func() {
+			buf := make([]byte, 512)
+			for {
+				_, err := h.Read(buf)
+				if err != nil {
+					break
+				}
+			}
+			close(readDone)
+		}()
+
+		// Yield briefly to ensure Read() enters Wait() or loop
+		time.Sleep(2 * time.Millisecond)
+
+		// Close handle concurrently
+		_ = h.Close()
+
+		select {
+		case <-readDone:
+			// Read unblocked cleanly
+		case <-time.After(1 * time.Second):
+			t.Fatalf("DEADLOCK DETECTED: Read() did not unblock within 1s after Close()")
+		}
+		_ = resolver.Close()
+	}
+}
+
+// TestDeviceResolver_DrainBufferedBeforeEOF verifies that buffered frames in an input
+// handle are drained before io.EOF is returned when upstream closes.
+func TestDeviceResolver_DrainBufferedBeforeEOF(t *testing.T) {
+	resolver := NewDeviceResolver()
+	resolver.SetGracePeriod(10 * time.Millisecond)
+
+	micURN := "urn:audio:hw:test:drain-mic"
+	vDev := NewVirtualAudioDevice()
+	resolver.Register(Device{
+		ID:        micURN,
+		URN:       micURN,
+		Name:      "Drain Mic",
+		MaxInput:  2,
+		MaxOutput: 0,
+		Status:    "active",
+	})
+	resolver.Rebind(micURN, vDev)
+
+	h, err := resolver.OpenInput(micURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput error: %v", err)
+	}
+
+	pcm := makeTestPCM(256, 2, 440)
+	_, _ = vDev.InjectPush(pcm)
+
+	// Wait for captureWorker to broadcast
+	time.Sleep(20 * time.Millisecond)
+
+	// Close the resolver/controller
+	_ = resolver.Close()
+
+	// Handle should still drain the buffered PCM frames
+	readBuf := make([]byte, len(pcm))
+	n, err := h.Read(readBuf)
+	if err != nil && err != io.EOF {
+		t.Fatalf("Read failed: n=%d err=%v", n, err)
+	}
+	if n != len(pcm) {
+		t.Fatalf("expected to drain %d bytes before EOF, got %d", len(pcm), n)
+	}
+	if !bytes.Equal(readBuf, pcm) {
+		t.Fatal("drained data mismatch")
+	}
+
+	// Subsequent read must return EOF
+	_, err = h.Read(readBuf)
+	if err != io.EOF {
+		t.Fatalf("expected io.EOF after draining, got %v", err)
+	}
+}
+
+// TestDeviceResolver_MultiWriterToSingleWriterTransition verifies that when multiple writers
+// are active on an output stream and one disconnects, the remaining writer transitions
+// to the fast path without data race on physical write.
+func TestDeviceResolver_MultiWriterToSingleWriterTransition(t *testing.T) {
+	resolver := NewDeviceResolver()
+	spkURN := "urn:audio:hw:test:transition-spk"
+	outDev := NewVirtualAudioDevice()
+
+	resolver.Register(Device{
+		ID:        spkURN,
+		URN:       spkURN,
+		Name:      "Transition Speaker",
+		MaxInput:  0,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+	resolver.Rebind(spkURN, outDev)
+
+	h1, err := resolver.OpenOutput(spkURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenOutput 1 failed: %v", err)
+	}
+	h2, err := resolver.OpenOutput(spkURN, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenOutput 2 failed: %v", err)
+	}
+
+	block := makeTestPCM(256, 2, 440)
+
+	// Concurrent writes
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = h1.Write(block)
+				time.Sleep(1 * time.Millisecond)
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10; i++ {
+			_, _ = h2.Write(block)
+			time.Sleep(1 * time.Millisecond)
+		}
+		// Close h2 while h1 continues writing
+		_ = h2.Close()
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	_ = h1.Close()
+	_ = resolver.Close()
+}
+
+// TestDeviceResolver_WorkerLifecycleAndGoroutineLeak verifies that controllers
+// and their background workers terminate cleanly when closed.
+func TestDeviceResolver_WorkerLifecycleAndGoroutineLeak(t *testing.T) {
+	initialGoroutines := runtime.NumGoroutine()
+
+	resolver := NewDeviceResolver()
+	resolver.SetGracePeriod(20 * time.Millisecond)
+
+	urnName := "urn:audio:hw:test:lifecycle-dev"
+	vDev := NewVirtualAudioDevice()
+	resolver.Register(Device{
+		ID:        urnName,
+		URN:       urnName,
+		Name:      "Lifecycle Dev",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+	resolver.RebindDirectional(urnName, DirectionInput, vDev)
+	resolver.RebindDirectional(urnName, DirectionOutput, vDev)
+
+	inH, err := resolver.OpenInput(urnName, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenInput error: %v", err)
+	}
+	outH, err := resolver.OpenOutput(urnName, 48000, 2, false)
+	if err != nil {
+		t.Fatalf("OpenOutput error: %v", err)
+	}
+
+	if count := resolver.ActiveControllerCount(); count != 2 {
+		t.Fatalf("expected 2 active controllers, got %d", count)
+	}
+
+	// Close both handles
+	_ = inH.Close()
+	_ = outH.Close()
+
+	// Wait for grace period
+	time.Sleep(50 * time.Millisecond)
+
+	if count := resolver.ActiveControllerCount(); count != 0 {
+		t.Fatalf("expected 0 active controllers after grace period, got %d", count)
+	}
+
+	_ = resolver.Close()
+
+	// Ensure no leaked controller worker goroutines remain
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if runtime.NumGoroutine() <= initialGoroutines+1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	leaked := runtime.NumGoroutine() - initialGoroutines
+	if leaked > 2 {
+		t.Fatalf("potential goroutine leak: %d additional goroutines running", leaked)
+	}
+}
+
+func TestDeviceResolver_HardwareOpenErrorBubblingWithoutCaching(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	activeURN := "urn:audio:hw:test:nonexistent-dev"
+	dev := Device{
+		ID:        activeURN,
+		URN:       activeURN,
+		RuntimeID: 9999, // non-existent hardware index
+		Name:      "Non-existent Active Device",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	}
+	resolver.Register(dev)
+
+	// 1. Attempt to open hardware input without emulator: should fail and bubble error
+	inStream, inErr := resolver.OpenInput(activeURN, 48000, 2, false)
+	if inErr == nil {
+		if inStream != nil {
+			_ = inStream.Close()
+		}
+		t.Fatal("expected OpenInput to return error for non-existent hardware device, got nil")
+	}
+	if inStream != nil {
+		t.Fatalf("expected nil stream on error, got %T", inStream)
+	}
+
+	// Verify no controller was cached for input
+	inKey := StreamKey{URN: activeURN, Direction: DirectionInput}
+	resolver.mu.Lock()
+	if _, cached := resolver.controllers[inKey]; cached {
+		resolver.mu.Unlock()
+		t.Fatal("expected no controller to be cached after input open failure")
+	}
+	resolver.mu.Unlock()
+
+	// 2. Attempt to open hardware output without emulator: should fail and bubble error
+	outStream, outErr := resolver.OpenOutput(activeURN, 48000, 2, false)
+	if outErr == nil {
+		if outStream != nil {
+			_ = outStream.Close()
+		}
+		t.Fatal("expected OpenOutput to return error for non-existent hardware device, got nil")
+	}
+	if outStream != nil {
+		t.Fatalf("expected nil stream on error, got %T", outStream)
+	}
+
+	// Verify no controller was cached for output
+	outKey := StreamKey{URN: activeURN, Direction: DirectionOutput}
+	resolver.mu.Lock()
+	if _, cached := resolver.controllers[outKey]; cached {
+		resolver.mu.Unlock()
+		t.Fatal("expected no controller to be cached after output open failure")
+	}
+	resolver.mu.Unlock()
+
+	// 3. Self-healing / retry: rebind virtual device to simulate hardware recovery
+	vDev := NewVirtualAudioDevice()
+	resolver.Rebind(activeURN, vDev)
+
+	// Now OpenInput should succeed and create a valid controller
+	recoveredStream, recErr := resolver.OpenInput(activeURN, 48000, 2, false)
+	if recErr != nil {
+		t.Fatalf("expected OpenInput to succeed after rebind, got %v", recErr)
+	}
+	defer recoveredStream.Close()
+
+	resolver.mu.Lock()
+	if _, cached := resolver.controllers[inKey]; !cached {
+		resolver.mu.Unlock()
+		t.Fatal("expected controller to be cached after successful rebind open")
+	}
+	resolver.mu.Unlock()
+}
+
+func TestNormalizeLoopbackDevice(t *testing.T) {
+	tests := []struct {
+		input string
+		dir   StreamDirection
+		want  string
+	}{
+		{"hw:Loopback", DirectionInput, "hw:Loopback,1"},
+		{"hw:Loopback,0", DirectionInput, "hw:Loopback,1"},
+		{"hw:Loopback,0,0", DirectionInput, "hw:Loopback,1,0"},
+		{"sysdefault:CARD=Loopback,DEV=0", DirectionInput, "sysdefault:CARD=Loopback,DEV=1"},
+		{"urn:audio:hw:alsa:loopback:d=0", DirectionInput, "urn:audio:hw:alsa:loopback:d=1"},
+		{"urn:audio:hw:alsa:loopback:0", DirectionInput, "urn:audio:hw:alsa:loopback:1"},
+		{"hw:0,0", DirectionInput, "hw:0,0"},
+
+		{"hw:Loopback,1", DirectionOutput, "hw:Loopback,0"},
+		{"hw:Loopback,1,0", DirectionOutput, "hw:Loopback,0,0"},
+		{"sysdefault:CARD=Loopback,DEV=1", DirectionOutput, "sysdefault:CARD=Loopback,DEV=0"},
+		{"urn:audio:hw:alsa:loopback:d=1", DirectionOutput, "urn:audio:hw:alsa:loopback:d=0"},
+		{"urn:audio:hw:alsa:loopback:1", DirectionOutput, "urn:audio:hw:alsa:loopback:0"},
+		{"hw:1,0", DirectionOutput, "hw:1,0"},
+	}
+
+	for _, tc := range tests {
+		got := NormalizeLoopbackDevice(tc.input, tc.dir)
+		if got != tc.want {
+			t.Errorf("NormalizeLoopbackDevice(%q, %v) = %q; want %q", tc.input, tc.dir, got, tc.want)
+		}
+	}
+}
+
+func TestDeviceResolver_QuarantineDecayingTTL(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	devURN := "urn:audio:hw:test:decaying-dev"
+	resolver.Register(Device{
+		ID:        devURN,
+		URN:       devURN,
+		RuntimeID: 10,
+		Name:      "Decaying Test Device",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+
+	// 1. Initial quarantine
+	resolver.Quarantine(devURN)
+	if !resolver.IsQuarantined(devURN) {
+		t.Fatal("expected device to be quarantined immediately")
+	}
+
+	resolver.mu.RLock()
+	bo1 := resolver.quarantineBackoff[devURN]
+	until1 := resolver.quarantineUntil[devURN]
+	resolver.mu.RUnlock()
+
+	if bo1 != minQuarantineBackoff {
+		t.Fatalf("expected initial backoff %v, got %v", minQuarantineBackoff, bo1)
+	}
+	if time.Now().After(until1) {
+		t.Fatalf("expected quarantine until in future")
+	}
+
+	// 2. Second quarantine before clear: exponential backoff doubles
+	resolver.Quarantine(devURN)
+	resolver.mu.RLock()
+	bo2 := resolver.quarantineBackoff[devURN]
+	resolver.mu.RUnlock()
+
+	if bo2 != 2*minQuarantineBackoff {
+		t.Fatalf("expected doubled backoff %v, got %v", 2*minQuarantineBackoff, bo2)
+	}
+
+	// 3. Simulate TTL expiration
+	resolver.mu.Lock()
+	resolver.quarantineUntil[devURN] = time.Now().Add(-1 * time.Second)
+	resolver.mu.Unlock()
+
+	if resolver.IsQuarantined(devURN) {
+		t.Fatal("expected IsQuarantined to return false after TTL expiration")
+	}
+
+	// 4. OpenInput after TTL expired: transitions to probing and returns cushion
+	st, err := resolver.OpenInput(devURN, 48000, 2, true)
+	if err != nil {
+		t.Fatalf("expected OpenInput to return cushion during probing, got %v", err)
+	}
+	defer st.Close()
+
+	// 5. Activate device: clears quarantine state completely
+	resolver.Activate(devURN)
+	resolver.mu.RLock()
+	_, hasUntil := resolver.quarantineUntil[devURN]
+	_, hasBackoff := resolver.quarantineBackoff[devURN]
+	resolver.mu.RUnlock()
+
+	if hasUntil || hasBackoff {
+		t.Fatalf("expected Activate to clear quarantine maps")
+	}
+}
+
+func TestDeviceResolver_LoopbackSiblingAutoMigration(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	// Device 0: Playback only on Cable 0
+	playDev := Device{
+		ID:        "urn:audio:hw:alsa:c=Loopback:d=0",
+		URN:       "urn:audio:hw:alsa:c=Loopback:d=0",
+		RuntimeID: 20,
+		Name:      "Loopback,0,0",
+		MaxInput:  0,
+		MaxOutput: 2,
+		Status:    "active",
+	}
+	// Device 1: Capture only on Cable 0
+	capDev := Device{
+		ID:        "urn:audio:hw:alsa:c=Loopback:d=1",
+		URN:       "urn:audio:hw:alsa:c=Loopback:d=1",
+		RuntimeID: 21,
+		Name:      "Loopback,0,1",
+		MaxInput:  2,
+		MaxOutput: 0,
+		Status:    "active",
+	}
+
+	resolver.Register(playDev)
+	resolver.Register(capDev)
+
+	// User requests input from playback endpoint "hw:Loopback,0"
+	// Resolver should normalize / auto-migrate to capture subdevice 1
+	inStream, err := resolver.OpenInput("hw:Loopback,0", 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenInput on loopback playback endpoint failed: %v", err)
+	}
+	defer inStream.Close()
+
+	buf := make([]byte, 192)
+	n, err := inStream.Read(buf)
+	if err != nil || n != len(buf) {
+		t.Fatalf("expected to read audio from auto-migrated capture subdevice: n=%d, err=%v", n, err)
+	}
+
+	// User requests output to capture endpoint "hw:Loopback,1"
+	// Resolver should normalize / auto-migrate to playback subdevice 0
+	outStream, err := resolver.OpenOutput("hw:Loopback,1", 48000, 2, true)
+	if err != nil {
+		t.Fatalf("OpenOutput on loopback capture endpoint failed: %v", err)
+	}
+	defer outStream.Close()
+
+	n, err = outStream.Write(buf)
+	if err != nil || n != len(buf) {
+		t.Fatalf("expected to write audio to auto-migrated playback subdevice: n=%d, err=%v", n, err)
+	}
+}
+
+func TestDeviceResolver_AsyncPromotion(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	devURN := "urn:audio:hw:test:async-promo"
+	resolver.Register(Device{
+		ID:        devURN,
+		URN:       devURN,
+		RuntimeID: 30,
+		Name:      "Async Promo Device",
+		MaxInput:  2,
+		MaxOutput: 2,
+		Status:    "active",
+	})
+
+	// Open cushion stream immediately (< 5ms)
+	start := time.Now()
+	st, err := resolver.OpenInputAsync(devURN, 48000, 2, true)
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("OpenInputAsync returned error: %v", err)
+	}
+	defer st.Close()
+
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("OpenInputAsync took too long: %v", elapsed)
+	}
+
+	// Reader can continuously read audio without blocking
+	buf := make([]byte, 384)
+	n, err := st.Read(buf)
+	if err != nil || n <= 0 {
+		t.Fatalf("expected immediate read from cushion stream: n=%d err=%v", n, err)
+	}
+
+	// Wait briefly for background promotion to complete
+	deadline := time.Now().Add(2 * time.Second)
+	promoted := false
+	for time.Now().Before(deadline) {
+		refHandle, ok := st.(*RefStreamHandle)
+		if ok && refHandle.Underlying() != nil {
+			if _, isGhost := refHandle.Underlying().(*GhostAudioStream); !isGhost {
+				promoted = true
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !promoted {
+		t.Fatalf("expected stream to be promoted to physical emulator stream")
+	}
+
+	// Continue reading after promotion to verify stream stability
+	for i := 0; i < 5; i++ {
+		n, err := st.Read(buf)
+		if err != nil || n <= 0 {
+			t.Fatalf("read %d after promotion failed: n=%d, err=%v", i, n, err)
+		}
+	}
+}
+
+// --- ADR 0034 Pass A: event-site artifact counters ---
+
+// xrunCapableFake is an AudioStream that also implements XRunHookSetter and
+// captures the installed hook, so tests can fire it as if the PortAudio
+// driver reported a hardware XRun. It counts its own hook invocations so a
+// test can prove the controller's lifetime counter matches the exact number
+// of invocations.
+type xrunCapableFake struct {
+	hook  atomic.Pointer[func()]
+	fires atomic.Uint64
+}
+
+func (f *xrunCapableFake) SetXRunHook(hook func()) {
+	if hook == nil {
+		f.hook.Store(nil)
+		return
+	}
+	f.hook.Store(&hook)
+}
+
+func (f *xrunCapableFake) fire() {
+	if h := f.hook.Load(); h != nil {
+		f.fires.Add(1)
+		(*h)()
+	}
+}
+
+func (f *xrunCapableFake) Read([]byte) (int, error)  { return 0, nil }
+func (f *xrunCapableFake) Write([]byte) (int, error) { return 0, nil }
+func (f *xrunCapableFake) Close() error              { return nil }
+
+// TestOutputSubscriber_RingDropCounting verifies the NEW exact playback-ring
+// drop counters: a write that overflows the multi-writer ring counts the
+// exact bytes/events once, and a later fitting write counts nothing.
+func TestOutputSubscriber_RingDropCounting(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:out-drops", Direction: DirectionOutput}, NewVirtualAudioDevice(), 48000, 2, defaultGracePeriod)
+	defer c.close()
+
+	// Two output handles force the multi-writer ring path in writeOutput.
+	c.mu.Lock()
+	h1 := c.newOutputHandleLocked()
+	h2 := c.newOutputHandleLocked()
+	c.mu.Unlock()
+	_ = h2
+
+	const over = 3840 // frame-aligned for 2ch (frameSize 4)
+	ringCap := h1.outSub.buf.cap()
+	if ringCap%h1.outSub.buf.frameSize != 0 {
+		t.Fatalf("ring cap %d is not frame-aligned", ringCap)
+	}
+
+	payload := make([]byte, ringCap+over)
+	n, err := c.writeOutput(h1, payload)
+	if err != nil {
+		t.Fatalf("writeOutput: %v", err)
+	}
+	if n != len(payload) {
+		t.Fatalf("writeOutput returned n=%d, want %d", n, len(payload))
+	}
+
+	sub := h1.outSub
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d, want exactly 1", got)
+	}
+	if got := sub.dropBytes.Load(); got != over {
+		t.Fatalf("dropBytes=%d, want exactly %d", got, over)
+	}
+
+	// DropCounter delegation on the output handle must match.
+	var dc DropCounter = h1
+	if got := dc.DroppedBytes(); got != over {
+		t.Fatalf("handle DroppedBytes()=%d, want %d", got, over)
+	}
+	if got := dc.DropEvents(); got != 1 {
+		t.Fatalf("handle DropEvents()=%d, want 1", got)
+	}
+
+	// Simulate the mixer draining space; a fitting write must add no event.
+	sub.mu.Lock()
+	sub.buf.read(make([]byte, over))
+	sub.mu.Unlock()
+	if _, err := c.writeOutput(h1, make([]byte, over)); err != nil {
+		t.Fatalf("second writeOutput: %v", err)
+	}
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d after fitting write, want still 1", got)
+	}
+	if got := sub.dropBytes.Load(); got != over {
+		t.Fatalf("dropBytes=%d after fitting write, want still %d", got, over)
+	}
+}
+
+// TestInputSubscriber_DropEventsAlongsideDropCount verifies the capture-ring
+// dropEvents counter increments in lockstep with the existing dropCount using
+// the exact ringBuf.write byte accounting.
+func TestInputSubscriber_DropEventsAlongsideDropCount(t *testing.T) {
+	sub := newInputSubscriber(4) // 2ch (frameSize 4)
+	const over = 8
+
+	sub.push(make([]byte, sub.buf.cap()+over))
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d, want exactly 1", got)
+	}
+	if got := sub.dropCount.Load(); got != over {
+		t.Fatalf("dropCount=%d, want exactly %d (exact ring accounting)", got, over)
+	}
+
+	// A reader consumed `over` bytes; a fitting push must add no event.
+	sub.mu.Lock()
+	sub.buf.read(make([]byte, over))
+	sub.mu.Unlock()
+	sub.push(make([]byte, over))
+	if got := sub.dropEvents.Load(); got != 1 {
+		t.Fatalf("dropEvents=%d after fitting push, want still 1", got)
+	}
+	if got := sub.dropCount.Load(); got != over {
+		t.Fatalf("dropCount=%d after fitting push, want still %d", got, over)
+	}
+}
+
+// TestDeviceStreamController_XRunHookExactness verifies the device-lifetime
+// XRun counters with a fake physical that captures its installed hook:
+// invoking the captured hook N times yields hwXrunsIn (input direction) or
+// hwXrunsOut (output direction) == N exactly, and non-implementing physicals
+// (ghost) are skipped without panic.
+func TestDeviceStreamController_XRunHookExactness(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	const invocations = 5
+
+	t.Run("input direction", func(t *testing.T) {
+		fake := &xrunCapableFake{}
+		c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-in", Direction: DirectionInput}, fake, 48000, 2, defaultGracePeriod)
+		defer c.close()
+
+		if fake.hook.Load() == nil {
+			t.Fatal("constructor did not install the XRun hook on the physical stream")
+		}
+		for i := 0; i < invocations; i++ {
+			fake.fire()
+		}
+		if got := c.hwXrunsIn.Load(); got != invocations {
+			t.Fatalf("hwXrunsIn=%d, want exactly %d", got, invocations)
+		}
+		if got := c.hwXrunsOut.Load(); got != 0 {
+			t.Fatalf("hwXrunsOut=%d, want 0 on an input-direction controller", got)
+		}
+		if got := fake.fires.Load(); got != invocations {
+			t.Fatalf("fake observed %d hook invocations, want %d", got, invocations)
+		}
+	})
+
+	t.Run("output direction", func(t *testing.T) {
+		fake := &xrunCapableFake{}
+		c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-out", Direction: DirectionOutput}, fake, 48000, 2, defaultGracePeriod)
+		defer c.close()
+
+		if fake.hook.Load() == nil {
+			t.Fatal("constructor did not install the XRun hook on the physical stream")
+		}
+		for i := 0; i < invocations; i++ {
+			fake.fire()
+		}
+		if got := c.hwXrunsOut.Load(); got != invocations {
+			t.Fatalf("hwXrunsOut=%d, want exactly %d", got, invocations)
+		}
+		if got := c.hwXrunsIn.Load(); got != 0 {
+			t.Fatalf("hwXrunsIn=%d, want 0 on an output-direction controller", got)
+		}
+	})
+
+	t.Run("non-implementing physical is skipped", func(t *testing.T) {
+		ghost := NewGhostAudioStream(48000, 2)
+		c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-ghost", Direction: DirectionInput}, ghost, 48000, 2, defaultGracePeriod)
+		defer c.close()
+		// Must not panic, and there is no hook to fire: counters stay 0.
+		if got := c.hwXrunsIn.Load(); got != 0 {
+			t.Fatalf("hwXrunsIn=%d for ghost physical, want 0", got)
+		}
+		if got := c.hwXrunsOut.Load(); got != 0 {
+			t.Fatalf("hwXrunsOut=%d for ghost physical, want 0", got)
+		}
+	})
+}
+
+// TestDeviceStreamController_XRunHookMonotonicAcrossSwaps verifies that
+// device-lifetime XRun totals are monotonic across swapPhysicalStream: the
+// new stream's hook is installed at swap time, and the old stream's hook is
+// intentionally never cleared, so a teardown-window XRun still counts.
+func TestDeviceStreamController_XRunHookMonotonicAcrossSwaps(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	a := &xrunCapableFake{}
+	b := &xrunCapableFake{}
+	c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-swap", Direction: DirectionInput}, a, 48000, 2, defaultGracePeriod)
+	defer c.close()
+
+	for i := 0; i < 3; i++ {
+		a.fire()
+	}
+
+	c.swapPhysicalStream(b)
+	if b.hook.Load() == nil {
+		t.Fatal("swapPhysicalStream did not install the XRun hook on the new stream")
+	}
+	for i := 0; i < 2; i++ {
+		b.fire()
+	}
+
+	// XRun in the teardown window of the old instance (hook never cleared).
+	a.fire()
+
+	if got := c.hwXrunsIn.Load(); got != 6 {
+		t.Fatalf("hwXrunsIn=%d, want exactly 6 (3+2+1: no reset, no double count)", got)
+	}
+}
+
+// TestDeviceResolver_ActiveControllerStats verifies the new resolver accessor
+// exposes, per active controller, URN, direction, ghost flag, and the
+// device-lifetime XRun values.
+func TestDeviceResolver_ActiveControllerStats(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	const urnName = "urn:test:stats-dev"
+	inKey := StreamKey{URN: urnName, Direction: DirectionInput}
+	outKey := StreamKey{URN: urnName, Direction: DirectionOutput}
+	ghostKey := StreamKey{URN: "urn:test:stats-ghost", Direction: DirectionOutput}
+
+	inFake := &xrunCapableFake{}
+	inCtrl := newDeviceStreamController(resolver, inKey, inFake, 48000, 2, defaultGracePeriod)
+	outCtrl := newDeviceStreamController(resolver, outKey, &xrunCapableFake{}, 48000, 2, defaultGracePeriod)
+	ghostCtrl := newDeviceStreamController(resolver, ghostKey, NewGhostAudioStream(48000, 2), 48000, 2, defaultGracePeriod)
+	defer func() {
+		_ = inCtrl.close()
+		_ = outCtrl.close()
+		_ = ghostCtrl.close()
+	}()
+
+	resolver.mu.Lock()
+	resolver.controllers[inKey] = inCtrl
+	resolver.controllers[outKey] = outCtrl
+	resolver.controllers[ghostKey] = ghostCtrl
+	resolver.mu.Unlock()
+
+	inFake.fire()
+	inFake.fire()
+
+	stats := resolver.ActiveControllerStats()
+	if len(stats) != 3 {
+		t.Fatalf("got %d controller stats, want 3", len(stats))
+	}
+
+	byKey := make(map[StreamKey]DeviceStreamStats, len(stats))
+	for _, s := range stats {
+		byKey[StreamKey{URN: s.URN, Direction: s.Direction}] = s
+	}
+
+	in, ok := byKey[inKey]
+	if !ok {
+		t.Fatalf("missing stats for %v", inKey)
+	}
+	if in.Ghost || in.HWXrunsIn != 2 || in.HWXrunsOut != 0 {
+		t.Fatalf("input stats = %+v, want Ghost=false HWXrunsIn=2 HWXrunsOut=0", in)
+	}
+
+	out, ok := byKey[outKey]
+	if !ok {
+		t.Fatalf("missing stats for %v", outKey)
+	}
+	if out.Ghost || out.HWXrunsIn != 0 || out.HWXrunsOut != 0 {
+		t.Fatalf("output stats = %+v, want Ghost=false and zero XRuns", out)
+	}
+
+	gh, ok := byKey[ghostKey]
+	if !ok {
+		t.Fatalf("missing stats for %v", ghostKey)
+	}
+	if !gh.Ghost {
+		t.Fatalf("ghost stats = %+v, want Ghost=true", gh)
+	}
+}
+
+// TestDeviceStreamController_XRunHookRaceUnderSwap must pass under
+// `go test -race`: one goroutine fires the installed hook in a loop while
+// another repeatedly swaps the physical stream. The final device-lifetime
+// count must equal the total number of hook invocations exactly (no lost or
+// double-counted XRuns, no reset).
+func TestDeviceStreamController_XRunHookRaceUnderSwap(t *testing.T) {
+	resolver := NewDeviceResolver()
+	defer resolver.Close()
+
+	const nFakes = 8
+	fakes := make([]*xrunCapableFake, nFakes)
+	for i := range fakes {
+		fakes[i] = &xrunCapableFake{}
+	}
+
+	c := newDeviceStreamController(resolver, StreamKey{URN: "urn:test:xrun-race", Direction: DirectionOutput}, fakes[0], 48000, 2, defaultGracePeriod)
+	defer c.close()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Swapper: cycles the physical stream among the fakes.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 1; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c.swapPhysicalStream(fakes[i%nFakes])
+		}
+	}()
+
+	// Fire workers: read the current physical stream and fire its captured
+	// hook as fast as possible.
+	const workers = 4
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if f, ok := c.getPhysicalStream().(*xrunCapableFake); ok {
+					f.fire()
+				}
+			}
+		}()
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	var totalInvocations uint64
+	for _, f := range fakes {
+		totalInvocations += f.fires.Load()
+	}
+	if totalInvocations == 0 {
+		t.Fatal("no hook invocations observed; test did not exercise the race")
+	}
+	if got := c.hwXrunsOut.Load(); got != totalInvocations {
+		t.Fatalf("hwXrunsOut=%d, total hook invocations=%d: lost or double-counted XRuns", got, totalInvocations)
+	}
+	if got := c.hwXrunsIn.Load(); got != 0 {
+		t.Fatalf("hwXrunsIn=%d, want 0 on an output-direction controller", got)
 	}
 }

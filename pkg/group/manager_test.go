@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/audio-router-p2p/pkg/audio"
+	"github.com/audio-router-p2p/pkg/cluster"
 	"github.com/audio-router-p2p/pkg/router"
 	"github.com/audio-router-p2p/pkg/transport"
 )
@@ -300,4 +301,206 @@ func TestDefaultRoomManager_ConcurrentAccess(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+func TestDefaultRoomManager_Persistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	roomsFile := tmpDir + "/rooms.json"
+
+	vp := NewVirtualDeviceProvider(nil, nil)
+	mgr1 := NewDefaultRoomManager(nil, nil, nil, nil, vp)
+	mgr1.SetRoomsFile(roomsFile)
+
+	// Create room and configure bindings
+	_, err := mgr1.CreateRoom("room-studio", "Main Studio")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+
+	micURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=1"
+	spkURN := "urn:audio:hw:usb:v=041e:p=3232:s=0000005Z:d=0"
+
+	if err := mgr1.AddInput("room-studio", micURN); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	if err := mgr1.AddOutput("room-studio", spkURN); err != nil {
+		t.Fatalf("AddOutput: %v", err)
+	}
+	if err := mgr1.SetInputGain("room-studio", micURN, 1.25); err != nil {
+		t.Fatalf("SetInputGain: %v", err)
+	}
+	if err := mgr1.SetOutputGain("room-studio", spkURN, 0.85); err != nil {
+		t.Fatalf("SetOutputGain: %v", err)
+	}
+	if err := mgr1.SetRoomSync("room-studio", true); err != nil {
+		t.Fatalf("SetRoomSync: %v", err)
+	}
+
+	mgr1.Close()
+
+	// Spin up a brand new room manager instance and load from file
+	mgr2 := NewDefaultRoomManager(nil, nil, nil, nil, vp)
+	mgr2.SetRoomsFile(roomsFile)
+	if err := mgr2.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer mgr2.Close()
+
+	rooms := mgr2.ListRooms()
+	if len(rooms) != 1 {
+		t.Fatalf("expected 1 restored room, got %d", len(rooms))
+	}
+	r := rooms[0]
+	if r.ID != "room-studio" || r.Name != "Main Studio" {
+		t.Fatalf("restored room ID/name mismatch: %+v", r)
+	}
+	normMicURN := "local/" + micURN
+	normSpkURN := "local/" + spkURN
+	if len(r.Inputs) != 1 || r.Inputs[0] != normMicURN {
+		t.Fatalf("restored inputs mismatch: got %v, want [%s]", r.Inputs, normMicURN)
+	}
+	if len(r.Outputs) != 1 || r.Outputs[0] != normSpkURN {
+		t.Fatalf("restored outputs mismatch: got %v, want [%s]", r.Outputs, normSpkURN)
+	}
+	if !r.Synced {
+		t.Fatalf("restored synced mismatch: got false, want true")
+	}
+	if g, ok := r.InputGains[normMicURN]; !ok || g != 1.25 {
+		t.Fatalf("restored input gain mismatch: got %v, want 1.25", r.InputGains)
+	}
+	if g, ok := r.OutputGains[normSpkURN]; !ok || g != 0.85 {
+		t.Fatalf("restored output gain mismatch: got %v, want 0.85", r.OutputGains)
+	}
+
+	// Test deletion and persistence
+	if err := mgr2.DeleteRoom("room-studio"); err != nil {
+		t.Fatalf("DeleteRoom: %v", err)
+	}
+	if len(mgr2.ListRooms()) != 0 {
+		t.Fatalf("expected 0 rooms after DeleteRoom")
+	}
+
+	// Reload again to verify deletion persisted
+	mgr3 := NewDefaultRoomManager(nil, nil, nil, nil, vp)
+	mgr3.SetRoomsFile(roomsFile)
+	if err := mgr3.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	defer mgr3.Close()
+
+	if len(mgr3.ListRooms()) != 0 {
+		t.Fatalf("expected 0 rooms in mgr3 after deletion persisted, got %d", len(mgr3.ListRooms()))
+	}
+}
+
+func TestDefaultRoomManager_CentralizedFactoryInjection(t *testing.T) {
+	cm := &mockClusterProvider{
+		snapshot: &cluster.ClusterSnapshot{
+			ClusterDevices: []cluster.AudioDeviceSummary{
+				{ID: "dev-cm-1", NodeID: "remote-node"},
+			},
+		},
+	}
+	devRes := &mockDeviceResolver{
+		devices: map[string]audio.Device{
+			"dev-res-1": {URN: "dev-res-1", Name: "Mock Dev"},
+		},
+	}
+
+	mgr := NewDefaultRoomManager(nil, nil, nil, nil)
+	defer mgr.Close()
+
+	mgr.SetClusterManager(cm)
+	mgr.SetDeviceResolver(devRes)
+
+	// 1. Verify CreateRoom uses centralized factory with DI
+	info, err := mgr.CreateRoom("room-di-create", "Created Room")
+	if err != nil {
+		t.Fatalf("CreateRoom: %v", err)
+	}
+	rCreate, ok := mgr.GetRoom(info.ID)
+	if !ok || rCreate == nil {
+		t.Fatalf("room %s not found", info.ID)
+	}
+	if rCreate.clusterMgr == nil {
+		t.Errorf("rCreate.clusterMgr is nil")
+	}
+	if rCreate.devResolver == nil {
+		t.Errorf("rCreate.devResolver is nil")
+	}
+
+	// 2. Verify applyRecordLocked (via MergeRecord) uses centralized factory with DI
+	rec := RoomRecord{
+		ID:        "room-di-gossip",
+		Name:      "Gossip Room",
+		Timestamp: HLT{WallTime: time.Now().UnixNano(), Counter: 1, NodeID: "node-remote"},
+	}
+	mgr.MergeRecord(rec)
+	rGossip, ok := mgr.GetRoom("room-di-gossip")
+	if !ok || rGossip == nil {
+		t.Fatalf("room-di-gossip not found after MergeRecord")
+	}
+	if rGossip.clusterMgr == nil {
+		t.Errorf("rGossip.clusterMgr is nil")
+	}
+	if rGossip.devResolver == nil {
+		t.Errorf("rGossip.devResolver is nil")
+	}
+
+	// 3. Verify Load uses centralized factory with DI and normalizes un-prefixed devices
+	roomsFile := t.TempDir() + "/load_di_rooms.json"
+	mgr.SetRoomsFile(roomsFile)
+	// Add an un-prefixed input/output to room-di-create before saving
+	if err := mgr.AddInput(info.ID, "raw-unprefixed-input"); err != nil {
+		t.Fatalf("AddInput: %v", err)
+	}
+	if err := mgr.AddOutput(info.ID, "raw-unprefixed-output"); err != nil {
+		t.Fatalf("AddOutput: %v", err)
+	}
+	if err := mgr.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	mgrLoaded := NewDefaultRoomManager(nil, nil, nil, nil)
+	defer mgrLoaded.Close()
+	mgrLoaded.SetClusterManager(cm)
+	mgrLoaded.SetDeviceResolver(devRes)
+	mgrLoaded.SetRoomsFile(roomsFile)
+	if err := mgrLoaded.Load(); err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	rLoaded, ok := mgrLoaded.GetRoom(info.ID)
+	if !ok || rLoaded == nil {
+		t.Fatalf("rLoaded not found")
+	}
+	if rLoaded.clusterMgr == nil {
+		t.Errorf("rLoaded.clusterMgr is nil")
+	}
+	if rLoaded.devResolver == nil {
+		t.Errorf("rLoaded.devResolver is nil")
+	}
+
+	// Verify un-prefixed devices normalized to "local/..."
+	inputs := rLoaded.Inputs()
+	if len(inputs) != 1 || inputs[0] != "local/raw-unprefixed-input" {
+		t.Errorf("expected normalized input local/raw-unprefixed-input, got %v", inputs)
+	}
+	outputs := rLoaded.Outputs()
+	if len(outputs) != 1 || outputs[0] != "local/raw-unprefixed-output" {
+		t.Errorf("expected normalized output local/raw-unprefixed-output, got %v", outputs)
+	}
+
+	// 4. Verify SetClusterManager dynamically updates all existing rooms
+	cm2 := &mockClusterProvider{
+		snapshot: &cluster.ClusterSnapshot{
+			ClusterDevices: []cluster.AudioDeviceSummary{
+				{ID: "cm-new-device", NodeID: "new-node"},
+			},
+		},
+	}
+	mgrLoaded.SetClusterManager(cm2)
+	if rLoaded.clusterMgr != cm2 {
+		t.Errorf("SetClusterManager did not update rLoaded.clusterMgr")
+	}
 }

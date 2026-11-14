@@ -1,8 +1,9 @@
 /**
- * Audio Router P2P - Audio Flow Canvas Layout Store (ADR 0012)
+ * Audio Router P2P - Audio Flow Canvas Layout Store (ADR 0012, ADR 0027)
  *
  * Manages client presentation state for SvelteFlow audio routing canvas:
- * - Selective device staging (enabledDevices)
+ * - Directional endpoint staging (in:<key>, out:<key>) with ADR 0027 isolation
+ * - Backward compatibility with V1 schema (audio_router_flow_layout_v1)
  * - Persistent (x, y) coordinates for input, room, and output nodes
  * - Palette sidebar collapsed/open state
  * - Collapsed cluster node accordions
@@ -26,8 +27,74 @@ export interface FlowLayoutStorageV1 {
   collapsedNodes?: string[];
 }
 
+// =========================================================================
+// ADR 0027 / ADR 0028 Directional Staging & Strict Canonical Endpoint Identity (CEI)
+// =========================================================================
+
+/**
+ * Test whether a stored item matches a requested target canvas key for a given direction.
+ * Enforces strict node isolation (ADR 0028):
+ * - If both targetKey and stored item are node-qualified (e.g. "nodeA/mic" vs "nodeB/mic"),
+ *   they match IF AND ONLY IF their exact qualified keys match.
+ * - If targetKey is node-qualified ("nodeA/mic") and stored item is legacy bare ("mic"),
+ *   matches only if stored item equals targetKey's device part.
+ * - If targetKey is bare ("mic") and stored item is qualified ("nodeA/mic"),
+ *   matches if stored item ends with "/" + targetKey.
+ * - If both are bare, matches if equal.
+ */
+function matchesEndpointTag(
+  storedItem: string,
+  targetKey: string,
+  direction?: 'input' | 'output'
+): boolean {
+  let stripped = storedItem;
+  if (direction) {
+    const dirTag = direction === 'input' ? 'in:' : 'out:';
+    const nodePrefix = direction === 'input' ? 'input-' : 'output-';
+    if (storedItem.startsWith(dirTag)) {
+      stripped = storedItem.slice(dirTag.length);
+    } else if (storedItem.startsWith(nodePrefix)) {
+      stripped = storedItem.slice(nodePrefix.length);
+    } else if (
+      storedItem.startsWith('in:') ||
+      storedItem.startsWith('out:') ||
+      storedItem.startsWith('input-') ||
+      storedItem.startsWith('output-')
+    ) {
+      // Belongs to the other direction
+      return false;
+    }
+  } else {
+    stripped = storedItem.replace(/^(in:|out:|input-|output-)/, '');
+  }
+
+  // Exact match
+  if (stripped === targetKey) return true;
+
+  const targetHasSlash = targetKey.includes('/');
+  const strippedHasSlash = stripped.includes('/');
+
+  // Both are node-qualified: if not exact, they NEVER match (ADR 0028 isolation)!
+  if (targetHasSlash && strippedHasSlash) {
+    return false;
+  }
+
+  // targetKey is node-qualified (e.g. nodeA/dev1), stored is legacy bare (e.g. dev1)
+  if (targetHasSlash && !strippedHasSlash) {
+    const targetDev = targetKey.slice(targetKey.indexOf('/') + 1);
+    return stripped === targetDev;
+  }
+
+  // targetKey is bare (e.g. dev1), stored is qualified (e.g. nodeA/dev1)
+  if (!targetHasSlash && strippedHasSlash) {
+    return stripped.endsWith(`/${targetKey}`);
+  }
+
+  return false;
+}
+
 export class FlowLayoutStore {
-  // Staged device IDs visible on the canvas
+  // Staged device / directional endpoint IDs visible on the canvas (e.g. "in:hw:0", "out:hw:0")
   enabledDevices = $state<Set<string>>(new Set());
 
   // Spatial coordinates keyed by SvelteFlow node ID (e.g. "input-hw:0", "room-main", "output-hw:1")
@@ -45,16 +112,23 @@ export class FlowLayoutStore {
   // Hydration readiness flag
   isHydrated = $state<boolean>(false);
 
+  // Flag indicating whether a saved layout was found in localStorage
+  hasSavedLayout = $state<boolean>(false);
+
   private saveTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     if (typeof window !== 'undefined') {
       this.hydrate();
+      window.addEventListener('beforeunload', () => {
+        this.persistNow();
+      });
     }
   }
 
   /**
-   * Hydrate layout state from localStorage with schema versioning and corruption recovery
+   * Hydrate layout state from localStorage with schema versioning,
+   * ADR 0027 directional normalization, and corruption recovery.
    */
   hydrate() {
     if (typeof window === 'undefined' || typeof localStorage === 'undefined') {
@@ -66,6 +140,7 @@ export class FlowLayoutStore {
       const raw = localStorage.getItem(STORAGE_KEY_V1);
       if (!raw) {
         this.isHydrated = true;
+        this.hasSavedLayout = false;
         return;
       }
 
@@ -75,29 +150,72 @@ export class FlowLayoutStore {
       if (!parsed || parsed.version !== 1) {
         console.warn(`[flowLayoutStore] Incompatible layout schema version (expected 1, got ${parsed?.version}). Resetting to default.`);
         this.isHydrated = true;
+        this.hasSavedLayout = false;
         return;
       }
+
+      this.hasSavedLayout = true;
 
       if (parsed.sidebarCollapsed !== undefined) {
         this.sidebarOpen = !parsed.sidebarCollapsed;
       }
 
+      const positionsMap = new Map<string, { x: number; y: number }>();
+      const positionsObj = parsed.nodePositions && typeof parsed.nodePositions === 'object' ? parsed.nodePositions : {};
+
+      if (parsed.nodePositions && typeof parsed.nodePositions === 'object') {
+        for (const [key, val] of Object.entries(parsed.nodePositions)) {
+          if (val && typeof val.x === 'number' && typeof val.y === 'number' && !isNaN(val.x) && !isNaN(val.y)) {
+            positionsMap.set(key, { x: Math.round(val.x), y: Math.round(val.y) });
+          }
+        }
+        this.positions = positionsMap;
+      }
+
+      // ADR 0027: Directional normalization for stagedDeviceIds
       if (Array.isArray(parsed.stagedDeviceIds)) {
-        this.enabledDevices = new Set(parsed.stagedDeviceIds);
+        const nextEnabled = new Set<string>();
+
+        for (const rawId of parsed.stagedDeviceIds) {
+          if (typeof rawId !== 'string' || !rawId.trim()) continue;
+
+          // Already directional tag: "in:..." or "out:..."
+          if (rawId.startsWith('in:') || rawId.startsWith('out:')) {
+            nextEnabled.add(rawId);
+            continue;
+          }
+
+          // Legacy SvelteFlow node IDs
+          if (rawId.startsWith('input-')) {
+            nextEnabled.add(`in:${rawId.slice(6)}`);
+            continue;
+          }
+          if (rawId.startsWith('output-')) {
+            nextEnabled.add(`out:${rawId.slice(7)}`);
+            continue;
+          }
+
+          // Legacy bare device keys (e.g. "hw:0" or "node2/hw:1")
+          // Inspect positions to infer whether input, output, or duplex was staged
+          const hasInPos = positionsObj[`input-${rawId}`] !== undefined;
+          const hasOutPos = positionsObj[`output-${rawId}`] !== undefined;
+
+          if (hasInPos && !hasOutPos) {
+            nextEnabled.add(`in:${rawId}`);
+          } else if (hasOutPos && !hasInPos) {
+            nextEnabled.add(`out:${rawId}`);
+          } else {
+            // Both directional positions exist or neither exists (default duplex)
+            nextEnabled.add(`in:${rawId}`);
+            nextEnabled.add(`out:${rawId}`);
+          }
+        }
+
+        this.enabledDevices = nextEnabled;
       }
 
       if (Array.isArray(parsed.collapsedNodes)) {
         this.collapsedNodes = new Set(parsed.collapsedNodes);
-      }
-
-      if (parsed.nodePositions && typeof parsed.nodePositions === 'object') {
-        const nextPos = new Map<string, { x: number; y: number }>();
-        for (const [key, val] of Object.entries(parsed.nodePositions)) {
-          if (val && typeof val.x === 'number' && typeof val.y === 'number' && !isNaN(val.x) && !isNaN(val.y)) {
-            nextPos.set(key, { x: Math.round(val.x), y: Math.round(val.y) });
-          }
-        }
-        this.positions = nextPos;
       }
 
       if (parsed.viewport && typeof parsed.viewport.zoom === 'number') {
@@ -108,6 +226,43 @@ export class FlowLayoutStore {
     } catch (err) {
       console.warn('[flowLayoutStore] Failed to parse stored canvas layout; recovering with clean defaults:', err);
       this.isHydrated = true;
+      this.hasSavedLayout = false;
+    }
+  }
+
+  /**
+   * Persist immediately to localStorage (synchronous write)
+   */
+  persistNow() {
+    if (typeof window === 'undefined' || typeof localStorage === 'undefined' || !this.isHydrated) {
+      return;
+    }
+
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      this.saveTimeout = null;
+    }
+
+    try {
+      const nodePositionsRecord: Record<string, { x: number; y: number }> = {};
+      for (const [nodeId, pos] of this.positions.entries()) {
+        nodePositionsRecord[nodeId] = { x: Math.round(pos.x), y: Math.round(pos.y) };
+      }
+
+      const payload: FlowLayoutStorageV1 = {
+        version: 1,
+        lastUpdated: Date.now(),
+        sidebarCollapsed: !this.sidebarOpen,
+        stagedDeviceIds: Array.from(this.enabledDevices),
+        nodePositions: nodePositionsRecord,
+        collapsedNodes: Array.from(this.collapsedNodes),
+        viewport: this.viewport ?? undefined,
+      };
+
+      localStorage.setItem(STORAGE_KEY_V1, JSON.stringify(payload));
+      this.hasSavedLayout = true;
+    } catch (err) {
+      console.warn('[flowLayoutStore] Failed to persist audio flow canvas layout to localStorage:', err);
     }
   }
 
@@ -124,69 +279,220 @@ export class FlowLayoutStore {
     }
 
     this.saveTimeout = setTimeout(() => {
-      try {
-        const nodePositionsRecord: Record<string, { x: number; y: number }> = {};
-        for (const [nodeId, pos] of this.positions.entries()) {
-          nodePositionsRecord[nodeId] = { x: Math.round(pos.x), y: Math.round(pos.y) };
-        }
-
-        const payload: FlowLayoutStorageV1 = {
-          version: 1,
-          lastUpdated: Date.now(),
-          sidebarCollapsed: !this.sidebarOpen,
-          stagedDeviceIds: Array.from(this.enabledDevices),
-          nodePositions: nodePositionsRecord,
-          collapsedNodes: Array.from(this.collapsedNodes),
-          viewport: this.viewport ?? undefined,
-        };
-
-        localStorage.setItem(STORAGE_KEY_V1, JSON.stringify(payload));
-      } catch (err) {
-        console.warn('[flowLayoutStore] Failed to persist audio flow canvas layout to localStorage:', err);
-      }
+      this.persistNow();
     }, 300);
   }
 
+  // =========================================================================
+  // ADR 0027 Directional Staging Primitives
+  // =========================================================================
+
   /**
-   * Check if device is currently staged on canvas
+   * Check if a specific directional endpoint is staged on canvas.
+   * Enforces strict node isolation (ADR 0028):
+   * Matches exact "in:<canvasKey>", "out:<canvasKey>", SvelteFlow node IDs,
+   * or legacy bare keys, but never bleeds across different cluster nodes.
    */
-  isDeviceEnabled(deviceId: string): boolean {
-    return this.enabledDevices.has(deviceId);
+  isEndpointStaged(canvasKey: string, direction: 'input' | 'output'): boolean {
+    const dirTag = direction === 'input' ? 'in:' : 'out:';
+    const nodePrefix = direction === 'input' ? 'input-' : 'output-';
+
+    // 1. Direct fast-path key lookups
+    if (this.enabledDevices.has(`${dirTag}${canvasKey}`)) return true;
+    if (this.enabledDevices.has(`${nodePrefix}${canvasKey}`)) return true;
+
+    // 2. Scan enabledDevices using strict canonical matching (ADR 0028)
+    for (const d of this.enabledDevices) {
+      if (matchesEndpointTag(d, canvasKey, direction)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   /**
-   * Stage a device on the canvas, optionally setting its initial position
+   * Stage only the specified directional endpoint by adding "in:<canvasKey>"
+   * or "out:<canvasKey>" to enabledDevices, and optionally storing its position.
    */
-  enableDevice(deviceId: string, pos?: { x: number; y: number }, targetNodeId?: string) {
+  stageEndpoint(canvasKey: string, direction: 'input' | 'output', pos?: { x: number; y: number }) {
+    const dirTag = `${direction === 'input' ? 'in:' : 'out:'}${canvasKey}`;
     const next = new Set(this.enabledDevices);
-    next.add(deviceId);
+    next.add(dirTag);
+    this.enabledDevices = next;
+
+    if (pos) {
+      const nodeKey = `${direction === 'input' ? 'input-' : 'output-'}${canvasKey}`;
+      const nextPositions = new Map(this.positions);
+      nextPositions.set(nodeKey, { x: Math.round(pos.x), y: Math.round(pos.y) });
+      this.positions = nextPositions;
+    }
+
+    this.persistNow();
+  }
+
+  /**
+   * Unstage only the specified directional endpoint.
+   * Removes "in:<canvasKey>" or "out:<canvasKey>", deletes its directional position,
+   * and preserves the counterpart directional endpoint (migrating legacy bare keys if present).
+   * Enforces strict node isolation (ADR 0028): never unstages matching devices on other nodes.
+   */
+  unstageEndpoint(canvasKey: string, direction: 'input' | 'output') {
+    const dirTag = direction === 'input' ? 'in:' : 'out:';
+    const nodePrefix = direction === 'input' ? 'input-' : 'output-';
+    const counterpartDirection = direction === 'input' ? 'output' : 'input';
+    const counterpartTag = `${counterpartDirection === 'input' ? 'in:' : 'out:'}${canvasKey}`;
+
+    const next = new Set(this.enabledDevices);
+
+    // 1. Detect and migrate legacy bare keys to preserve the un-dismissed counterpart
+    let hadBareKey = false;
+    for (const d of next) {
+      if (
+        !d.startsWith('in:') &&
+        !d.startsWith('out:') &&
+        !d.startsWith('input-') &&
+        !d.startsWith('output-')
+      ) {
+        if (matchesEndpointTag(d, canvasKey)) {
+          hadBareKey = true;
+          next.delete(d);
+        }
+      }
+    }
+
+    if (hadBareKey) {
+      next.add(counterpartTag);
+    }
+
+    // 2. Remove all directional entries matching this canvasKey and direction (ADR 0028)
+    for (const d of Array.from(next)) {
+      if (matchesEndpointTag(d, canvasKey, direction)) {
+        next.delete(d);
+      }
+    }
+
+    this.enabledDevices = next;
+
+    // 3. Remove ONLY positions for this direction and this canvasKey
+    const nextPositions = new Map(this.positions);
+    const targetNodeId = `${nodePrefix}${canvasKey}`;
+    nextPositions.delete(targetNodeId);
+
+    for (const k of Array.from(nextPositions.keys())) {
+      if (k.startsWith(nodePrefix)) {
+        const stripped = k.slice(nodePrefix.length);
+        if (matchesEndpointTag(stripped, canvasKey)) {
+          nextPositions.delete(k);
+        }
+      }
+    }
+    this.positions = nextPositions;
+
+    this.persistNow();
+  }
+
+  // =========================================================================
+  // Backward-Compatibility Methods (ADR 0012 / ADR 0024 Callers)
+  // =========================================================================
+
+  /**
+   * Check if device is currently staged on canvas (either input or output endpoint).
+   */
+  isDeviceEnabled(deviceId: string, nodeId?: string, direction?: 'input' | 'output'): boolean {
+    const canvasKey = nodeId && !deviceId.includes('/') ? `${nodeId}/${deviceId}` : deviceId;
+    if (direction) {
+      return this.isEndpointStaged(canvasKey, direction);
+    }
+    return this.isEndpointStaged(canvasKey, 'input') || this.isEndpointStaged(canvasKey, 'output');
+  }
+
+  /**
+   * Stage a device on the canvas, optionally setting its initial position.
+   * If direction is provided or inferrable from targetNodeId, stages that endpoint specifically;
+   * otherwise stages both input and output endpoints for duplex compatibility.
+   */
+  enableDevice(
+    deviceId: string,
+    pos?: { x: number; y: number },
+    targetNodeId?: string,
+    direction?: 'input' | 'output'
+  ) {
+    if (direction) {
+      this.stageEndpoint(deviceId, direction, pos);
+      return;
+    }
+
+    if (targetNodeId?.startsWith('input-') || deviceId.startsWith('input-') || deviceId.startsWith('in:')) {
+      const clean = deviceId.replace(/^(input-|in:)/, '');
+      this.stageEndpoint(clean, 'input', pos);
+      if (pos && targetNodeId) {
+        this.positions.set(targetNodeId, { x: Math.round(pos.x), y: Math.round(pos.y) });
+      }
+      return;
+    }
+
+    if (targetNodeId?.startsWith('output-') || deviceId.startsWith('output-') || deviceId.startsWith('out:')) {
+      const clean = deviceId.replace(/^(output-|out:)/, '');
+      this.stageEndpoint(clean, 'output', pos);
+      if (pos && targetNodeId) {
+        this.positions.set(targetNodeId, { x: Math.round(pos.x), y: Math.round(pos.y) });
+      }
+      return;
+    }
+
+    // Unspecified direction: stage both endpoints and store position
+    const next = new Set(this.enabledDevices);
+    next.add(`in:${deviceId}`);
+    next.add(`out:${deviceId}`);
     this.enabledDevices = next;
 
     if (pos) {
       const key = targetNodeId || deviceId;
       const nextPositions = new Map(this.positions);
       nextPositions.set(key, { x: Math.round(pos.x), y: Math.round(pos.y) });
+      nextPositions.set(`input-${deviceId}`, { x: Math.round(pos.x), y: Math.round(pos.y) });
+      nextPositions.set(`output-${deviceId}`, { x: Math.round(pos.x), y: Math.round(pos.y) });
       this.positions = nextPositions;
     }
 
-    this.queuePersist();
+    this.persistNow();
   }
 
   /**
-   * Remove a device from the canvas staging and clean up associated positions
+   * Remove a device from canvas staging and clean up associated positions.
+   * If direction is passed, delegates to unstageEndpoint; otherwise removes all directional endpoints.
+   * Enforces strict node isolation (ADR 0028).
    */
-  disableDevice(deviceId: string) {
+  disableDevice(deviceId: string, nodeId?: string, direction?: 'input' | 'output') {
+    const canvasKey = nodeId && !deviceId.includes('/') ? `${nodeId}/${deviceId}` : deviceId;
+    if (direction) {
+      this.unstageEndpoint(canvasKey, direction);
+      return;
+    }
+
     const next = new Set(this.enabledDevices);
-    next.delete(deviceId);
+    for (const d of Array.from(next)) {
+      if (matchesEndpointTag(d, canvasKey)) {
+        next.delete(d);
+      }
+    }
     this.enabledDevices = next;
 
     const nextPositions = new Map(this.positions);
-    nextPositions.delete(deviceId);
-    nextPositions.delete(`input-${deviceId}`);
-    nextPositions.delete(`output-${deviceId}`);
+    nextPositions.delete(canvasKey);
+    nextPositions.delete(`input-${canvasKey}`);
+    nextPositions.delete(`output-${canvasKey}`);
+
+    for (const k of Array.from(nextPositions.keys())) {
+      const stripped = k.replace(/^(input-|output-)/, '');
+      if (matchesEndpointTag(stripped, canvasKey)) {
+        nextPositions.delete(k);
+      }
+    }
     this.positions = nextPositions;
 
-    this.queuePersist();
+    this.persistNow();
   }
 
   /**
@@ -211,6 +517,18 @@ export class FlowLayoutStore {
   }
 
   /**
+   * Remove stored coordinate for a specific node ID (e.g. deleted room)
+   */
+  deleteNodePosition(nodeId: string) {
+    if (this.positions.has(nodeId)) {
+      const next = new Map(this.positions);
+      next.delete(nodeId);
+      this.positions = next;
+      this.persistNow();
+    }
+  }
+
+  /**
    * Retrieve coordinate for a node
    */
   getPosition(nodeId: string): { x: number; y: number } | undefined {
@@ -222,7 +540,7 @@ export class FlowLayoutStore {
    */
   clearPositions() {
     this.positions = new Map();
-    this.queuePersist();
+    this.persistNow();
   }
 
   /**
@@ -288,9 +606,18 @@ export class FlowLayoutStore {
    * Initialize default staged devices on first load if none are saved
    */
   initDefaultsIfEmpty(defaultDeviceIds: string[]) {
-    if (this.enabledDevices.size === 0 && defaultDeviceIds.length > 0) {
-      this.enabledDevices = new Set(defaultDeviceIds);
-      this.queuePersist();
+    if (!this.hasSavedLayout && this.enabledDevices.size === 0 && defaultDeviceIds.length > 0) {
+      const set = new Set<string>();
+      for (const id of defaultDeviceIds) {
+        if (id.startsWith('in:') || id.startsWith('out:')) {
+          set.add(id);
+        } else {
+          set.add(`in:${id}`);
+          set.add(`out:${id}`);
+        }
+      }
+      this.enabledDevices = set;
+      this.persistNow();
     }
   }
 
@@ -299,8 +626,19 @@ export class FlowLayoutStore {
    */
   resetLayout(defaultDeviceIds?: string[]) {
     this.positions = new Map();
-    this.enabledDevices = new Set(defaultDeviceIds || []);
-    this.queuePersist();
+    const set = new Set<string>();
+    if (defaultDeviceIds) {
+      for (const id of defaultDeviceIds) {
+        if (id.startsWith('in:') || id.startsWith('out:')) {
+          set.add(id);
+        } else {
+          set.add(`in:${id}`);
+          set.add(`out:${id}`);
+        }
+      }
+    }
+    this.enabledDevices = set;
+    this.persistNow();
   }
 }
 

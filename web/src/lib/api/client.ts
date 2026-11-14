@@ -21,6 +21,7 @@ import type {
   UpdateRoomBindingsRequest,
   StreamStats,
   SimProfiles,
+  DeviceHealth,
   ErrorResponse,
   NetworkHealthResponse,
   ClusterNodesResponse,
@@ -302,10 +303,10 @@ export class ApiClient {
     });
   }
 
-  async addRoomInput(roomId: string, devId: string, gain?: number): Promise<RoomInfo> {
+  async addRoomInput(roomId: string, devId: string, gain?: number, nodeId?: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/inputs`, {
       method: 'POST',
-      body: JSON.stringify({ device_id: devId, gain }),
+      body: JSON.stringify({ device_id: devId, node_id: nodeId, gain }),
     });
   }
 
@@ -315,10 +316,10 @@ export class ApiClient {
     });
   }
 
-  async addRoomOutput(roomId: string, devId: string, gain?: number): Promise<RoomInfo> {
+  async addRoomOutput(roomId: string, devId: string, gain?: number, nodeId?: string): Promise<RoomInfo> {
     return this.request<RoomInfo>(`/api/v1/rooms/${encodeURIComponent(roomId)}/outputs`, {
       method: 'POST',
-      body: JSON.stringify({ device_id: devId, gain }),
+      body: JSON.stringify({ device_id: devId, node_id: nodeId, gain }),
     });
   }
 
@@ -350,6 +351,14 @@ export class ApiClient {
 
   async getStreamStats(): Promise<Record<string, StreamStats>> {
     return this.request<Record<string, StreamStats>>('/api/v1/telemetry/stream-stats');
+  }
+
+  /**
+   * ADR 0034: URN-keyed per-device artifact health. Returns an empty object
+   * when the daemon's ArtifactAggregator is unwired (tests, partial startup).
+   */
+  async getDeviceArtifacts(): Promise<Record<string, DeviceHealth>> {
+    return this.request<Record<string, DeviceHealth>>('/api/v1/telemetry/device-artifacts');
   }
 
   // ==========================================================================

@@ -10,6 +10,8 @@ require (
 	github.com/pion/rtp v1.8.3
 	github.com/pion/srtp/v2 v2.0.20
 	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_model v0.6.3
+	go.uber.org/goleak v1.3.0
 	golang.org/x/net v0.58.0
 )
 
@@ -29,7 +31,6 @@ require (
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
 	github.com/pion/transport/v2 v2.2.4 // indirect
-	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.71.0 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
 	github.com/sean-/seed v0.0.0-20170313163322-e2103e2c3529 // indirect

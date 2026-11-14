@@ -1,11 +1,13 @@
 package cluster
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"net/url"
@@ -30,10 +32,17 @@ type LocalNodeProvider interface {
 	ActiveStreams() int
 }
 
+// RoomSyncProvider allows anti-entropy room synchronization across mesh nodes (ADR 0017).
+type RoomSyncProvider interface {
+	ExportCRDTRooms() ([]byte, error)
+	MergeCRDTRooms(data []byte) error
+}
+
 // DiscoveryProvider provides mesh topology and gossip state.
 type DiscoveryProvider interface {
 	NodeID() string
 	Peers() []discovery.Peer
+	LivePeers() []discovery.Peer
 	PeerByID(id string) *discovery.Peer
 	PeerState(id string) string
 }
@@ -56,6 +65,12 @@ type Manager struct {
 	disc       DiscoveryProvider
 	httpClient *http.Client
 
+	// relayHTTPClient is dedicated to long-lived peer telemetry SSE streams.
+	// It intentionally has NO overall request timeout (unlike httpClient which
+	// is bounded by ScrapeTimeout); a global timeout would kill the streaming
+	// connection every ScrapeTimeout and cause periodic meter gaps in the UI.
+	relayHTTPClient *http.Client
+
 	// Lock-free read plane for O(1) instant UI/API queries
 	snapshot atomic.Pointer[ClusterSnapshot]
 
@@ -63,6 +78,12 @@ type Manager struct {
 	peerMu       sync.RWMutex
 	peerFailures map[string]int
 	circuitOpen  map[string]time.Time
+
+	// Telemetry mesh relay
+	broadcaster   TelemetryBroadcaster
+	broadcasterMu sync.RWMutex
+	peerStreamsMu sync.Mutex
+	peerStreams   map[string]context.CancelFunc
 
 	// Lifecycle management
 	started  atomic.Bool
@@ -92,17 +113,21 @@ func NewManager(cfg Config, local LocalNodeProvider, disc DiscoveryProvider, cus
 	}
 
 	var client *http.Client
+	// Shared transport for all cluster HTTP traffic. Note: http.Client.Timeout
+	// is per-client, so a bounded scrape client and an unbounded relay client
+	// can safely share the same transport.
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // Allow self-signed certificates inside mesh
+		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	relayClient := &http.Client{Transport: tr} // No Timeout: long-lived SSE streams
 	if len(customClient) > 0 && customClient[0] != nil {
 		client = customClient[0]
 	} else {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Allow self-signed certificates inside mesh
-			},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-		}
 		client = &http.Client{
 			Transport: tr,
 			Timeout:   cfg.ScrapeTimeout + 500*time.Millisecond,
@@ -110,12 +135,14 @@ func NewManager(cfg Config, local LocalNodeProvider, disc DiscoveryProvider, cus
 	}
 
 	m := &Manager{
-		cfg:          cfg,
-		local:        local,
-		disc:         disc,
-		httpClient:   client,
+		cfg:             cfg,
+		local:           local,
+		disc:            disc,
+		httpClient:      client,
+		relayHTTPClient: relayClient,
 		peerFailures: make(map[string]int),
 		circuitOpen:  make(map[string]time.Time),
+		peerStreams:  make(map[string]context.CancelFunc),
 		stopCh:       make(chan struct{}),
 	}
 
@@ -161,6 +188,12 @@ func (m *Manager) Stop() {
 		if m.cancel != nil {
 			m.cancel()
 		}
+		m.peerStreamsMu.Lock()
+		for _, cancel := range m.peerStreams {
+			cancel()
+		}
+		m.peerStreams = make(map[string]context.CancelFunc)
+		m.peerStreamsMu.Unlock()
 		m.wg.Wait()
 	})
 }
@@ -327,7 +360,7 @@ func (m *Manager) ScrapeCluster(ctx context.Context) *ClusterSnapshot {
 		LastSeen:      time.Now(),
 	}
 
-	// 2. Discover peers
+	// 2. Discover peers: check SWIM state and circuit breaker so dead/unreachable peers don't block worker pools
 	var peers []discovery.Peer
 	if m.disc != nil {
 		peers = m.disc.Peers()
@@ -346,6 +379,48 @@ func (m *Manager) ScrapeCluster(ctx context.Context) *ClusterSnapshot {
 peerLoop:
 	for _, p := range peers {
 		if p.ID == localID {
+			continue
+		}
+
+		// Pre-filter: Check SWIM state so dead peers don't allocate worker pool slots or cause timeouts
+		if m.disc != nil && m.disc.PeerState(p.ID) == "dead" {
+			mu.Lock()
+			peerSummaries = append(peerSummaries, ClusterNodeSummary{
+				ID:          p.ID,
+				NodeID:      p.ID,
+				Name:        p.ID,
+				APIAddr:     p.APIAddr,
+				IsLocal:     false,
+				SWIMState:   "dead",
+				HealthScore: 0.0,
+				HealthGrade: string(telemetry.GradeCritical),
+				LastSeen:    p.LastSeen,
+				ErrorReason: "SWIM failure detector reported dead",
+			})
+			mu.Unlock()
+			continue
+		}
+
+		// Pre-filter: Check circuit breaker without occupying a worker slot
+		if m.isCircuitOpen(p.ID) {
+			swimState := "unknown"
+			if m.disc != nil {
+				swimState = m.disc.PeerState(p.ID)
+			}
+			mu.Lock()
+			peerSummaries = append(peerSummaries, ClusterNodeSummary{
+				ID:          p.ID,
+				NodeID:      p.ID,
+				Name:        p.ID,
+				APIAddr:     p.APIAddr,
+				IsLocal:     false,
+				SWIMState:   swimState,
+				HealthScore: 0.0,
+				HealthGrade: string(telemetry.GradeCritical),
+				LastSeen:    p.LastSeen,
+				ErrorReason: "circuit breaker open (consecutive failures)",
+			})
+			mu.Unlock()
 			continue
 		}
 
@@ -436,11 +511,12 @@ peerLoop:
 	}
 
 	m.snapshot.Store(snap)
+	m.syncPeerTelemetryStreams()
 	return snap
 }
 
 func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterNodeSummary, map[string]float64) {
-	swimState := "alive"
+	swimState := "unknown"
 	if m.disc != nil {
 		swimState = m.disc.PeerState(peer.ID)
 	}
@@ -566,6 +642,26 @@ func (m *Manager) scrapePeer(ctx context.Context, peer discovery.Peer) (ClusterN
 
 	// Success: reset failures and clear circuit
 	m.recordSuccess(peer.ID)
+
+	// 3. Scrape GET /api/v1/cluster/rooms for HTTP anti-entropy room synchronization (ADR 0017)
+	if syncer, ok := m.local.(RoomSyncProvider); ok && syncer != nil {
+		roomsURL := strings.TrimRight(peer.APIAddr, "/") + "/api/v1/cluster/rooms"
+		rReq, err := http.NewRequestWithContext(ctx, http.MethodGet, roomsURL, nil)
+		if err == nil {
+			if m.cfg.AuthToken != "" {
+				rReq.Header.Set("Authorization", "Bearer "+m.cfg.AuthToken)
+			}
+			if rResp, err := m.httpClient.Do(rReq); err == nil {
+				if rResp.StatusCode == http.StatusOK {
+					var body bytes.Buffer
+					if _, err := io.Copy(&body, io.LimitReader(rResp.Body, 1<<20)); err == nil {
+						_ = syncer.MergeCRDTRooms(body.Bytes())
+					}
+				}
+				_ = rResp.Body.Close()
+			}
+		}
+	}
 
 	peerDevices := make([]AudioDeviceSummary, len(rawDevices))
 	for i, d := range rawDevices {
@@ -829,4 +925,136 @@ func (m *Manager) MutateRemoteDevice(ctx context.Context, nodeID string, deviceI
 		Muted:     devResult.Muted,
 		UpdatedAt: time.Now(),
 	}, nil
+}
+
+// SetTelemetryBroadcaster attaches the telemetry broadcaster to relay peer meter frames.
+func (m *Manager) SetTelemetryBroadcaster(b TelemetryBroadcaster) {
+	m.broadcasterMu.Lock()
+	m.broadcaster = b
+	m.broadcasterMu.Unlock()
+	m.syncPeerTelemetryStreams()
+}
+
+func (m *Manager) syncPeerTelemetryStreams() {
+	m.broadcasterMu.RLock()
+	broadcaster := m.broadcaster
+	m.broadcasterMu.RUnlock()
+	if broadcaster == nil || m.disc == nil {
+		return
+	}
+
+	livePeers := m.disc.LivePeers()
+	localID := m.disc.NodeID()
+
+	m.peerStreamsMu.Lock()
+	defer m.peerStreamsMu.Unlock()
+
+	activeSet := make(map[string]bool)
+	for _, peer := range livePeers {
+		if peer.ID == "" || peer.ID == localID || peer.APIAddr == "" {
+			continue
+		}
+		activeSet[peer.ID] = true
+		if _, exists := m.peerStreams[peer.ID]; !exists {
+			parentCtx := m.ctx
+			if parentCtx == nil {
+				parentCtx = context.Background()
+			}
+			ctx, cancel := context.WithCancel(parentCtx)
+			m.peerStreams[peer.ID] = cancel
+			m.wg.Add(1)
+			go m.runPeerTelemetryStream(ctx, peer.ID, peer.APIAddr)
+		}
+	}
+
+	for id, cancel := range m.peerStreams {
+		if !activeSet[id] {
+			cancel()
+			delete(m.peerStreams, id)
+		}
+	}
+}
+
+func (m *Manager) runPeerTelemetryStream(ctx context.Context, peerID, apiAddr string) {
+	defer m.wg.Done()
+
+	apiURL := apiAddr
+	if !strings.HasPrefix(apiURL, "http://") && !strings.HasPrefix(apiURL, "https://") {
+		apiURL = "http://" + apiURL
+	}
+	meterURL := strings.TrimRight(apiURL, "/") + "/api/v1/telemetry/meters?local_only=true&rate=30"
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-m.stopCh:
+			return
+		default:
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, meterURL, nil)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+		if m.cfg.AuthToken != "" {
+			req.Header.Set("Authorization", "Bearer "+m.cfg.AuthToken)
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("X-Cluster-Relay", "true")
+
+		resp, err := m.relayHTTPClient.Do(req)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+				continue
+			}
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(2 * time.Second):
+				continue
+			}
+		}
+
+		reader := bufio.NewReader(resp.Body)
+		for {
+			line, err := reader.ReadBytes('\n')
+			if len(line) > 0 {
+				trimmed := bytes.TrimSpace(line)
+				if bytes.HasPrefix(trimmed, []byte("data: ")) {
+					payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data: ")))
+					if len(payload) > 0 {
+						m.broadcasterMu.RLock()
+						b := m.broadcaster
+						m.broadcasterMu.RUnlock()
+						if b != nil {
+							b.BroadcastRelayed(payload)
+						}
+					}
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		resp.Body.Close()
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Second):
+		}
+	}
 }

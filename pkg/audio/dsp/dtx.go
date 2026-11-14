@@ -33,7 +33,7 @@ func (s DTXState) String() string {
 type DTXConfig struct {
 	Enabled          bool          `json:"enabled"`
 	SilenceThreshold float64       `json:"silence_threshold"` // in dBFS, e.g. -50.0
-	HangoverDuration time.Duration `json:"hangover_duration"`  // e.g. 400ms
+	HangoverDuration time.Duration `json:"hangover_duration"`  // default: 5s / 5000ms
 	SIDInterval      time.Duration `json:"sid_interval"`       // e.g. 500ms
 	FrameDuration    time.Duration `json:"frame_duration"`     // e.g. 20ms
 }
@@ -42,8 +42,8 @@ type DTXConfig struct {
 func DefaultDTXConfig() DTXConfig {
 	return DTXConfig{
 		Enabled:          true,
-		SilenceThreshold: -50.0,
-		HangoverDuration: 400 * time.Millisecond,
+		SilenceThreshold: -75.0,
+		HangoverDuration: 5 * time.Second,
 		SIDInterval:      500 * time.Millisecond,
 		FrameDuration:    20 * time.Millisecond,
 	}
@@ -71,13 +71,13 @@ func NewDTXController(cfg DTXConfig) *DTXController {
 		cfg.FrameDuration = 20 * time.Millisecond
 	}
 	if cfg.HangoverDuration <= 0 {
-		cfg.HangoverDuration = 400 * time.Millisecond
+		cfg.HangoverDuration = 5 * time.Second
 	}
 	if cfg.SIDInterval <= 0 {
 		cfg.SIDInterval = 500 * time.Millisecond
 	}
 	if cfg.SilenceThreshold == 0 {
-		cfg.SilenceThreshold = -50.0
+		cfg.SilenceThreshold = -75.0
 	}
 
 	hFrames := int(math.Ceil(float64(cfg.HangoverDuration) / float64(cfg.FrameDuration)))
@@ -121,7 +121,21 @@ func (d *DTXController) ProcessFrame(pcm []byte, channels int) (shouldSend bool,
 		return true, false, metrics
 	}
 
-	isActive := metrics.RMSdBFS >= d.config.SilenceThreshold
+	// Hysteresis: entering Active from Silence or Hangover requires crossing above
+	// SilenceThreshold (e.g. -75.0 dBFS). Once in Active state, maintain Active
+	// until level drops below SilenceThreshold - HysteresisMargin (3.0 dB) to prevent
+	// rapid state chattering / thrashing near the threshold.
+	const hysteresisMargin = 3.0
+	var isActive bool
+	if d.state == DTXStateActive {
+		threshold := d.config.SilenceThreshold - hysteresisMargin
+		if threshold < SilenceFloorDBFS {
+			threshold = SilenceFloorDBFS
+		}
+		isActive = metrics.RMSdBFS >= threshold
+	} else {
+		isActive = metrics.RMSdBFS >= d.config.SilenceThreshold
+	}
 
 	if isActive {
 		// Active audio detected: transition directly to Active state

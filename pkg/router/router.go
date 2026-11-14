@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ type StreamRoute struct {
 	Direction       string    `json:"direction,omitempty"` // "receive" for a receiver-only route; otherwise send
 	SourceDevice    int       `json:"sourceDevice"`
 	SourceDeviceURN string    `json:"sourceDeviceUrn,omitempty"`
+	SourceNodeID    string    `json:"sourceNodeId,omitempty"` // Node ID of source endpoint
 	DestDevice      int       `json:"destDevice,omitempty"`
 	DestDeviceURN   string    `json:"destDeviceUrn,omitempty"`
 	Destinations    []string  `json:"destinations"`
@@ -297,7 +299,14 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 	if ch <= 0 {
 		ch = 2
 	}
+	sampleRate := sr.SampleRate
+	if sampleRate <= 0 {
+		sampleRate = 48000
+	}
 	srcNode := "local"
+	if sr.SourceNodeID != "" {
+		srcNode = sr.SourceNodeID
+	}
 	dstNode := "local"
 	inCh, outCh := ch, ch
 	if sr.InChannels > 0 {
@@ -329,40 +338,47 @@ func StreamRouteToMatrixRoute(sr StreamRoute) MatrixRoute {
 	for i := 0; i < outCh; i++ {
 		outChans[i] = i
 	}
-	srcDevice, dstDevice := fmt.Sprintf("%d", sr.SourceDevice), fmt.Sprintf("%d", sr.DestDevice)
-	if sr.SourceDeviceURN != "" {
-		srcDevice = sr.SourceDeviceURN
+	srcDevID := sr.SourceDeviceURN
+	if srcDevID == "" {
+		srcDevID = fmt.Sprintf("%d", sr.SourceDevice)
 	}
-	if sr.DestDeviceURN != "" {
-		dstDevice = sr.DestDeviceURN
+
+	dstDevID := sr.DestDeviceURN
+	if dstDevID == "" {
+		if sr.DestDevice >= 0 {
+			dstDevID = fmt.Sprintf("%d", sr.DestDevice)
+		} else {
+			dstDevID = "0"
+		}
 	}
 	slew := sr.SlewMS
 	if slew <= 0 {
 		slew = 20
 	}
+
 	return MatrixRoute{
 		ID:   sr.ID,
 		Name: sr.ID,
 		Source: MatrixEndpoint{
 			NodeID:   srcNode,
-			DeviceID: srcDevice,
+			DeviceID: srcDevID,
 			Layout:   LayoutStereo,
 			Channels: inChans,
 		},
 		Destination: MatrixEndpoint{
 			NodeID:   dstNode,
-			DeviceID: dstDevice,
+			DeviceID: dstDevID,
 			Layout:   LayoutStereo,
 			Channels: outChans,
 		},
-		InChannels:    inCh,
-		OutChannels:   outCh,
-		Coefficients:  coeffs,
-		SlewMS:        slew,
-		Muted:         sr.Muted,
-		State:         "active",
-		LatencyPreset: sr.LatencyPreset,
-
+		SampleRate:      sampleRate,
+		InChannels:      inCh,
+		OutChannels:     outCh,
+		Coefficients:    coeffs,
+		SlewMS:          slew,
+		Muted:           sr.Muted,
+		State:           "active",
+		LatencyPreset:   sr.LatencyPreset,
 		ChannelDelaysMS: append([]float64(nil), sr.ChannelDelaysMS...),
 	}
 }
@@ -393,20 +409,33 @@ func MatrixRouteToStreamRoute(mr MatrixRoute) StreamRoute {
 
 	var dests []string
 	if mr.Destination.NodeID != "" && mr.Destination.NodeID != "local" {
-		dests = []string{mr.Destination.NodeID}
+		if _, _, err := net.SplitHostPort(mr.Destination.NodeID); err == nil {
+			dests = []string{mr.Destination.NodeID}
+		}
 	} else if len(mr.Destination.Channels) > 0 {
 		dests = []string{"127.0.0.1:45678"}
 	}
+
+	sampleRate := mr.SampleRate
+	if sampleRate <= 0 {
+		sampleRate = 48000
+	}
+	ch := mr.InChannels
+	if ch <= 0 {
+		ch = mr.OutChannels
+	}
+
 	return StreamRoute{
 		ID:              mr.ID,
 		Direction:       direction,
 		SourceDevice:    srcDev,
 		SourceDeviceURN: mr.Source.DeviceID,
+		SourceNodeID:    mr.Source.NodeID,
 		DestDevice:      dstDev,
 		DestDeviceURN:   mr.Destination.DeviceID,
 		Destinations:    dests,
-		SampleRate:      48000,
-		Channels:        mr.OutChannels,
+		SampleRate:      sampleRate,
+		Channels:        ch,
 		InChannels:      mr.InChannels,
 		OutChannels:     mr.OutChannels,
 		Coefficients:    append([]float64(nil), mr.Coefficients...),

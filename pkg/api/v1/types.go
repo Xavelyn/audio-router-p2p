@@ -125,6 +125,7 @@ type RoomInfo struct {
 // RoomDeviceBindingRequest assigns or updates an input or output device in a room.
 type RoomDeviceBindingRequest struct {
 	DeviceID string   `json:"device_id"`
+	NodeID   string   `json:"node_id,omitempty"`
 	Gain     *float64 `json:"gain,omitempty"`
 	Muted    *bool    `json:"muted,omitempty"`
 }
@@ -160,6 +161,8 @@ type JitterStats struct {
 	Underruns          uint64  `json:"underruns"`
 	Overruns           uint64  `json:"overruns"`
 	JitterMS           float64 `json:"jitter_ms,omitempty"`
+	LatePackets        uint64  `json:"late_packets"`
+	EarlyPackets       uint64  `json:"early_packets"`
 }
 
 // FECStats holds forward error correction recovery metrics.
@@ -206,6 +209,12 @@ type StreamStats struct {
 	PLC               PLCStats               `json:"plc"`
 	ASRC              ASRCStats              `json:"asrc"`
 	Peers             map[string]JitterStats `json:"peers,omitempty"`
+
+	// ADR 0034: optional per-route artifact health and device overlay.
+	// Pointer + omitempty keep the response byte-compatible when the
+	// ArtifactAggregator is unwired (tests, partial startup).
+	Health  *RouteHealth       `json:"health,omitempty"`
+	Devices *RouteDeviceImpact `json:"devices,omitempty"`
 }
 
 // RoutePeerStatus is the per-peer link view inside a route's status.
@@ -304,16 +313,47 @@ var ErrRouteNotCalibratable = errors.New("route is not calibratable: calibration
 // per-channel alignment offsets are malformed (wrong length or out of range).
 var ErrInvalidAlignment = errors.New("invalid alignment offsets")
 
+// ArtifactSeverity is the 4-tier audibility grade for audio artifacts (ADR
+// 0034). Alias of the telemetry type so the JSON wire format is identical.
+type ArtifactSeverity = telemetry.ArtifactSeverity
+
+const (
+	ArtifactSeverityNone     = telemetry.SeverityNone
+	ArtifactSeverityMinor    = telemetry.SeverityMinor
+	ArtifactSeverityMajor    = telemetry.SeverityMajor
+	ArtifactSeverityCritical = telemetry.SeverityCritical
+)
+
+// RouteHealth is the per-route artifact health evaluation. Alias of the
+// telemetry type (identical JSON wire format per ADR 0034 §4).
+type RouteHealth = telemetry.RouteHealth
+
+// ArtifactRates is the per-second artifact rate block. Alias of the telemetry type.
+type ArtifactRates = telemetry.ArtifactRates
+
+// PeerArtifactHealth is the windowed per-peer artifact triple. Alias of the telemetry type.
+type PeerArtifactHealth = telemetry.PeerArtifactHealth
+
+// DeviceDirArtifacts is the per-direction device XRun summary. Alias of the telemetry type.
+type DeviceDirArtifacts = telemetry.DeviceDirArtifacts
+
+// DeviceHealth is the per-physical-device artifact health. Alias of the telemetry type.
+type DeviceHealth = telemetry.DeviceHealth
+
+// RouteDeviceImpact is the per-route device artifact overlay. Alias of the telemetry type.
+type RouteDeviceImpact = telemetry.RouteDeviceImpact
+
 // WSControlMessage represents command payloads received over live WebSocket.
 type WSControlMessage struct {
-	Type         string    `json:"type"` // "crosspoint", "patch_route", "mute"
-	RouteID      string    `json:"route_id"`
-	OutChannel   int       `json:"out_channel,omitempty"`
-	InChannel    int       `json:"in_channel,omitempty"`
-	Gain         float64   `json:"gain,omitempty"`
-	Coefficients []float64 `json:"coefficients,omitempty"`
-	SlewMS       float64   `json:"slew_ms,omitempty"`
-	Muted        *bool     `json:"muted,omitempty"`
+	Type         string                 `json:"type"` // "crosspoint", "patch_route", "mute"
+	RouteID      string                 `json:"route_id"`
+	OutChannel   int                    `json:"out_channel,omitempty"`
+	InChannel    int                    `json:"in_channel,omitempty"`
+	Gain         float64                `json:"gain,omitempty"`
+	Coefficients []float64              `json:"coefficients,omitempty"`
+	SlewMS       float64                `json:"slew_ms,omitempty"`
+	Muted        *bool                  `json:"muted,omitempty"`
+	Crosspoint   *CrosspointGainRequest `json:"crosspoint,omitempty"`
 }
 
 // NetworkHealthResponse represents the JSON response for GET /api/v1/network/health per ADR 0010.

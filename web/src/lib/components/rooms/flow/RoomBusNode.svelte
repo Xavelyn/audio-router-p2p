@@ -1,7 +1,8 @@
 <script lang="ts">
   import { Handle, Position } from '@xyflow/svelte';
   import { Switch } from 'bits-ui';
-  import type { RoomInfo, AudioDevice } from '$lib/api/types';
+  import { LATENCY_PRESETS, type RoomInfo, type AudioDevice } from '$lib/api/types';
+  import { roomStore } from '$lib/stores/rooms.svelte';
   import Crown from '@lucide/svelte/icons/crown';
   import Network from '@lucide/svelte/icons/network';
   import Plus from '@lucide/svelte/icons/plus';
@@ -32,6 +33,10 @@
   const activeLinkCount = $derived(
     (data.room.inputs?.length || 0) * (data.room.outputs?.length || 0)
   );
+  const currentPreset = $derived(data.room.latency_preset || 'balanced');
+  const currentPresetHint = $derived(
+    LATENCY_PRESETS.find((p) => p.id === currentPreset)?.hint || '20ms packet / 20–200ms jitter'
+  );
 </script>
 
 <div
@@ -44,7 +49,7 @@
     type="target"
     position={Position.Left}
     id="in"
-    class="!w-4 !h-4 !-left-[8px] !bg-cyan-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(6,182,212,0.9)] hover:!scale-125 transition-transform cursor-crosshair"
+    class="!w-4 !h-4 !bg-cyan-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(6,182,212,0.9)] hover:shadow-[0_0_16px_rgba(6,182,212,1)] hover:brightness-125 hover:ring-2 hover:ring-cyan-300/80 transition-all cursor-crosshair"
     title="Drop connection here to assign input device to this room"
   />
 
@@ -53,7 +58,7 @@
     type="source"
     position={Position.Right}
     id="out"
-    class="!w-4 !h-4 !-right-[8px] !bg-purple-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(168,85,247,0.9)] hover:!scale-125 transition-transform cursor-crosshair"
+    class="!w-4 !h-4 !bg-purple-400 !border-2 !border-zinc-950 !rounded-full shadow-[0_0_10px_rgba(168,85,247,0.9)] hover:shadow-[0_0_16px_rgba(168,85,247,1)] hover:brightness-125 hover:ring-2 hover:ring-purple-300/80 transition-all cursor-crosshair"
     title="Drag wire to route this room into an output device"
   />
 
@@ -64,11 +69,11 @@
         <Network class="w-4 h-4" />
       </div>
       <div class="min-w-0">
-        <div class="flex items-center gap-2">
-          <h2 class="text-sm font-bold text-zinc-100 truncate" title={data.room.name}>
+        <div class="flex items-center gap-2 min-w-0">
+          <h2 class="text-sm font-bold text-zinc-100 truncate flex-1 min-w-0" title={data.room.name}>
             {data.room.name}
           </h2>
-          <span class="rounded px-1.5 py-0.2 text-[9px] font-mono font-bold uppercase tracking-wider {data.room.state === 'active'
+          <span class="rounded px-1.5 py-0.2 text-[9px] font-mono font-bold uppercase tracking-wider shrink-0 {data.room.state === 'active'
             ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
             : 'bg-zinc-800 text-zinc-400 border border-zinc-700'}">
             {data.room.state}
@@ -119,14 +124,36 @@
     </div>
   </div>
 
+  <!-- Latency Preset Selector -->
+  <div class="mt-3 rounded-xl bg-zinc-950/80 p-2.5 border border-zinc-800/90">
+    <div class="flex items-center justify-between mb-2">
+      <span class="text-[10px] font-mono text-zinc-400">LATENCY PRESET</span>
+      <span class="text-[10px] font-mono text-cyan-300">{currentPresetHint}</span>
+    </div>
+    <div class="grid grid-cols-3 gap-1">
+      {#each LATENCY_PRESETS as preset}
+        <button
+          type="button"
+          onclick={() => roomStore.setRoomLatency(data.room.id, preset.id)}
+          class="rounded-md px-2 py-1 text-[10px] font-mono font-semibold uppercase tracking-wide border transition-colors cursor-pointer {currentPreset === preset.id
+            ? 'bg-cyan-500 text-zinc-950 border-cyan-400'
+            : 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:border-cyan-500/50 hover:text-cyan-300'}"
+          title={preset.hint}
+        >
+          {preset.label}
+        </button>
+      {/each}
+    </div>
+  </div>
+
   <!-- All-to-All Summing Bus Core Indicator -->
   <div class="mt-3 rounded-xl bg-gradient-to-r from-cyan-950/30 via-zinc-950/70 to-purple-950/30 p-2.5 border border-cyan-500/20">
-    <div class="flex items-center justify-between text-[11px] font-mono">
-      <span class="text-zinc-300 font-semibold flex items-center gap-1">
+    <div class="flex flex-wrap items-center justify-between gap-1.5 text-[11px] font-mono">
+      <span class="text-zinc-300 font-semibold flex items-center gap-1 shrink-0">
         <span>Summing Audio Bus</span>
         <ArrowRight class="w-3 h-3 text-cyan-400" />
       </span>
-      <span class="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/40">
+      <span class="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/40 shrink-0">
         {activeLinkCount} Active Paths ({data.room.inputs?.length || 0} In &times; {data.room.outputs?.length || 0} Out)
       </span>
     </div>
@@ -166,7 +193,8 @@
                   <button
                     type="button"
                     onclick={() => {
-                      data.onAddInput(dev.id);
+                      const devKey = (dev as any).node_id && !dev.id.includes('/') ? `${(dev as any).node_id}/${dev.id}` : dev.id;
+                      data.onAddInput(devKey);
                       showAddInputMenu = false;
                     }}
                     class="w-full text-left rounded px-2 py-1 text-xs font-mono text-zinc-200 hover:bg-cyan-500/20 hover:text-cyan-300 transition-colors truncate"
@@ -182,15 +210,15 @@
 
       <!-- Inputs List -->
       <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-        {#each data.inputDevices as dev (dev.id)}
-          <div class="flex items-center justify-between rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
-            <div class="truncate mr-1" title={dev.name}>
-              <span class="text-cyan-300 font-medium">{dev.name}</span>
+        {#each data.inputDevices as dev ((dev as any).endpoint_id || dev.id)}
+          <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-cyan-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
+            <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
+              <span class="text-cyan-300 font-medium truncate block">{dev.name}</span>
             </div>
             <button
               type="button"
-              onclick={() => data.onRemoveInput(dev.id)}
-              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0"
+              onclick={() => data.onRemoveInput((dev as any).endpoint_id || dev.id)}
+              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Remove {dev.name} from room"
               aria-label="Remove {dev.name} from room"
             >
@@ -235,7 +263,8 @@
                   <button
                     type="button"
                     onclick={() => {
-                      data.onAddOutput(dev.id);
+                      const devKey = (dev as any).node_id && !dev.id.includes('/') ? `${(dev as any).node_id}/${dev.id}` : dev.id;
+                      data.onAddOutput(devKey);
                       showAddOutputMenu = false;
                     }}
                     class="w-full text-left rounded px-2 py-1 text-xs font-mono text-zinc-200 hover:bg-purple-500/20 hover:text-purple-300 transition-colors truncate"
@@ -251,15 +280,15 @@
 
       <!-- Outputs List -->
       <div class="space-y-1.5 max-h-36 overflow-y-auto pr-1">
-        {#each data.outputDevices as dev (dev.id)}
-          <div class="flex items-center justify-between rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
-            <div class="truncate mr-1" title={dev.name}>
-              <span class="text-purple-300 font-medium">{dev.name}</span>
+        {#each data.outputDevices as dev ((dev as any).endpoint_id || dev.id)}
+          <div class="flex items-center justify-between min-w-0 rounded bg-zinc-900/90 border border-purple-500/30 px-2 py-1 text-[10px] font-mono text-zinc-200">
+            <div class="truncate mr-1 min-w-0 flex-1" title={dev.name}>
+              <span class="text-purple-300 font-medium truncate block">{dev.name}</span>
             </div>
             <button
               type="button"
-              onclick={() => data.onRemoveOutput(dev.id)}
-              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0"
+              onclick={() => data.onRemoveOutput((dev as any).endpoint_id || dev.id)}
+              class="text-zinc-500 hover:text-red-400 p-0.5 transition-colors shrink-0 cursor-pointer"
               title="Remove {dev.name} from room"
               aria-label="Remove {dev.name} from room"
             >
@@ -277,12 +306,12 @@
   </div>
 
   <!-- Room Meta Footer -->
-  <div class="mt-3 flex items-center justify-between pt-2 border-t border-zinc-800/80 text-[10px] font-mono text-zinc-400">
-    <div class="flex items-center gap-1">
-      <Crown class="w-3 h-3 text-amber-400" />
-      <span>Leader: <strong class="text-amber-300 font-bold">{data.room.leader || 'node-local'}</strong></span>
+  <div class="mt-3 flex items-center justify-between pt-2 border-t border-zinc-800/80 text-[10px] font-mono text-zinc-400 min-w-0 gap-2">
+    <div class="flex items-center gap-1 min-w-0 flex-1">
+      <Crown class="w-3 h-3 text-amber-400 shrink-0" />
+      <span class="truncate">Leader: <strong class="text-amber-300 font-bold">{data.room.leader || 'node-local'}</strong></span>
     </div>
-    <div class="flex items-center gap-1.5">
+    <div class="flex items-center gap-1.5 shrink-0">
       <span>{data.room.members?.length || 1} peer node(s)</span>
     </div>
   </div>

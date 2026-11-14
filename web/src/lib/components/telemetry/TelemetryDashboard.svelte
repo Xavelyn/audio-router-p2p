@@ -2,8 +2,10 @@
   import { onMount, onDestroy } from 'svelte';
   import { clusterStore } from '$lib/stores/cluster.svelte';
   import { telemetryStore } from '$lib/stores/telemetry.svelte';
+  import { peerStore } from '$lib/stores/peers.svelte';
   import type { ClusterNodeSummary, AudioDeviceSummary } from '$lib/api/types';
   import NetworkSimulatorPanel from './NetworkSimulatorPanel.svelte';
+  import RouteHealthPanel from './RouteHealthPanel.svelte';
 
   import Cpu from '@lucide/svelte/icons/cpu';
   import Activity from '@lucide/svelte/icons/activity';
@@ -23,16 +25,64 @@
   import Shield from '@lucide/svelte/icons/shield';
   import Layers from '@lucide/svelte/icons/layers';
   import ArrowUpDown from '@lucide/svelte/icons/arrow-up-down';
+  import X from '@lucide/svelte/icons/x';
+
+  // Form state for connecting unicast peer
+  let isPeerModalOpen = $state(false);
+  let peerAddr = $state('192.168.1.150:7001');
+  let peerTlsFingerprint = $state('');
+  let isConnectingPeer = $state(false);
+  let peerError = $state<string | null>(null);
+
+  let peerPollTimer: ReturnType<typeof setTimeout> | null = null;
+  let isDestroyed = false;
+
+  async function pollPeersRecursively() {
+    if (isDestroyed) return;
+    try {
+      await Promise.allSettled([
+        peerStore.loadPeers(),
+        peerStore.loadClockSync(),
+      ]);
+    } finally {
+      if (!isDestroyed) {
+        peerPollTimer = setTimeout(pollPeersRecursively, 2500);
+      }
+    }
+  }
 
   onMount(() => {
-    clusterStore.startPolling(2500);
     telemetryStore.startPolling(2000);
+    pollPeersRecursively();
   });
 
   onDestroy(() => {
-    clusterStore.stopPolling();
+    isDestroyed = true;
     telemetryStore.stopPolling();
+    if (peerPollTimer) {
+      clearTimeout(peerPollTimer);
+      peerPollTimer = null;
+    }
   });
+
+  async function handleConnectPeer() {
+    isConnectingPeer = true;
+    peerError = null;
+    try {
+      await peerStore.connectPeer(peerAddr.trim(), peerTlsFingerprint.trim() || undefined);
+      isPeerModalOpen = false;
+    } catch (err: any) {
+      peerError = err.message || 'Failed to initiate peer handshake';
+    } finally {
+      isConnectingPeer = false;
+    }
+  }
+
+  function handleScrapeNow() {
+    clusterStore.pollCluster();
+    peerStore.loadPeers();
+    peerStore.loadClockSync();
+  }
 
   // Selected node
   const activeNode = $derived(clusterStore.selectedNode);
@@ -160,14 +210,23 @@
 
     <!-- Right Poll Actions -->
     <div class="flex items-center gap-2">
+      <button
+        onclick={() => (isPeerModalOpen = true)}
+        class="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-mono font-medium text-cyan-300 hover:bg-cyan-500/20 hover:border-cyan-500/60 transition-colors cursor-pointer shadow-sm shadow-cyan-500/10"
+        title="Pair Remote Mesh Peer via unicast handshake"
+      >
+        <Radio class="w-3.5 h-3.5 text-cyan-400" />
+        <span>Pair Remote Peer</span>
+      </button>
+
       {#if clusterStore.lastUpdated}
         <span class="text-[10px] font-mono text-zinc-500 hidden sm:inline">
           Updated: {clusterStore.lastUpdated.toLocaleTimeString()}
         </span>
       {/if}
       <button
-        onclick={() => clusterStore.pollCluster()}
-        class="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-cyan-300 transition-colors"
+        onclick={handleScrapeNow}
+        class="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2.5 py-1 text-xs text-zinc-300 hover:bg-zinc-800 hover:text-cyan-300 transition-colors cursor-pointer"
         title="Trigger cluster snapshot scrape"
       >
         <RefreshCw class="w-3.5 h-3.5 text-cyan-400 {clusterStore.isLoading ? 'animate-spin' : ''}" />
@@ -185,17 +244,17 @@
       <!-- ==================================================================== -->
       <div class="grid grid-cols-2 md:grid-cols-5 gap-3 md:gap-4">
         <!-- Global Cluster Health Index Gauge -->
-        <div class="col-span-2 md:col-span-1 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg flex flex-col justify-between">
+        <div class="min-w-0 col-span-2 md:col-span-1 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg flex flex-col justify-between">
           <div class="flex items-center justify-between text-xs font-mono text-zinc-400">
             <span>CLUSTER HEALTH</span>
-            <Activity class="w-4 h-4 text-emerald-400" />
+            <Activity class="w-4 h-4 text-emerald-400 shrink-0" />
           </div>
-          <div class="mt-2 flex items-baseline gap-2">
-            <span class="text-3xl font-mono font-bold {getHealthColor(clusterStore.clusterHealthScore).text}">
+          <div class="mt-2 flex items-baseline gap-2 min-w-0">
+            <span class="text-3xl font-mono font-bold truncate {getHealthColor(clusterStore.clusterHealthScore).text}">
               {clusterStore.clusterHealthScore.toFixed(0)}
             </span>
-            <span class="text-xs font-mono text-zinc-400">/ 100</span>
-            <span class="ml-auto rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold border {getHealthColor(clusterStore.clusterHealthScore).bg} {getHealthColor(clusterStore.clusterHealthScore).border} {getHealthColor(clusterStore.clusterHealthScore).text}">
+            <span class="text-xs font-mono text-zinc-400 shrink-0">/ 100</span>
+            <span class="ml-auto rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold border shrink-0 {getHealthColor(clusterStore.clusterHealthScore).bg} {getHealthColor(clusterStore.clusterHealthScore).border} {getHealthColor(clusterStore.clusterHealthScore).text}">
               {clusterStore.clusterHealthGrade}
             </span>
           </div>
@@ -208,65 +267,67 @@
         </div>
 
         <!-- Node Count & Membership -->
-        <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
+        <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
           <div class="flex items-center justify-between text-xs font-mono text-zinc-400">
             <span>TOTAL NODES</span>
-            <Server class="w-4 h-4 text-cyan-400" />
+            <Server class="w-4 h-4 text-cyan-400 shrink-0" />
           </div>
           <div class="mt-2 text-2xl font-mono font-bold text-zinc-100">
             {clusterStore.nodes.length}
           </div>
-          <div class="mt-1 flex items-center gap-2 text-[10px] font-mono">
-            <span class="text-emerald-400">{clusterStore.healthyNodes} Healthy</span>
-            <span class="text-zinc-600">&bull;</span>
-            <span class={clusterStore.degradedNodes > 0 ? 'text-amber-400' : 'text-zinc-500'}>
+          <div class="mt-1 flex items-center gap-2 text-[10px] font-mono truncate">
+            <span class="text-emerald-400 shrink-0">{clusterStore.healthyNodes} Healthy</span>
+            <span class="text-zinc-600 shrink-0">&bull;</span>
+            <span class="truncate {clusterStore.degradedNodes > 0 ? 'text-amber-400' : 'text-zinc-500'}">
               {clusterStore.degradedNodes} Degraded
             </span>
           </div>
         </div>
 
         <!-- Distributed Clock Sync Lock -->
-        <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
+        <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
           <div class="flex items-center justify-between text-xs font-mono text-zinc-400">
             <span>CLOCK SYNC ROLE</span>
-            <Clock class="w-4 h-4 text-cyan-400" />
+            <Clock class="w-4 h-4 text-cyan-400 shrink-0" />
           </div>
-          <div class="mt-2 text-2xl font-mono font-bold text-emerald-400 flex items-center gap-1.5">
+          <div class="mt-2 text-2xl font-mono font-bold text-emerald-400 flex items-center gap-1.5 truncate">
             {#if clusterStore.localNode?.clock_sync?.is_master || clusterStore.localNode?.clock_role === 'master'}
               <span>PTP MASTER</span>
-            {:else}
+            {:else if clusterStore.localNode}
               <span>LOCKED</span>
+            {:else}
+              <span class="text-zinc-500 text-lg">STANDALONE</span>
             {/if}
           </div>
-          <div class="mt-1 text-[10px] font-mono text-zinc-400">
-            Offset: {((clusterStore.localNode?.clock_sync?.offset_us ?? clusterStore.localNode?.clock_offset_us) ?? 0).toFixed(2)} &mu;s
+          <div class="mt-1 text-[10px] font-mono text-zinc-400 truncate">
+            Offset: {clusterStore.localNode ? ((clusterStore.localNode.clock_sync?.offset_us ?? clusterStore.localNode.clock_offset_us) ?? 0).toFixed(2) + ' μs' : '—'}
           </div>
         </div>
 
         <!-- SWIM Memberlist Discovery -->
-        <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
+        <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
           <div class="flex items-center justify-between text-xs font-mono text-zinc-400">
             <span>SWIM GOSSIP MESH</span>
-            <Radio class="w-4 h-4 text-amber-400" />
+            <Radio class="w-4 h-4 text-amber-400 shrink-0" />
           </div>
           <div class="mt-2 text-2xl font-mono font-bold text-zinc-100">
             {discHealth?.active_members ?? clusterStore.nodes.length} <span class="text-xs text-zinc-500 font-normal">Active</span>
           </div>
-          <div class="mt-1 text-[10px] font-mono text-zinc-400">
-            {discHealth?.beacons_received ?? 2840} beacons rx
+          <div class="mt-1 text-[10px] font-mono text-zinc-400 truncate">
+            {discHealth?.beacons_received ?? 0} beacons rx
           </div>
         </div>
 
         <!-- Total Cluster Audio Devices -->
-        <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
+        <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-900/60 p-4 shadow-lg">
           <div class="flex items-center justify-between text-xs font-mono text-zinc-400">
             <span>MESH AUDIO I/O</span>
-            <Sliders class="w-4 h-4 text-cyan-400" />
+            <Sliders class="w-4 h-4 text-cyan-400 shrink-0" />
           </div>
           <div class="mt-2 text-2xl font-mono font-bold text-zinc-100">
             {clusterStore.devices.length} <span class="text-xs text-zinc-500 font-normal">Devices</span>
           </div>
-          <div class="mt-1 text-[10px] font-mono text-zinc-400">
+          <div class="mt-1 text-[10px] font-mono text-zinc-400 truncate">
             {clusterStore.inputDevices.length} In &bull; {clusterStore.outputDevices.length} Out
           </div>
         </div>
@@ -289,7 +350,12 @@
         </div>
 
         <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {#each clusterStore.nodes as node}
+          {#if clusterStore.nodes.length === 0}
+            <div class="col-span-full rounded-xl border border-dashed border-zinc-800 p-8 text-center text-xs font-mono text-zinc-500">
+              No cluster nodes discovered. Connect to a gateway node to view topology.
+            </div>
+          {:else}
+            {#each clusterStore.nodes as node}
             {@const isSelected = activeNode?.id === node.id || activeNode?.node_id === node.node_id}
             {@const swim = getSwimBadge(node.swim_state)}
             {@const healthStyles = getHealthColor(node.health_score)}
@@ -304,30 +370,30 @@
               role="button"
               onclick={() => handleSelectNode(node)}
               onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') handleSelectNode(node); }}
-              class="rounded-xl border p-4 shadow-lg cursor-pointer transition-all text-left flex flex-col justify-between {isSelected
+              class="min-w-0 rounded-xl border p-4 shadow-lg cursor-pointer transition-all text-left flex flex-col justify-between {isSelected
                 ? 'border-cyan-500 bg-zinc-900 ring-2 ring-cyan-500/30'
                 : 'border-zinc-800 bg-zinc-900/60 hover:border-zinc-700 hover:bg-zinc-900/90'}"
             >
               <div>
                 <!-- Top Header: Badge, SWIM State, Health Score -->
                 <div class="flex items-start justify-between gap-2">
-                  <div class="flex items-center gap-1.5 flex-wrap">
+                  <div class="flex items-center gap-1.5 flex-wrap min-w-0">
                     {#if node.is_local}
-                      <span class="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/40 shadow-sm shadow-cyan-500/20">
+                      <span class="rounded bg-cyan-500/20 px-2 py-0.5 text-[10px] font-mono font-bold text-cyan-300 border border-cyan-500/40 shadow-sm shadow-cyan-500/20 shrink-0">
                         LOCAL GATEWAY
                       </span>
                     {:else}
-                      <span class="rounded bg-zinc-800 px-2 py-0.5 text-[10px] font-mono text-zinc-300 border border-zinc-700">
+                      <span class="rounded bg-zinc-800 px-2 py-0.5 text-[10px] font-mono text-zinc-300 border border-zinc-700 shrink-0">
                         REMOTE PEER
                       </span>
                     {/if}
 
-                    <span class="rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold border {swim.bg} {swim.color}">
+                    <span class="rounded px-1.5 py-0.5 text-[10px] font-mono font-semibold border shrink-0 {swim.bg} {swim.color}">
                       {swim.label}
                     </span>
                   </div>
 
-                  <div class="flex items-center gap-1.5">
+                  <div class="flex items-center gap-1.5 shrink-0">
                     <span class="rounded px-2 py-0.5 text-xs font-mono font-bold border {healthStyles.bg} {healthStyles.border} {healthStyles.text}">
                       {node.health_score.toFixed(0)}%
                     </span>
@@ -335,18 +401,18 @@
                 </div>
 
                 <!-- Node Name & Address -->
-                <div class="mt-2.5">
-                  <h3 class="text-sm font-semibold text-zinc-100 truncate">
+                <div class="mt-2.5 min-w-0">
+                  <h3 class="text-sm font-semibold text-zinc-100 truncate" title={node.name || node.id}>
                     {node.name || node.id}
                   </h3>
-                  <p class="text-[11px] font-mono text-zinc-400 truncate mt-0.5">
+                  <p class="text-[11px] font-mono text-zinc-400 truncate mt-0.5" title={node.api_addr || 'Internal Loopback'}>
                     {node.api_addr || 'Internal Loopback'}
                   </p>
                 </div>
 
                 <!-- Error Alert if suspect/dead/reason -->
                 {#if node.error_reason || node.swim_state === 'suspect' || node.swim_state === 'dead'}
-                  <div class="mt-2.5 rounded-lg bg-red-950/40 border border-red-500/30 p-2 text-[11px] font-mono text-red-300 flex items-center gap-1.5">
+                  <div class="mt-2.5 rounded-lg bg-red-950/40 border border-red-500/30 p-2 text-[11px] font-mono text-red-300 flex items-center gap-1.5 min-w-0">
                     <AlertCircle class="w-3.5 h-3.5 text-red-400 shrink-0" />
                     <span class="truncate">{node.error_reason || `Node state is ${node.swim_state}`}</span>
                   </div>
@@ -355,41 +421,41 @@
                 <!-- Key Metrics Grid -->
                 <div class="mt-3 grid grid-cols-2 gap-2 text-xs font-mono">
                   <!-- Latency & Packet Loss -->
-                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                     <span class="text-[10px] text-zinc-400 block">LINK RTT & LOSS</span>
-                    <div class="flex items-baseline justify-between mt-0.5">
-                      <span class="font-bold {getLatencyBadgeClass(node.rtt_ms)}">
+                    <div class="flex items-baseline justify-between gap-1 mt-0.5 min-w-0">
+                      <span class="font-bold truncate {getLatencyBadgeClass(node.rtt_ms)}">
                         {node.rtt_ms !== undefined ? `${node.rtt_ms.toFixed(1)}ms` : (node.is_local ? '0.0ms' : '—')}
                       </span>
-                      <span class="text-[10px] text-zinc-400">
+                      <span class="text-[10px] text-zinc-400 shrink-0">
                         {node.packet_loss_ratio !== undefined ? `${(node.packet_loss_ratio * 100).toFixed(2)}% loss` : '0.0%'}
                       </span>
                     </div>
                   </div>
 
                   <!-- Clock Sync -->
-                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                     <span class="text-[10px] text-zinc-400 block">CLOCK SYNC</span>
-                    <div class="flex items-baseline justify-between mt-0.5">
+                    <div class="flex items-baseline justify-between gap-1 mt-0.5 min-w-0">
                       {#if isMaster}
-                        <span class="text-emerald-400 font-bold">PTP MASTER</span>
+                        <span class="text-emerald-400 font-bold truncate">PTP MASTER</span>
                       {:else}
-                        <span class="text-zinc-200 font-bold">{clockOffset > 0 ? '+' : ''}{clockOffset.toFixed(1)}&mu;s</span>
-                        <span class="text-[10px] text-zinc-400">{clockDrift > 0 ? '+' : ''}{clockDrift.toFixed(1)}ppm</span>
+                        <span class="text-zinc-200 font-bold truncate">{clockOffset > 0 ? '+' : ''}{clockOffset.toFixed(1)}&mu;s</span>
+                        <span class="text-[10px] text-zinc-400 shrink-0">{clockDrift > 0 ? '+' : ''}{clockDrift.toFixed(1)}ppm</span>
                       {/if}
                     </div>
                   </div>
 
                   <!-- Active Streams -->
-                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                     <span class="text-[10px] text-zinc-400 block">ACTIVE STREAMS</span>
-                    <span class="text-zinc-200 font-bold">{node.active_streams ?? 0} Audio Pipes</span>
+                    <span class="text-zinc-200 font-bold truncate block">{node.active_streams ?? 0} Audio Pipes</span>
                   </div>
 
                   <!-- Audio Devices Preview -->
-                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60">
+                  <div class="rounded-lg bg-zinc-950/70 p-2 border border-zinc-800/60 min-w-0">
                     <span class="text-[10px] text-zinc-400 block">AUDIO I/O</span>
-                    <span class="text-cyan-300 font-bold">{inCount} In &bull; {outCount} Out</span>
+                    <span class="text-cyan-300 font-bold truncate block">{inCount} In &bull; {outCount} Out</span>
                   </div>
                 </div>
               </div>
@@ -403,6 +469,7 @@
               </div>
             </div>
           {/each}
+          {/if}
         </div>
       </div>
 
@@ -439,10 +506,10 @@
           <table class="w-full text-xs font-mono border-collapse text-left">
             <thead>
               <tr class="border-b border-zinc-800">
-                <th class="p-2.5 text-zinc-500 font-semibold uppercase bg-zinc-950/40">Source \ Target</th>
+                <th class="p-2.5 text-zinc-500 font-semibold uppercase bg-zinc-950/40 whitespace-nowrap">Source \ Target</th>
                 {#each clusterStore.nodes as colNode}
-                  <th class="p-2.5 text-center text-zinc-300 font-semibold bg-zinc-950/40 min-w-[120px]">
-                    <div class="truncate font-mono">{colNode.name || colNode.id}</div>
+                  <th class="p-2.5 text-center text-zinc-300 font-semibold bg-zinc-950/40 min-w-[90px] max-w-[130px]">
+                    <div class="truncate font-mono" title={colNode.name || colNode.id}>{colNode.name || colNode.id}</div>
                     {#if colNode.is_local}
                       <span class="text-[9px] text-cyan-400 font-normal">[Local]</span>
                     {/if}
@@ -454,12 +521,12 @@
               {#each clusterStore.nodes as rowNode}
                 <tr class="border-b border-zinc-800/60 hover:bg-zinc-800/20 transition-colors">
                   <!-- Row Header -->
-                  <td class="p-2.5 font-medium text-zinc-300 whitespace-nowrap bg-zinc-950/20">
-                    <div class="flex items-center gap-2">
-                      <span class="h-1.5 w-1.5 rounded-full {rowNode.swim_state === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
-                      <span class="truncate">{rowNode.name || rowNode.id}</span>
+                  <td class="p-2.5 font-medium text-zinc-300 whitespace-nowrap bg-zinc-950/20 max-w-[180px]">
+                    <div class="flex items-center gap-2 min-w-0">
+                      <span class="h-1.5 w-1.5 rounded-full shrink-0 {rowNode.swim_state === 'alive' ? 'bg-emerald-400' : 'bg-amber-400'}"></span>
+                      <span class="truncate" title={rowNode.name || rowNode.id}>{rowNode.name || rowNode.id}</span>
                       {#if rowNode.is_local}
-                        <span class="text-[9px] text-cyan-400">[Local]</span>
+                        <span class="text-[9px] text-cyan-400 shrink-0">[Local]</span>
                       {/if}
                     </div>
                   </td>
@@ -467,7 +534,7 @@
                   <!-- Cell RTT -->
                   {#each clusterStore.nodes as colNode}
                     {@const cellRtt = getMatrixCellRtt(rowNode.id, colNode.id)}
-                    <td class="p-2.5 text-center">
+                    <td class="p-2.5 text-center min-w-[90px] max-w-[130px]">
                       {#if rowNode.id === colNode.id}
                         <span class="inline-block rounded px-2 py-0.5 text-zinc-500 bg-zinc-950/60 border border-zinc-800/40">
                           &mdash;
@@ -491,7 +558,80 @@
       </div>
 
       <!-- ==================================================================== -->
-      <!-- 4. SELECTED NODE INSPECTOR                                          -->
+      <!-- 4. DISCOVERED MESH PEERS & PTP CLOCK ALIGNMENT                       -->
+      <!-- ==================================================================== -->
+      <div class="rounded-xl border border-zinc-800 bg-zinc-900/60 p-5 shadow-xl">
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between border-b border-zinc-800 pb-3 mb-4 gap-3">
+          <div class="flex items-center gap-2">
+            <Radio class="w-4 h-4 text-cyan-400" />
+            <h2 class="text-xs font-mono font-bold uppercase tracking-wider text-zinc-200">
+              Discovered Mesh Peers & PTP Clock Alignment ({peerStore.peers.length} Peers)
+            </h2>
+          </div>
+
+          <div class="flex items-center gap-3">
+            <span class="text-[11px] font-mono text-zinc-500 hidden md:inline">
+              mDNS & DHT Discovery &bull; PTP IEEE 1588 Sync
+            </span>
+            <button
+              onclick={() => (isPeerModalOpen = true)}
+              class="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-mono font-medium text-cyan-300 hover:bg-cyan-500/20 hover:border-cyan-500/60 transition-all cursor-pointer shadow-sm shadow-cyan-500/10"
+            >
+              <Radio class="w-3.5 h-3.5 text-cyan-400" />
+              <span>Pair Remote Peer</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="rounded-lg border border-zinc-800/80 bg-zinc-950/40 overflow-x-auto shadow-inner">
+          <table class="w-full text-left text-xs font-mono">
+            <thead class="border-b border-zinc-800 bg-zinc-950/80 text-zinc-400 text-[10px] uppercase">
+              <tr>
+                <th class="px-4 py-3 whitespace-nowrap">Peer Node ID</th>
+                <th class="px-4 py-3 whitespace-nowrap">Network Address</th>
+                <th class="px-4 py-3 whitespace-nowrap">Status</th>
+                <th class="px-4 py-3 whitespace-nowrap">RTT Latency</th>
+                <th class="px-4 py-3 whitespace-nowrap">Clock Offset</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-zinc-800/60 text-zinc-200">
+              {#if peerStore.peers.length === 0}
+                <tr>
+                  <td colspan="5" class="px-4 py-8 text-center text-zinc-500 italic">
+                    No mesh peers discovered. Click "Pair Remote Peer" to initiate a direct peer connection.
+                  </td>
+                </tr>
+              {:else}
+                {#each peerStore.peers as peer}
+                  <tr class="hover:bg-zinc-800/30 transition-colors">
+                    <td class="px-4 py-3 font-semibold text-zinc-100 flex items-center gap-2 min-w-0">
+                      <span class="h-2 w-2 rounded-full shrink-0 {peer.status === 'connected' ? 'bg-emerald-400 shadow-[0_0_6px_rgba(52,211,153,0.6)]' : 'bg-amber-400'}"></span>
+                      <span class="truncate max-w-[200px]" title={peer.id}>{peer.id}</span>
+                    </td>
+                    <td class="px-4 py-3 text-zinc-400 whitespace-nowrap">{peer.addr}</td>
+                    <td class="px-4 py-3 whitespace-nowrap">
+                      <span class="rounded px-2 py-0.5 text-[10px] font-bold uppercase {peer.status === 'connected'
+                        ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                        : 'bg-amber-500/10 text-amber-400 border border-amber-500/20'}">
+                        {peer.status}
+                      </span>
+                    </td>
+                    <td class="px-4 py-3 text-cyan-400 font-bold whitespace-nowrap">
+                      {peer.rtt_ms !== undefined ? `${peer.rtt_ms.toFixed(1)} ms` : '--'}
+                    </td>
+                    <td class="px-4 py-3 text-zinc-300 whitespace-nowrap">
+                      {peerStore.clockSync?.offset_ns !== undefined ? (peerStore.clockSync.offset_ns / 1000).toFixed(2) : '0.00'} &mu;s
+                    </td>
+                  </tr>
+                {/each}
+              {/if}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ==================================================================== -->
+      <!-- 5. SELECTED NODE INSPECTOR                                          -->
       <!-- ==================================================================== -->
       {#if activeNode}
         <div class="rounded-xl border border-cyan-500/30 bg-zinc-900/80 p-5 shadow-2xl space-y-5">
@@ -537,110 +677,110 @@
           <!-- Inspector Cards Grid -->
           <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
             <!-- 1. Clock & Transport Link -->
-            <div class="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 shadow-lg space-y-3">
+            <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 shadow-lg space-y-3">
               <div class="flex items-center justify-between border-b border-zinc-800/80 pb-2">
                 <div class="flex items-center gap-2 text-xs font-mono font-bold uppercase text-zinc-300">
-                  <Clock class="w-4 h-4 text-cyan-400" />
+                  <Clock class="w-4 h-4 text-cyan-400 shrink-0" />
                   <span>Clock Synchronization</span>
                 </div>
-                <span class="text-[10px] font-mono text-emerald-400">
+                <span class="text-[10px] font-mono text-emerald-400 shrink-0">
                   {activeNode.clock_sync?.is_master || activeNode.clock_role === 'master' ? 'PTP MASTER' : 'PTP LOCKED'}
                 </span>
               </div>
 
               <div class="space-y-2 text-xs font-mono">
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">Phase Offset:</span>
-                  <span class="text-zinc-200 font-bold">{((activeNode.clock_sync?.offset_us ?? activeNode.clock_offset_us) ?? 0).toFixed(2)} &mu;s</span>
+                  <span class="text-zinc-200 font-bold truncate">{((activeNode.clock_sync?.offset_us ?? activeNode.clock_offset_us) ?? 0).toFixed(2)} &mu;s</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">Frequency Drift:</span>
-                  <span class="text-zinc-200 font-bold">{((activeNode.clock_sync?.drift_ppm ?? activeNode.clock_drift_ppm) ?? 0).toFixed(2)} PPM</span>
+                  <span class="text-zinc-200 font-bold truncate">{((activeNode.clock_sync?.drift_ppm ?? activeNode.clock_drift_ppm) ?? 0).toFixed(2)} PPM</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">Sync RTT:</span>
-                  <span class="text-zinc-200 font-bold">{(activeNode.clock_sync?.sync_rtt_us ?? 0).toFixed(0)} &mu;s</span>
+                  <span class="text-zinc-200 font-bold truncate">{(activeNode.clock_sync?.sync_rtt_us ?? 0).toFixed(0)} &mu;s</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">Packets Lost:</span>
-                  <span class="text-emerald-400 font-bold">{activeNode.clock_sync?.packets_lost ?? 0}</span>
+                  <span class="text-emerald-400 font-bold truncate">{activeNode.clock_sync?.packets_lost ?? 0}</span>
                 </div>
               </div>
             </div>
 
             <!-- 2. DSP & Error Correction (FEC & PLC) -->
-            <div class="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 shadow-lg space-y-3">
+            <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 shadow-lg space-y-3">
               <div class="flex items-center justify-between border-b border-zinc-800/80 pb-2">
                 <div class="flex items-center gap-2 text-xs font-mono font-bold uppercase text-zinc-300">
-                  <Zap class="w-4 h-4 text-cyan-400" />
+                  <Zap class="w-4 h-4 text-cyan-400 shrink-0" />
                   <span>DSP & Loss Immunity</span>
                 </div>
-                <span class="text-[10px] font-mono text-cyan-400">RFC 5109 + PSOLA</span>
+                <span class="text-[10px] font-mono text-cyan-400 shrink-0">RFC 5109 + PSOLA</span>
               </div>
 
               <div class="space-y-2 text-xs font-mono">
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">FEC Recovered:</span>
-                  <span class="text-emerald-400 font-bold">{fec?.packets_recovered_total ?? 14} pkts</span>
+                  <span class="text-emerald-400 font-bold truncate">{fec?.packets_recovered_total ?? 0} pkts</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">PLC Concealed:</span>
-                  <span class="text-amber-400 font-bold">{plc?.concealed_frames_total ?? 4} frames</span>
+                  <span class="text-amber-400 font-bold truncate">{plc?.concealed_frames_total ?? 0} frames</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">ASRC Drift:</span>
-                  <span class="text-cyan-400 font-bold">{asrc?.drift_ppm ? asrc.drift_ppm.toFixed(2) : '-1.82'} PPM</span>
+                  <span class="text-cyan-400 font-bold truncate">{asrc?.drift_ppm !== undefined ? asrc.drift_ppm.toFixed(2) : '0.00'} PPM</span>
                 </div>
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">Resample Ratio:</span>
-                  <span class="text-zinc-200 font-bold">{asrc?.resample_ratio ? asrc.resample_ratio.toFixed(7) : '0.9999982'}</span>
+                  <span class="text-zinc-200 font-bold truncate">{asrc?.resample_ratio !== undefined ? asrc.resample_ratio.toFixed(7) : '1.0000000'}</span>
                 </div>
               </div>
             </div>
 
             <!-- 3. Host Resources / Link Quality -->
-            <div class="rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 shadow-lg space-y-3">
+            <div class="min-w-0 rounded-xl border border-zinc-800 bg-zinc-950/60 p-4 shadow-lg space-y-3">
               <div class="flex items-center justify-between border-b border-zinc-800/80 pb-2">
                 <div class="flex items-center gap-2 text-xs font-mono font-bold uppercase text-zinc-300">
-                  <Activity class="w-4 h-4 text-emerald-400" />
+                  <Activity class="w-4 h-4 text-emerald-400 shrink-0" />
                   <span>Host Performance</span>
                 </div>
-                <span class="text-[10px] font-mono text-zinc-400">
+                <span class="text-[10px] font-mono text-zinc-400 shrink-0">
                   {isSelectedLocal ? 'LOCAL AGENT' : 'PEER LINK'}
                 </span>
               </div>
 
               <div class="space-y-2 text-xs font-mono">
                 {#if isSelectedLocal}
-                  <div class="flex justify-between">
+                  <div class="flex justify-between gap-1">
                     <span class="text-zinc-400">CPU Usage:</span>
-                    <span class="text-zinc-200 font-bold">{telemetryStore.systemMetrics.cpu_percent.toFixed(1)}%</span>
+                    <span class="text-zinc-200 font-bold truncate">{telemetryStore.systemMetrics.cpu_percent.toFixed(1)}%</span>
                   </div>
-                  <div class="flex justify-between">
+                  <div class="flex justify-between gap-1">
                     <span class="text-zinc-400">Heap Memory:</span>
-                    <span class="text-zinc-200 font-bold">{telemetryStore.systemMetrics.memory_used_mb.toFixed(1)} MB</span>
+                    <span class="text-zinc-200 font-bold truncate">{telemetryStore.systemMetrics.memory_used_mb.toFixed(1)} MB</span>
                   </div>
-                  <div class="flex justify-between">
+                  <div class="flex justify-between gap-1">
                     <span class="text-zinc-400">Goroutines:</span>
-                    <span class="text-cyan-400 font-bold">{telemetryStore.systemMetrics.goroutines}</span>
+                    <span class="text-cyan-400 font-bold truncate">{telemetryStore.systemMetrics.goroutines}</span>
                   </div>
                 {:else}
-                  <div class="flex justify-between">
+                  <div class="flex justify-between gap-1">
                     <span class="text-zinc-400">Direct Ping RTT:</span>
-                    <span class="text-zinc-200 font-bold">{activeNode.rtt_ms !== undefined ? `${activeNode.rtt_ms.toFixed(2)} ms` : '—'}</span>
+                    <span class="text-zinc-200 font-bold truncate">{activeNode.rtt_ms !== undefined ? `${activeNode.rtt_ms.toFixed(2)} ms` : '—'}</span>
                   </div>
-                  <div class="flex justify-between">
+                  <div class="flex justify-between gap-1">
                     <span class="text-zinc-400">Packet Loss:</span>
-                    <span class="text-zinc-200 font-bold">{activeNode.packet_loss_ratio !== undefined ? `${(activeNode.packet_loss_ratio * 100).toFixed(2)}%` : '0.00%'}</span>
+                    <span class="text-zinc-200 font-bold truncate">{activeNode.packet_loss_ratio !== undefined ? `${(activeNode.packet_loss_ratio * 100).toFixed(2)}%` : '0.00%'}</span>
                   </div>
-                  <div class="flex justify-between">
+                  <div class="flex justify-between gap-1">
                     <span class="text-zinc-400">Effective Bitrate:</span>
-                    <span class="text-cyan-400 font-bold">{activeNode.bitrate_kbps ? `${activeNode.bitrate_kbps} kbps` : '1536 kbps'}</span>
+                    <span class="text-cyan-400 font-bold truncate">{activeNode.bitrate_kbps ? `${activeNode.bitrate_kbps} kbps` : '—'}</span>
                   </div>
                 {/if}
-                <div class="flex justify-between">
+                <div class="flex justify-between gap-1">
                   <span class="text-zinc-400">Active Streams:</span>
-                  <span class="text-zinc-200 font-bold">{activeNode.active_streams} Stream Pipelines</span>
+                  <span class="text-zinc-200 font-bold truncate">{activeNode.active_streams} Stream Pipelines</span>
                 </div>
               </div>
             </div>
@@ -667,10 +807,10 @@
             {:else}
               <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
                 {#each activeNode.devices as dev}
-                  <div class="rounded-lg border border-zinc-800 bg-zinc-950/70 p-3.5 flex flex-col justify-between space-y-3">
+                  <div class="min-w-0 rounded-lg border border-zinc-800 bg-zinc-950/70 p-3.5 flex flex-col justify-between space-y-3">
                     <div>
                       <div class="flex items-center justify-between gap-2">
-                        <span class="rounded px-2 py-0.5 text-[10px] font-mono uppercase font-bold border {dev.direction === 'input'
+                        <span class="rounded px-2 py-0.5 text-[10px] font-mono uppercase font-bold border shrink-0 {dev.direction === 'input'
                           ? 'bg-blue-500/10 border-blue-500/30 text-blue-400'
                           : dev.direction === 'output'
                             ? 'bg-purple-500/10 border-purple-500/30 text-purple-400'
@@ -678,22 +818,22 @@
                           {dev.direction}
                         </span>
 
-                        <span class="rounded bg-zinc-900 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800">
+                        <span class="rounded bg-zinc-900 px-2 py-0.5 text-[10px] font-mono text-zinc-400 border border-zinc-800 shrink-0">
                           {dev.max_input > 0 ? `${dev.max_input} In` : ''} {dev.max_output > 0 ? `${dev.max_output} Out` : ''} &bull; {dev.default_sample_rate / 1000}kHz
                         </span>
                       </div>
 
-                      <h4 class="mt-2 text-xs font-semibold text-zinc-100 truncate">
+                      <h4 class="mt-2 text-xs font-semibold text-zinc-100 truncate" title={dev.name}>
                         {dev.name}
                       </h4>
-                      <div class="text-[10px] font-mono text-zinc-500 truncate">
+                      <div class="text-[10px] font-mono text-zinc-500 truncate" title={dev.device_id || dev.id}>
                         ID: {dev.device_id || dev.id}
                       </div>
                     </div>
 
                     <!-- Fader and Mute -->
                     <div class="pt-2 border-t border-zinc-800/80 flex items-center justify-between gap-3">
-                      <div class="flex items-center gap-2 flex-1">
+                      <div class="flex items-center gap-2 flex-1 min-w-0">
                         <Volume2 class="w-3.5 h-3.5 text-zinc-400 shrink-0" />
                         <input
                           type="range"
@@ -702,9 +842,9 @@
                           step="0.05"
                           value={dev.volume ?? 1.0}
                           onchange={(e) => handleDeviceVolume(dev, parseFloat((e.target as HTMLInputElement).value))}
-                          class="w-full accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
+                          class="w-full min-w-[50px] accent-cyan-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg shrink"
                         />
-                        <span class="text-[10px] font-mono text-zinc-400 w-8 text-right">
+                        <span class="text-[10px] font-mono text-zinc-400 w-9 text-right shrink-0">
                           {Math.round((dev.volume ?? 1.0) * 100)}%
                         </span>
                       </div>
@@ -726,6 +866,11 @@
               </div>
             {/if}
           </div>
+
+          <!-- 5. Audio Artifacts (ADR 0034): per-route + per-device health -->
+          <div class="border-t border-zinc-800 pt-4">
+            <RouteHealthPanel />
+          </div>
         </div>
       {/if}
 
@@ -737,3 +882,76 @@
     </div>
   </div>
 </div>
+
+<!-- Pair Remote Peer Modal -->
+{#if isPeerModalOpen}
+  <div
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4"
+    role="dialog"
+    aria-modal="true"
+  >
+    <div class="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-950 p-6 shadow-2xl text-zinc-100">
+      <div class="flex items-center justify-between border-b border-zinc-800 pb-3 mb-4">
+        <div class="flex items-center gap-2">
+          <Radio class="w-4 h-4 text-cyan-400" />
+          <h2 class="text-sm font-semibold text-zinc-100 uppercase tracking-wide">
+            Pair Remote Mesh Peer
+          </h2>
+        </div>
+        <button
+          onclick={() => (isPeerModalOpen = false)}
+          class="rounded p-1 text-zinc-400 hover:text-zinc-200 cursor-pointer"
+          aria-label="Close dialog"
+        >
+          <X class="w-4 h-4" />
+        </button>
+      </div>
+
+      <div class="space-y-4">
+        <div>
+          <label for="peer-addr" class="block text-xs font-mono text-zinc-300 mb-1">PEER ADDRESS (IP:PORT)</label>
+          <input
+            id="peer-addr"
+            type="text"
+            bind:value={peerAddr}
+            placeholder="192.168.1.150:7001"
+            class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
+          />
+        </div>
+
+        <div>
+          <label for="peer-cert" class="block text-xs font-mono text-zinc-300 mb-1">DTLS CERTIFICATE FINGERPRINT (OPTIONAL)</label>
+          <input
+            id="peer-cert"
+            type="text"
+            bind:value={peerTlsFingerprint}
+            placeholder="SHA-256 fingerprint hex..."
+            class="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 font-mono focus:border-cyan-500 focus:outline-none"
+          />
+        </div>
+
+        {#if peerError}
+          <div class="text-xs text-red-400 bg-red-950/40 p-2 rounded border border-red-800/50">
+            {peerError}
+          </div>
+        {/if}
+      </div>
+
+      <div class="mt-6 flex justify-end gap-2 border-t border-zinc-800 pt-4">
+        <button
+          onclick={() => (isPeerModalOpen = false)}
+          class="rounded-lg px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 cursor-pointer"
+        >
+          Cancel
+        </button>
+        <button
+          onclick={handleConnectPeer}
+          disabled={isConnectingPeer}
+          class="rounded-lg bg-cyan-500 px-4 py-1.5 text-xs font-semibold text-zinc-950 hover:bg-cyan-400 disabled:opacity-50 cursor-pointer transition-colors shadow-sm shadow-cyan-500/20"
+        >
+          {isConnectingPeer ? 'Connecting...' : 'Initiate Handshake'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
